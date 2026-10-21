@@ -1,0 +1,10 @@
+# Cargo build config for Nyx.
+# +crt-static: link the C runtime statically so nyx.exe has no VC++ redist dependency,
+# and so the vcpkg crate picks the x64-windows-static triplet (libtorrent, boost, openssl).
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+# Fallback vcpkg location used by scripts/setup-toolchain.ps1; a VCPKG_ROOT already in
+# the environment wins (force = false), so other machines can point elsewhere.
+[env]
+VCPKG_ROOT = { value = "D:\\Projects\\tools\\vcpkg", force = false }

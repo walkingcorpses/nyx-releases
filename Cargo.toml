@@ -1,0 +1,9 @@
+# Nyx workspace root. Every crate lives under crates/ (nyx-engine, nyx-core, ...).
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT"

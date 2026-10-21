@@ -1,0 +1,13 @@
+# nyx-engine: safe Rust wrapper over libtorrent-rasterbar via a thin cxx C++ shim.
+[package]
+name = "nyx-engine"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+cxx = "1"
+
+[build-dependencies]
+cxx-build = "1"
+vcpkg = "0.2"
