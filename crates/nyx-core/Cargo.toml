@@ -1,0 +1,13 @@
+# nyx-core: pure-logic crate (input validation, shared types). No libtorrent dependency, so tests are fast.
+[package]
+name = "nyx-core"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+data-encoding = "2"
+percent-encoding = "2"
+
+[dev-dependencies]
+proptest = "1"
