@@ -33,4 +33,5 @@ fn main() {
     println!("cargo:rerun-if-changed=cpp/shim.cpp");
     println!("cargo:rerun-if-changed=cpp/shim.hpp");
     println!("cargo:rerun-if-env-changed=VCPKG_ROOT");
+    println!("cargo:rerun-if-changed=../../vcpkg.json");
 }

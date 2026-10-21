@@ -7,3 +7,10 @@ fn libtorrent_version_is_2_0() {
     let v = nyx_engine::libtorrent_version();
     assert!(v.starts_with("2.0"), "unexpected libtorrent version: {v}");
 }
+
+/// Builds and tears down a real lt::session, which pulls most of libtorrent,
+/// boost.asio and openssl into the link, so the dependency check is meaningful.
+#[test]
+fn session_starts_and_stops() {
+    assert!(nyx_engine::session_smoke());
+}

@@ -8,3 +8,9 @@ mod ffi;
 pub fn libtorrent_version() -> String {
     ffi::lt_version()
 }
+
+/// Starts a real libtorrent session (loopback only, no DHT/LSD/UPnP/NAT-PMP)
+/// and shuts it down. Proves the full engine links and runs, not just headers.
+pub fn session_smoke() -> bool {
+    ffi::lt_session_smoke()
+}

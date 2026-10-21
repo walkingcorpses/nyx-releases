@@ -4,13 +4,28 @@
 #   - Visual Studio 2022 Build Tools, "Desktop development with C++" workload
 #   - CMake
 #   - vcpkg (cloned to D:\Projects\tools\vcpkg, VCPKG_ROOT persisted for the user)
-#   - libtorrent:x64-windows-static via vcpkg (static libs, static CRT)
+#   - libtorrent 2.0.x (pinned in vcpkg.json) + boost/openssl, triplet x64-windows-static,
+#     installed in manifest mode into %VCPKG_ROOT%\installed (static libs, static CRT)
 # Each step is skipped when the tool is already present, so re-running is safe.
 # Run from any PowerShell window: powershell -ExecutionPolicy Bypass -File scripts\setup-toolchain.ps1
 # The Build Tools install may raise a UAC prompt.
+# -AllowPrune: required when VCPKG_ROOT is not the dedicated D:\Projects\tools\vcpkg,
+#   because the manifest install deletes every package in <VCPKG_ROOT>\installed
+#   that vcpkg.json does not list.
+
+param([switch]$AllowPrune)
 
 $ErrorActionPreference = 'Stop'
-$VcpkgRoot = if ($env:VCPKG_ROOT) { $env:VCPKG_ROOT } else { 'D:\Projects\tools\vcpkg' }
+$DefaultVcpkgRoot = 'D:\Projects\tools\vcpkg'
+$VcpkgRoot = if ($env:VCPKG_ROOT) { $env:VCPKG_ROOT } else { $DefaultVcpkgRoot }
+
+# Refuse up front to prune a shared vcpkg tree unless the caller opts in.
+if (-not $AllowPrune -and ([IO.Path]::GetFullPath($VcpkgRoot).TrimEnd('\') -ne $DefaultVcpkgRoot)) {
+    Write-Host "VCPKG_ROOT is '$VcpkgRoot', not the dedicated $DefaultVcpkgRoot." -ForegroundColor Red
+    Write-Host 'The vcpkg step would remove every package in its installed tree that Nyx does not need.' -ForegroundColor Red
+    Write-Host 'Re-run with -AllowPrune to accept that, or unset VCPKG_ROOT to use the default.' -ForegroundColor Red
+    exit 2
+}
 
 # Prints a step banner so the log shows what is being installed and why.
 function Step($msg) { Write-Host "==> $msg" -ForegroundColor Cyan }
@@ -49,11 +64,17 @@ if (-not (Have cmake) -and -not (Test-Path "$env:ProgramFiles\CMake\bin\cmake.ex
 # 4. vcpkg cloned and bootstrapped; VCPKG_ROOT persisted so new shells see it.
 if (-not (Test-Path (Join-Path $VcpkgRoot 'vcpkg.exe'))) {
     Step "Installing vcpkg to $VcpkgRoot"
-    if (-not (Test-Path $VcpkgRoot)) { git clone https://github.com/microsoft/vcpkg.git $VcpkgRoot }
+    if (-not (Test-Path $VcpkgRoot)) {
+        if (-not (Have git)) { throw 'git is required to clone vcpkg; install Git for Windows first' }
+        git clone https://github.com/microsoft/vcpkg.git $VcpkgRoot
+        if ($LASTEXITCODE) { throw "git clone of vcpkg failed ($LASTEXITCODE)" }
+    }
     & (Join-Path $VcpkgRoot 'bootstrap-vcpkg.bat') -disableMetrics
     if ($LASTEXITCODE) { throw 'vcpkg bootstrap failed' }
 } else { Step 'vcpkg already installed, skipping' }
-[Environment]::SetEnvironmentVariable('VCPKG_ROOT', $VcpkgRoot, 'User')
+if ([Environment]::GetEnvironmentVariable('VCPKG_ROOT', 'User') -ne $VcpkgRoot) {
+    [Environment]::SetEnvironmentVariable('VCPKG_ROOT', $VcpkgRoot, 'User')
+}
 $env:VCPKG_ROOT = $VcpkgRoot
 
 # 5. libtorrent and its deps (boost, openssl) as static libs with the static CRT.

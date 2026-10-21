@@ -8,6 +8,9 @@ mod bridge {
 
         /// libtorrent version string from `lt::version()`.
         fn lt_version() -> String;
+
+        /// Starts and stops a loopback-only `lt::session`; true on success.
+        fn lt_session_smoke() -> bool;
     }
 }
 
