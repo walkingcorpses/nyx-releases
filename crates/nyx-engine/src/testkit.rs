@@ -5,6 +5,7 @@ pub mod socks5;
 
 use std::net::{SocketAddr, TcpListener};
 use std::path::Path;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::{ffi, Engine, EngineError, TorrentId};
@@ -23,10 +24,21 @@ pub fn make_torrent_files(dir: &Path, sizes: &[u64]) -> Vec<u8> {
     ffi::make_torrent(&dir.to_string_lossy(), sizes, PIECE_LEN, "").unwrap()
 }
 
+/// Ports already handed out in this process, so parallel tests never share one even if
+/// the OS recycles a just-released port before the engine binds it.
+static HANDED_OUT: Mutex<Vec<u16>> = Mutex::new(Vec::new());
+
 /// Asks the OS for a free loopback port, so each test engine listens somewhere unique.
 pub fn free_loopback_addr() -> SocketAddr {
-    let l = TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap()
+    loop {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let mut used = HANDED_OUT.lock().unwrap();
+        if !used.contains(&addr.port()) {
+            used.push(addr.port());
+            return addr;
+        }
+    }
 }
 
 /// Polls `cond` every 50 ms until it is true or `timeout` passes. Returns the final value.
