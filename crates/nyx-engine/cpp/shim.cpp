@@ -1,14 +1,147 @@
 // shim.cpp - implementation of the cxx bridge functions declared in shim.hpp.
 // Every libtorrent call Nyx makes goes through this file.
 #include "nyx-engine/cpp/shim.hpp"
+#include "nyx-engine/src/ffi.rs.h"
 
-#include <libtorrent/session.hpp>
+#include <libtorrent/add_torrent_params.hpp>
+#include <libtorrent/alert_types.hpp>
+#include <libtorrent/announce_entry.hpp>
+#include <libtorrent/create_torrent.hpp>
+#include <libtorrent/error_code.hpp>
+#include <libtorrent/file_storage.hpp>
+#include <libtorrent/ip_filter.hpp>
+#include <libtorrent/load_torrent.hpp>
+#include <libtorrent/magnet_uri.hpp>
+#include <libtorrent/peer_info.hpp>
+#include <libtorrent/read_resume_data.hpp>
+#include <libtorrent/session_params.hpp>
 #include <libtorrent/settings_pack.hpp>
+#include <libtorrent/torrent_flags.hpp>
+#include <libtorrent/torrent_handle.hpp>
+#include <libtorrent/torrent_info.hpp>
+#include <libtorrent/torrent_status.hpp>
 #include <libtorrent/version.hpp>
+#include <libtorrent/write_resume_data.hpp>
 
+#include <chrono>
 #include <exception>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <vector>
 
 namespace nyx {
+
+namespace {
+
+// Limits applied to every .torrent that reaches libtorrent (spec: untrusted input).
+constexpr int kMaxTorrentBytes = 10 * 1024 * 1024;
+constexpr int kMaxBencodeDepth = 64;
+// Bit for libtorrent's global peer class (id 0) in an ip_filter used as a peer-class filter.
+constexpr std::uint32_t kGlobalClassBit = 1u;
+
+// Hex of an info-hash, lowercase. v1 hash when the torrent has one (also for hybrids),
+// otherwise the 64-char v2 hash. Matches nyx_core's TorrentId.
+std::string id_of(lt::info_hash_t const& ih) {
+    std::ostringstream os;
+    if (ih.has_v1()) os << ih.v1; else os << ih.v2;
+    return os.str();
+}
+
+// Decodes a lowercase/uppercase hex id into the 20-byte hash libtorrent indexes by.
+// A 64-char v2 id is truncated to its first 20 bytes, which is how lt::find_torrent
+// matches v2 torrents.
+lt::sha1_hash hash_of(std::string const& id) {
+    if (id.size() != 40 && id.size() != 64) throw std::invalid_argument("bad torrent id");
+    auto nib = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        throw std::invalid_argument("bad torrent id");
+    };
+    lt::sha1_hash h;
+    char* out = h.data();
+    for (int i = 0; i < 20; ++i) out[i] = char(nib(id[2 * i]) << 4 | nib(id[2 * i + 1]));
+    return h;
+}
+
+// Looks a torrent up by id; throws (-> Rust Err) when it is not in the session.
+lt::torrent_handle find(lt::session& ses, rust::Str id) {
+    lt::torrent_handle h = ses.find_torrent(hash_of(std::string(id)));
+    if (!h.is_valid()) throw std::runtime_error("no such torrent");
+    return h;
+}
+
+// .torrent limits shared by add and inspect.
+lt::load_torrent_limits torrent_limits() {
+    lt::load_torrent_limits lim;
+    lim.max_buffer_size = kMaxTorrentBytes;
+    lim.max_decode_depth = kMaxBencodeDepth;
+    return lim;
+}
+
+// Common add flags: Nyx does its own queueing (so no auto-manage) and repeat adds are
+// not errors (the caller merges instead).
+void base_flags(lt::add_torrent_params& atp, bool paused, bool sequential) {
+    atp.flags &= ~lt::torrent_flags::auto_managed;
+    atp.flags &= ~lt::torrent_flags::duplicate_is_error;
+    // libtorrent's default flags include `paused` (auto-manage normally starts it); with
+    // auto-manage off we must clear it ourselves or every torrent would sit paused.
+    atp.flags &= ~lt::torrent_flags::paused;
+    if (paused) atp.flags |= lt::torrent_flags::paused;
+    if (sequential) atp.flags |= lt::torrent_flags::sequential_download;
+}
+
+// If `atp` names a torrent already in the session: merge trackers, fill in metadata
+// when the existing one is a bare magnet, and return its id. Otherwise adds it.
+rust::String add_or_merge(lt::session& ses, lt::add_torrent_params atp) {
+    lt::info_hash_t const ih = atp.ti ? atp.ti->info_hashes() : atp.info_hashes;
+    lt::torrent_handle existing = ses.find_torrent(ih.has_v1() ? ih.v1 : lt::sha1_hash(ih.v2.data()));
+    if (existing.is_valid()) {
+        for (auto const& url : atp.trackers) existing.add_tracker(lt::announce_entry(url));
+        if (atp.ti && !existing.torrent_file()) {
+            auto const info = atp.ti->info_section();
+            existing.set_metadata(info);
+        }
+        return rust::String(id_of(existing.info_hashes()));
+    }
+    lt::torrent_handle h = ses.add_torrent(std::move(atp));
+    return rust::String(id_of(h.info_hashes()));
+}
+
+// Deterministic filler bytes so test payloads hash the same every run.
+void write_payload(std::filesystem::path const& p, std::uint64_t size, std::uint32_t seed) {
+    std::filesystem::create_directories(p.parent_path());
+    std::ofstream f(p, std::ios::binary | std::ios::trunc);
+    std::uint32_t x = seed * 2654435761u + 12345u;
+    std::vector<char> buf(64 * 1024);
+    while (size > 0) {
+        std::size_t n = std::size_t(std::min<std::uint64_t>(size, buf.size()));
+        for (std::size_t i = 0; i < n; ++i) {
+            x = x * 1664525u + 1013904223u;
+            buf[i] = char(x >> 24);
+        }
+        f.write(buf.data(), std::streamsize(n));
+        size -= n;
+    }
+}
+
+// Maps libtorrent's torrent state to the small code Rust understands.
+std::uint8_t state_code(lt::torrent_status const& st) {
+    switch (st.state) {
+        case lt::torrent_status::downloading_metadata: return 0;
+        case lt::torrent_status::checking_files:
+        case lt::torrent_status::checking_resume_data: return 1;
+        case lt::torrent_status::downloading: return 2;
+        case lt::torrent_status::finished:
+        case lt::torrent_status::seeding: return 3;
+        default: return 4;
+    }
+}
+
+} // namespace
 
 // Real session start/stop: links the session, networking and crypto code paths,
 // and checks a setting survives the round trip. Exceptions map to false so
@@ -34,6 +167,374 @@ bool lt_session_smoke() {
 // spike proves the static library actually links, not just that headers exist.
 rust::String lt_version() {
     return rust::String(lt::version());
+}
+
+// Builds the session settings once: encryption forced, rate limits applied even on
+// LAN, loopback peers allowed (several engines share 127.0.0.1 in tests).
+Session::Session(rust::Str listen, rust::Slice<const std::uint8_t> dht_state, bool discovery)
+    : ses_(
+          [&] {
+              lt::settings_pack pack;
+              pack.set_str(lt::settings_pack::listen_interfaces, std::string(listen));
+              pack.set_str(lt::settings_pack::user_agent, "Nyx/0.1");
+              pack.set_bool(lt::settings_pack::enable_dht, discovery);
+              pack.set_bool(lt::settings_pack::enable_lsd, discovery);
+              pack.set_bool(lt::settings_pack::enable_upnp, discovery);
+              pack.set_bool(lt::settings_pack::enable_natpmp, discovery);
+              pack.set_bool(lt::settings_pack::allow_multiple_connections_per_ip, true);
+              pack.set_int(lt::settings_pack::alert_mask, lt::alert_category::error);
+              lt::session_params sp(std::move(pack));
+              if (discovery && !dht_state.empty()) {
+                  lt::session_params old = lt::read_session_params(lt::span<char const>(
+                      reinterpret_cast<char const*>(dht_state.data()), dht_state.size()));
+                  sp.dht_state = std::move(old.dht_state);
+              }
+              return sp;
+          }()),
+      discovery_(discovery) {
+    // Rate limits must also bind LAN/loopback peers (libtorrent exempts them by default):
+    // put every address, v4 and v6, in the global peer class and nothing in the local one.
+    lt::ip_filter classes;
+    classes.add_rule(lt::make_address_v4("0.0.0.0"), lt::make_address_v4("255.255.255.255"),
+                     kGlobalClassBit);
+    classes.add_rule(lt::make_address_v6("::"), lt::make_address_v6("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"),
+                     kGlobalClassBit);
+    ses_.set_peer_class_filter(classes);
+    set_encryption(0);  // forced RC4 until the app says otherwise
+}
+
+std::unique_ptr<Session> new_session(rust::Str listen, rust::Slice<const std::uint8_t> dht_state,
+                                     bool discovery) {
+    return std::make_unique<Session>(listen, dht_state, discovery);
+}
+
+// Magnets add with default_dont_download: nothing is fetched until the UI picks files.
+rust::String Session::add_magnet(rust::Str uri, rust::Str save_path, bool paused, bool sequential) const {
+    lt::error_code ec;
+    lt::add_torrent_params atp = lt::parse_magnet_uri(std::string(uri), ec);
+    if (ec) throw std::runtime_error(ec.message());
+    atp.save_path = std::string(save_path);
+    base_flags(atp, paused, sequential);
+    atp.flags |= lt::torrent_flags::default_dont_download;
+    return add_or_merge(ses_, std::move(atp));
+}
+
+rust::String Session::add_torrent(rust::Slice<const std::uint8_t> bytes, rust::Str save_path,
+                                  bool paused, bool sequential) const {
+    lt::add_torrent_params atp = lt::load_torrent_buffer(
+        lt::span<char const>(reinterpret_cast<char const*>(bytes.data()), bytes.size()),
+        torrent_limits());
+    atp.save_path = std::string(save_path);
+    base_flags(atp, paused, sequential);
+    return add_or_merge(ses_, std::move(atp));
+}
+
+rust::String Session::add_resume(rust::Slice<const std::uint8_t> data) const {
+    lt::add_torrent_params atp = lt::read_resume_data(lt::span<char const>(
+        reinterpret_cast<char const*>(data.data()), data.size()));
+    // Resume data carries its own paused flag; keep it, only drop auto-manage.
+    atp.flags &= ~lt::torrent_flags::auto_managed;
+    lt::torrent_handle h = ses_.add_torrent(std::move(atp));
+    return rust::String(id_of(h.info_hashes()));
+}
+
+// Reads every torrent's status in one pass. Error text comes from libtorrent's errc
+// (storage errors, disk full); pause state from the flags.
+rust::Vec<TorrentRow> Session::snapshot() const {
+    // Drain alerts so libtorrent's queue never fills (errors are read from status instead).
+    std::vector<lt::alert*> drain;
+    ses_.pop_alerts(&drain);
+
+    rust::Vec<TorrentRow> out;
+    for (lt::torrent_handle const& h : ses_.get_torrents()) {
+        lt::torrent_status st = h.status();
+        TorrentRow row;
+        row.id = id_of(st.info_hashes);
+        row.name = st.name;
+        row.state = state_code(st);
+        row.paused = bool(st.flags & lt::torrent_flags::paused);
+        row.error = st.errc ? rust::String(st.errc.message()) : rust::String();
+        row.progress = st.progress;
+        row.down_rate = std::uint64_t(st.download_payload_rate);
+        row.up_rate = std::uint64_t(st.upload_payload_rate);
+        auto ti = st.torrent_file.lock();
+        row.size = ti ? std::uint64_t(ti->total_size()) : 0;
+        row.peers = std::uint32_t(st.num_peers);
+        out.push_back(std::move(row));
+    }
+    return out;
+}
+
+rust::Vec<FileRow> Session::files(rust::Str id) const {
+    lt::torrent_handle h = find(ses_, id);
+    rust::Vec<FileRow> out;
+    auto ti = h.torrent_file();
+    if (!ti) return out;
+    lt::file_storage const& fs = ti->files();
+    std::vector<std::int64_t> prog = h.file_progress();
+    std::vector<lt::download_priority_t> prio = h.get_file_priorities();
+    for (lt::file_index_t i{0}; i < lt::file_index_t(fs.num_files()); ++i) {
+        FileRow f;
+        f.path = fs.file_path(i);
+        f.size = std::uint64_t(fs.file_size(i));
+        std::size_t const k = std::size_t(static_cast<int>(i));
+        f.progress = f.size == 0 ? 1.0f : float(double(prog[k]) / double(f.size));
+        f.priority = k < prio.size() ? std::uint8_t(static_cast<std::uint8_t>(prio[k])) : 4;
+        out.push_back(std::move(f));
+    }
+    return out;
+}
+
+// Flags string is a compact set of letters; `encrypted` counts only real RC4 payload
+// encryption, not a plaintext payload behind an encrypted handshake.
+rust::Vec<PeerRow> Session::peers(rust::Str id) const {
+    lt::torrent_handle h = find(ses_, id);
+    std::vector<lt::peer_info> infos;
+    h.get_peer_info(infos);
+    rust::Vec<PeerRow> out;
+    for (auto const& p : infos) {
+        PeerRow r;
+        r.addr = p.ip.address().to_string() + ":" + std::to_string(p.ip.port());
+        r.client = p.client;
+        r.down_rate = std::uint64_t(p.payload_down_speed);
+        r.up_rate = std::uint64_t(p.payload_up_speed);
+        std::string fl;
+        if (p.flags & lt::peer_info::interesting) fl += 'I';
+        if (p.flags & lt::peer_info::choked) fl += 'c';
+        if (p.flags & lt::peer_info::remote_interested) fl += 'i';
+        if (p.flags & lt::peer_info::remote_choked) fl += 'C';
+        fl += (p.flags & lt::peer_info::local_connection) ? 'L' : 'R';
+        if (p.flags & lt::peer_info::rc4_encrypted) fl += 'E';
+        r.flags = fl;
+        r.encrypted = bool(p.flags & lt::peer_info::rc4_encrypted);
+        out.push_back(std::move(r));
+    }
+    return out;
+}
+
+rust::Vec<TrackerRow> Session::trackers(rust::Str id) const {
+    lt::torrent_handle h = find(ses_, id);
+    rust::Vec<TrackerRow> out;
+    for (auto const& t : h.trackers()) {
+        TrackerRow r;
+        r.url = t.url;
+        std::string status = "Not contacted";
+        for (auto const& ep : t.endpoints) {
+            for (auto const& info : ep.info_hashes) {
+                if (info.fails > 0) status = "Error: " + info.last_error.message();
+                else if (info.updating) status = "Updating";
+                else if (info.start_sent) status = "Working";
+            }
+        }
+        r.status = status;
+        out.push_back(std::move(r));
+    }
+    return out;
+}
+
+rust::Vec<std::uint8_t> Session::have_pieces(rust::Str id) const {
+    lt::torrent_handle h = find(ses_, id);
+    rust::Vec<std::uint8_t> out;
+    auto ti = h.torrent_file();
+    if (!ti) return out;
+    for (lt::piece_index_t p{0}; p < lt::piece_index_t(ti->num_pieces()); ++p)
+        out.push_back(h.have_piece(p) ? 1 : 0);
+    return out;
+}
+
+DiscoveryFlags Session::discovery_flags() const {
+    lt::settings_pack s = ses_.get_settings();
+    return DiscoveryFlags{s.get_bool(lt::settings_pack::enable_dht), s.get_bool(lt::settings_pack::enable_lsd),
+                          s.get_bool(lt::settings_pack::enable_upnp), s.get_bool(lt::settings_pack::enable_natpmp)};
+}
+
+void Session::pause(rust::Str id) const {
+    lt::torrent_handle h = find(ses_, id);
+    h.unset_flags(lt::torrent_flags::auto_managed);
+    h.pause();
+}
+
+void Session::resume(rust::Str id) const {
+    lt::torrent_handle h = find(ses_, id);
+    h.unset_flags(lt::torrent_flags::auto_managed);
+    h.resume();
+}
+
+void Session::remove(rust::Str id, bool delete_files) const {
+    lt::torrent_handle h = find(ses_, id);
+    ses_.remove_torrent(h, delete_files ? lt::session::delete_files : lt::remove_flags_t{});
+}
+
+void Session::recheck(rust::Str id) const { find(ses_, id).force_recheck(); }
+
+void Session::set_priorities(rust::Str id, rust::Slice<const std::uint8_t> prios) const {
+    std::vector<lt::download_priority_t> v;
+    for (std::uint8_t p : prios) v.push_back(lt::download_priority_t{p > 7 ? std::uint8_t(7) : p});
+    find(ses_, id).prioritize_files(v);
+}
+
+void Session::set_sequential(rust::Str id, bool on) const {
+    lt::torrent_handle h = find(ses_, id);
+    if (on) h.set_flags(lt::torrent_flags::sequential_download);
+    else h.unset_flags(lt::torrent_flags::sequential_download);
+}
+
+// 0 means unlimited in the Rust API; libtorrent uses -1 for that on per-torrent limits.
+void Session::set_torrent_limits(rust::Str id, std::uint64_t down, std::uint64_t up) const {
+    lt::torrent_handle h = find(ses_, id);
+    h.set_download_limit(down == 0 ? -1 : int(down));
+    h.set_upload_limit(up == 0 ? -1 : int(up));
+}
+
+void Session::set_global_limits(std::uint64_t down, std::uint64_t up) const {
+    lt::settings_pack p;
+    p.set_int(lt::settings_pack::download_rate_limit, int(down));
+    p.set_int(lt::settings_pack::upload_rate_limit, int(up));
+    ses_.apply_settings(std::move(p));
+}
+
+void Session::add_peer(rust::Str id, rust::Str ip, std::uint16_t port) const {
+    lt::error_code ec;
+    lt::address a = lt::make_address(std::string(ip), ec);
+    if (ec) throw std::runtime_error(ec.message());
+    find(ses_, id).connect_peer(lt::tcp::endpoint(a, port));
+}
+
+// Forced = both directions pe_forced, RC4 only: plaintext peers are refused.
+void Session::set_encryption(std::int32_t mode) const {
+    lt::settings_pack p;
+    using sp = lt::settings_pack;
+    if (mode == 0) {
+        p.set_int(sp::out_enc_policy, sp::pe_forced);
+        p.set_int(sp::in_enc_policy, sp::pe_forced);
+        p.set_int(sp::allowed_enc_level, sp::pe_rc4);
+        p.set_bool(sp::prefer_rc4, true);
+    } else if (mode == 1) {
+        p.set_int(sp::out_enc_policy, sp::pe_enabled);
+        p.set_int(sp::in_enc_policy, sp::pe_enabled);
+        p.set_int(sp::allowed_enc_level, sp::pe_both);
+    } else {
+        p.set_int(sp::out_enc_policy, sp::pe_disabled);
+        p.set_int(sp::in_enc_policy, sp::pe_disabled);
+        p.set_int(sp::allowed_enc_level, sp::pe_plaintext);
+    }
+    ses_.apply_settings(std::move(p));
+}
+
+// With a proxy: everything (peers, trackers, hostnames) goes through it and the
+// features that talk to the network directly are switched off to avoid leaks.
+void Session::set_proxy(bool enabled, rust::Str host, std::uint16_t port, rust::Str user,
+                        rust::Str pass) const {
+    lt::settings_pack p;
+    using sp = lt::settings_pack;
+    if (enabled) {
+        bool const auth = !user.empty();
+        p.set_int(sp::proxy_type, auth ? sp::socks5_pw : sp::socks5);
+        p.set_str(sp::proxy_hostname, std::string(host));
+        p.set_int(sp::proxy_port, port);
+        p.set_str(sp::proxy_username, std::string(user));
+        p.set_str(sp::proxy_password, std::string(pass));
+        p.set_bool(sp::proxy_hostnames, true);
+        p.set_bool(sp::proxy_peer_connections, true);
+        p.set_bool(sp::proxy_tracker_connections, true);
+        p.set_bool(sp::enable_lsd, false);
+        p.set_bool(sp::enable_upnp, false);
+        p.set_bool(sp::enable_natpmp, false);
+        // uTP is UDP; keep peer traffic on TCP so it cannot bypass the SOCKS5 CONNECT path.
+        p.set_bool(sp::enable_outgoing_utp, false);
+        p.set_bool(sp::enable_incoming_utp, false);
+    } else {
+        p.set_int(sp::proxy_type, sp::none);
+        p.set_bool(sp::enable_lsd, discovery_);
+        p.set_bool(sp::enable_upnp, discovery_);
+        p.set_bool(sp::enable_natpmp, discovery_);
+        p.set_bool(sp::enable_outgoing_utp, true);
+        p.set_bool(sp::enable_incoming_utp, true);
+    }
+    ses_.apply_settings(std::move(p));
+}
+
+rust::Vec<std::uint8_t> Session::save_session_state() const {
+    std::vector<char> buf = lt::write_session_params_buf(ses_.session_state(lt::session::save_dht_state));
+    rust::Vec<std::uint8_t> out;
+    for (char c : buf) out.push_back(std::uint8_t(c));
+    return out;
+}
+
+// Asks every torrent for resume data and waits (up to timeout) for the answers.
+// Failures (e.g. nothing changed, no metadata) are skipped; their old file stays valid.
+rust::Vec<ResumeBlob> Session::save_resume(std::uint32_t timeout_ms) const {
+    int pending = 0;
+    for (lt::torrent_handle const& h : ses_.get_torrents()) {
+        if (!h.is_valid()) continue;
+        h.save_resume_data(lt::torrent_handle::save_info_dict);
+        ++pending;
+    }
+    rust::Vec<ResumeBlob> out;
+    auto const deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (pending > 0 && std::chrono::steady_clock::now() < deadline) {
+        ses_.wait_for_alert(std::chrono::milliseconds(100));
+        std::vector<lt::alert*> alerts;
+        ses_.pop_alerts(&alerts);
+        for (lt::alert* a : alerts) {
+            if (auto* ok = lt::alert_cast<lt::save_resume_data_alert>(a)) {
+                std::vector<char> buf = lt::write_resume_data_buf(ok->params);
+                ResumeBlob b;
+                b.id = id_of(ok->params.info_hashes);
+                for (char c : buf) b.data.push_back(std::uint8_t(c));
+                out.push_back(std::move(b));
+                --pending;
+            } else if (lt::alert_cast<lt::save_resume_data_failed_alert>(a)) {
+                --pending;
+            }
+        }
+    }
+    return out;
+}
+
+TorrentMeta inspect_torrent(rust::Slice<const std::uint8_t> bytes) {
+    lt::add_torrent_params atp = lt::load_torrent_buffer(
+        lt::span<char const>(reinterpret_cast<char const*>(bytes.data()), bytes.size()),
+        torrent_limits());
+    TorrentMeta m;
+    m.id = id_of(atp.ti->info_hashes());
+    m.name = atp.ti->name();
+    lt::file_storage const& fs = atp.ti->files();
+    for (lt::file_index_t i{0}; i < lt::file_index_t(fs.num_files()); ++i) {
+        FileRow f;
+        f.path = fs.file_path(i);
+        f.size = std::uint64_t(fs.file_size(i));
+        f.progress = 0.0f;
+        f.priority = 4;
+        m.files.push_back(std::move(f));
+    }
+    return m;
+}
+
+rust::Vec<std::uint8_t> make_torrent(rust::Str dir, rust::Slice<const std::uint64_t> sizes,
+                                     std::uint32_t piece_len, rust::Str tracker) {
+    namespace fsys = std::filesystem;
+    fsys::path const base{std::string(dir)};
+    lt::file_storage fs;
+    if (sizes.size() == 1) {
+        write_payload(base / "payload.bin", sizes[0], 0);
+        fs.add_file("payload.bin", std::int64_t(sizes[0]));
+    } else {
+        for (std::size_t i = 0; i < sizes.size(); ++i) {
+            std::string const rel = "payload/f" + std::to_string(i) + ".bin";
+            write_payload(base / rel, sizes[i], std::uint32_t(i));
+            fs.add_file(rel, std::int64_t(sizes[i]));
+        }
+    }
+    lt::create_torrent ct(fs, int(piece_len));
+    if (!tracker.empty()) ct.add_tracker(std::string(tracker));
+    lt::error_code ec;
+    lt::set_piece_hashes(ct, base.string(), ec);
+    if (ec) throw std::runtime_error(ec.message());
+    std::vector<char> buf = ct.generate_buf();
+    rust::Vec<std::uint8_t> out;
+    for (char c : buf) out.push_back(std::uint8_t(c));
+    return out;
 }
 
 } // namespace nyx

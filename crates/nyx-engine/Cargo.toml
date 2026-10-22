@@ -5,9 +5,17 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 
+[features]
+# Test helpers (torrent maker, add_peer, SOCKS5 stub, plaintext-only override). Never enabled in the app.
+test-support = []
+
 [dependencies]
 cxx = "1"
+nyx-core = { path = "../nyx-core" }
 
 [build-dependencies]
 cxx-build = "1"
 vcpkg = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
