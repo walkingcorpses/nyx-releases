@@ -221,6 +221,25 @@ impl Engine {
         Ok(self.inner.set_sequential(id, on)?)
     }
 
+    /// Changes the save folder of a torrent (created first). For a magnet still fetching metadata
+    /// this just sets the path. Errors creating the folder come back as `Backend`.
+    pub fn set_save_path(&self, id: &TorrentId, path: &Path) -> Result<(), EngineError> {
+        if let Some(msg) = prepare_save_dir(path) {
+            return Err(EngineError::Backend(msg));
+        }
+        self.meta.lock().unwrap().save_errors.remove(id);
+        Ok(self.inner.move_storage(id, &path_str(path))?)
+    }
+
+    /// Sets or clears the torrent's category label (the folder is chosen separately).
+    pub fn set_category(&self, id: &TorrentId, category: Option<String>) {
+        let mut m = self.meta.lock().unwrap();
+        match category {
+            Some(c) => m.categories.insert(id.clone(), c),
+            None => m.categories.remove(id),
+        };
+    }
+
     /// Rate caps in bytes per second, 0 = unlimited. `None` sets the global caps.
     pub fn set_limits(&self, id: Option<&TorrentId>, down: u64, up: u64) -> Result<(), EngineError> {
         match id {

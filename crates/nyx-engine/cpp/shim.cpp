@@ -388,6 +388,11 @@ void Session::set_sequential(rust::Str id, bool on) const {
     else h.unset_flags(lt::torrent_flags::sequential_download);
 }
 
+// Existing files at the destination are kept (never overwritten): a move must not destroy data.
+void Session::move_storage(rust::Str id, rust::Str path) const {
+    find(ses_, id).move_storage(std::string(path), lt::move_flags_t::dont_replace);
+}
+
 // 0 means unlimited in the Rust API; libtorrent uses -1 for that on per-torrent limits.
 void Session::set_torrent_limits(rust::Str id, std::uint64_t down, std::uint64_t up) const {
     lt::torrent_handle h = find(ses_, id);

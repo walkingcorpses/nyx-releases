@@ -1,0 +1,107 @@
+/* app.css - Nyx theme. Dark only: near-black base, violet and cyan accents, glass panels.
+   All colours and sizes are tokens here so components never hard-code them. */
+
+:root {
+  color-scheme: dark;
+
+  --bg: #07060d;
+  --bg-raised: #0d0b16;
+  --glass: rgba(255, 255, 255, 0.045);
+  --glass-strong: rgba(255, 255, 255, 0.075);
+  --line: rgba(255, 255, 255, 0.085);
+  --line-strong: rgba(255, 255, 255, 0.16);
+
+  --text: #ebe8f7;
+  --text-dim: #9d98b4;
+  --text-faint: #6a6580;
+
+  --violet: #8b5cf6;
+  --violet-soft: rgba(139, 92, 246, 0.18);
+  --cyan: #22d3ee;
+  --cyan-soft: rgba(34, 211, 238, 0.16);
+  --good: #4ade80;
+  --warn: #fbbf24;
+  --bad: #fb7185;
+
+  --radius: 10px;
+  --radius-sm: 6px;
+  --row-h: 46px;
+  --font: 'Segoe UI Variable Text', 'Segoe UI', system-ui, sans-serif;
+  --mono: 'Cascadia Mono', 'Consolas', monospace;
+}
+
+* { box-sizing: border-box; }
+
+html, body, #app { height: 100%; margin: 0; }
+
+body {
+  background:
+    radial-gradient(900px 500px at 12% -10%, rgba(139, 92, 246, 0.16), transparent 60%),
+    radial-gradient(800px 460px at 100% 0%, rgba(34, 211, 238, 0.09), transparent 60%),
+    var(--bg);
+  color: var(--text);
+  font: 13px/1.4 var(--font);
+  overflow: hidden;
+  user-select: none;
+  -webkit-font-smoothing: antialiased;
+}
+
+button, input, select { font: inherit; color: inherit; }
+input[type='text'], input[type='number'], input[type='password'], select {
+  user-select: text;
+}
+
+/* Thin themed scrollbars */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: var(--line-strong); border-radius: 8px; border: 2px solid transparent; background-clip: content-box; }
+::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.28); background-clip: content-box; border: 2px solid transparent; }
+::-webkit-scrollbar-track { background: transparent; }
+
+/* Shared building blocks */
+
+.glass {
+  background: var(--glass);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  backdrop-filter: blur(18px) saturate(1.2);
+}
+
+.btn {
+  display: inline-flex; align-items: center; gap: 6px;
+  height: 30px; padding: 0 12px;
+  border: 1px solid var(--line); border-radius: var(--radius-sm);
+  background: var(--glass); cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, transform 0.08s;
+}
+.btn:hover:not(:disabled) { background: var(--glass-strong); border-color: var(--line-strong); }
+.btn:active:not(:disabled) { transform: translateY(1px); }
+.btn:disabled { opacity: 0.4; cursor: default; }
+.btn.primary {
+  background: linear-gradient(135deg, var(--violet), #6d4be0);
+  border-color: transparent; font-weight: 600;
+  box-shadow: 0 4px 18px rgba(139, 92, 246, 0.35);
+}
+.btn.primary:hover:not(:disabled) { background: linear-gradient(135deg, #9d73ff, #7a58ee); }
+.btn.danger { color: var(--bad); }
+.btn.icon { width: 30px; padding: 0; justify-content: center; }
+
+.field {
+  width: 100%; height: 30px; padding: 0 10px;
+  background: rgba(0, 0, 0, 0.35); border: 1px solid var(--line); border-radius: var(--radius-sm);
+  outline: none; transition: border-color 0.15s, box-shadow 0.15s;
+}
+.field:focus { border-color: var(--violet); box-shadow: 0 0 0 3px var(--violet-soft); }
+.field:disabled { opacity: 0.5; }
+
+.chip {
+  display: inline-block; padding: 1px 8px; border-radius: 99px; font-size: 11px;
+  background: var(--violet-soft); color: #c4b0ff; border: 1px solid rgba(139, 92, 246, 0.3);
+}
+
+.muted { color: var(--text-dim); }
+.num { font-variant-numeric: tabular-nums; }
+.error-text { color: var(--bad); font-size: 12px; }
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation: none !important; transition: none !important; }
+}

@@ -238,6 +238,14 @@ impl AppState {
         self.engine.set_file_priorities(id, &prios).map_err(|e| e.to_string())
     }
 
+    /// Sets the save folder (checked like any other) and category of an existing torrent. Used by
+    /// the add dialog for magnets, which are added before the user has chosen a folder.
+    pub fn set_torrent_options(&self, id: &TorrentId, save_path: &str, category: Option<String>) -> Result<(), String> {
+        let dir = self.resolve_save_path(save_path, category.as_deref())?;
+        self.engine.set_category(id, category);
+        self.engine.set_save_path(id, &dir).map_err(|e| e.to_string())
+    }
+
     /// Files, peers and trackers for the drawer.
     pub fn get_detail(&self, id: &TorrentId) -> Result<DetailDto, String> {
         self.engine.torrent_detail(id).map(Into::into).map_err(|e| e.to_string())

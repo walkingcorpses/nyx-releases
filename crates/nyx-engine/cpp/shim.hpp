@@ -72,6 +72,8 @@ public:
     void recheck(rust::Str id) const;
     void set_priorities(rust::Str id, rust::Slice<const std::uint8_t> prios) const;
     void set_sequential(rust::Str id, bool on) const;
+    // Changes where the torrent saves; for a magnet without metadata it just updates the path.
+    void move_storage(rust::Str id, rust::Str path) const;
     void set_torrent_limits(rust::Str id, std::uint64_t down, std::uint64_t up) const;
     void set_global_limits(std::uint64_t down, std::uint64_t up) const;
     void add_peer(rust::Str id, rust::Str ip, std::uint16_t port) const;

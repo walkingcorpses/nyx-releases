@@ -178,3 +178,20 @@ fn detail_lists_files_peers_trackers() {
     assert!(!d.peers.is_empty());
     assert!(d.trackers.is_empty());
 }
+
+/// A magnet still fetching metadata can be pointed at another folder, and categories can be changed.
+#[test]
+fn magnet_save_path_and_category_can_change() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (e, _) = engine(tmp.path(), "e");
+    let magnet = format!("magnet:?xt=urn:btih:{}", "cd".repeat(20));
+    let id = e.add_magnet(&magnet, AddOptions::new(tmp.path().join("first"))).unwrap();
+    let target = tmp.path().join("second");
+    e.set_save_path(&id, &target).unwrap();
+    assert!(target.is_dir());
+    assert!(wait_until(Duration::from_secs(5), || e.snapshot()[0].save_path == target));
+    e.set_category(&id, Some("tv".into()));
+    assert_eq!(e.snapshot()[0].category.as_deref(), Some("tv"));
+    e.set_category(&id, None);
+    assert_eq!(e.snapshot()[0].category, None);
+}

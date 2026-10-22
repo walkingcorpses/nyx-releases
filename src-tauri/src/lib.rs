@@ -89,6 +89,7 @@ pub fn run() {
             commands::inspect_torrent,
             commands::torrent_action,
             commands::set_priorities,
+            commands::set_torrent_options,
             commands::get_detail,
             commands::get_magnet,
             commands::move_in_queue,

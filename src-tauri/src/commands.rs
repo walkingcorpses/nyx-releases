@@ -49,6 +49,12 @@ pub fn set_priorities(state: St, id: String, priorities: Vec<u8>) -> Result<(), 
     state.set_priorities(&id, priorities)
 }
 
+/// Final folder and category for a torrent added from a magnet (chosen after the file list arrived).
+#[tauri::command]
+pub fn set_torrent_options(state: St, id: String, save_path: String, category: Option<String>) -> Result<(), String> {
+    state.set_torrent_options(&id, &save_path, category)
+}
+
 /// Files, peers and trackers for the detail drawer.
 #[tauri::command]
 pub fn get_detail(state: St, id: String) -> Result<DetailDto, String> {

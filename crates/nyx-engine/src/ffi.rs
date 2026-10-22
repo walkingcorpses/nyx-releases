@@ -102,6 +102,7 @@ mod bridge {
         fn recheck(self: &Session, id: &str) -> Result<()>;
         fn set_priorities(self: &Session, id: &str, prios: &[u8]) -> Result<()>;
         fn set_sequential(self: &Session, id: &str, on: bool) -> Result<()>;
+        fn move_storage(self: &Session, id: &str, path: &str) -> Result<()>;
         fn set_torrent_limits(self: &Session, id: &str, down: u64, up: u64) -> Result<()>;
         fn set_global_limits(self: &Session, down: u64, up: u64) -> Result<()>;
         fn add_peer(self: &Session, id: &str, ip: &str, port: u16) -> Result<()>;

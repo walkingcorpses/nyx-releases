@@ -243,6 +243,12 @@
           "markdownDescription": "Enables the set_settings command without any pre-configured scope."
         },
         {
+          "description": "Enables the set_torrent_options command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-set-torrent-options",
+          "markdownDescription": "Enables the set_torrent_options command without any pre-configured scope."
+        },
+        {
           "description": "Enables the take_pending_args command without any pre-configured scope.",
           "type": "string",
           "const": "allow-take-pending-args",
@@ -325,6 +331,12 @@
           "type": "string",
           "const": "deny-set-settings",
           "markdownDescription": "Denies the set_settings command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the set_torrent_options command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-set-torrent-options",
+          "markdownDescription": "Denies the set_torrent_options command without any pre-configured scope."
         },
         {
           "description": "Denies the take_pending_args command without any pre-configured scope.",
