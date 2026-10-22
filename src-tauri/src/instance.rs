@@ -3,11 +3,15 @@
 // parks them for the UI and wakes the window.
 
 use std::io::Write;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::state::AppState;
+
+/// Arguments forwarded by a second launch before AppState exists (the first instance is still
+/// starting). `queue_own_args` moves them into the state once it is ready, so none are lost.
+static EARLY: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// Keeps only arguments Nyx should act on: magnet links and .torrent file paths. Anything
 /// else (flags, other files) is dropped so a launch argument can never do more than add a torrent.
@@ -44,8 +48,9 @@ pub fn handle_args(app: &AppHandle, args: &[String]) {
     for a in &wanted {
         test_log(&format!("forwarded: {a}"));
     }
-    if let Some(state) = app.try_state::<Arc<AppState>>() {
-        state.push_pending(wanted);
+    match app.try_state::<Arc<AppState>>() {
+        Some(state) => state.push_pending(wanted),
+        None => EARLY.lock().unwrap().extend(wanted), // still starting: keep them for later
     }
     show_main(app);
     let _ = app.emit("app://open", ());
@@ -54,10 +59,11 @@ pub fn handle_args(app: &AppHandle, args: &[String]) {
 /// Arguments of this process's own launch: parked for the UI. Returns true if there were any,
 /// so startup can show the window even when "start minimized" is on.
 pub fn queue_own_args(app: &AppHandle, args: &[String]) -> bool {
-    let wanted = filter_args(args);
+    let mut wanted = filter_args(args);
     for a in &wanted {
         test_log(&format!("own: {a}"));
     }
+    wanted.extend(std::mem::take(&mut *EARLY.lock().unwrap()));
     let any = !wanted.is_empty();
     if let Some(state) = app.try_state::<Arc<AppState>>() {
         state.push_pending(wanted);
