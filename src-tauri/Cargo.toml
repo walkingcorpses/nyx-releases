@@ -1,0 +1,39 @@
+# nyx: the Tauri 2 app (the nyx.exe). Glues the engine and nyx-core to the Svelte UI.
+[package]
+name = "nyx"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[lib]
+# Tauri 2 layout: logic in the lib so integration tests can import it; main.rs just calls run().
+name = "nyx_lib"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nyx"
+path = "src/main.rs"
+
+[features]
+# Set by the release build: serve the UI embedded in the exe instead of from the dev server.
+custom-protocol = ["tauri/custom-protocol"]
+
+[dependencies]
+nyx-core = { path = "../crates/nyx-core" }
+nyx-engine = { path = "../crates/nyx-engine" }
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-single-instance = "2"
+tauri-plugin-notification = "2"
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+winreg = "0.55"
+windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging"] }
+
+[build-dependencies]
+tauri-build = "2"
+
+[dev-dependencies]
+tempfile = "3"
+nyx-engine = { path = "../crates/nyx-engine", features = ["test-support"] }

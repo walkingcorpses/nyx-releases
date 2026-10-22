@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-get-detail"
+description = "Enables the get_detail command without any pre-configured scope."
+commands.allow = ["get_detail"]
+
+[[permission]]
+identifier = "deny-get-detail"
+description = "Denies the get_detail command without any pre-configured scope."
+commands.deny = ["get_detail"]

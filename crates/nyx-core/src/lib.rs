@@ -11,7 +11,7 @@ pub use categories::{Categories, CategoryDef};
 pub use queue::{Action, Queue, QueueEntry};
 pub use scheduler::{Block, Schedule};
 pub use settings::{data_dir, EncryptionPref, ProxySettings, Settings};
-pub use validate::{check_torrent_bytes, parse_magnet, safe_join, Magnet, ParseError};
+pub use validate::{build_magnet, check_torrent_bytes, parse_magnet, safe_join, Magnet, ParseError};
 
 /// Torrent identifier: lowercase hex info hash (40 chars v1, 64 chars v2).
 /// Later crates import this so every layer names torrents the same way.

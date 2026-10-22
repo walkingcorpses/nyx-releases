@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-set-priorities"
+description = "Enables the set_priorities command without any pre-configured scope."
+commands.allow = ["set_priorities"]
+
+[[permission]]
+identifier = "deny-set-priorities"
+description = "Denies the set_priorities command without any pre-configured scope."
+commands.deny = ["set_priorities"]

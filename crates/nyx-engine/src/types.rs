@@ -48,6 +48,8 @@ pub struct TorrentState {
     pub size: u64,
     pub peers: u32,
     pub category: Option<String>,
+    /// Folder the torrent saves into (for "open folder").
+    pub save_path: PathBuf,
 }
 
 /// A connected peer, shown in the detail drawer.

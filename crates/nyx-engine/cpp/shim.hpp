@@ -62,6 +62,8 @@ public:
     // One byte per piece, 1 = we have it (tests: sequential download, resume).
     rust::Vec<std::uint8_t> have_pieces(rust::Str id) const;
     DiscoveryFlags discovery_flags() const;
+    // Current encryption policy read back from libtorrent: 0 forced, 1 prefer, 2 plaintext only.
+    std::int32_t encryption_mode() const;
 
     // Controls.
     void pause(rust::Str id) const;

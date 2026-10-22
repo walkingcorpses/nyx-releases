@@ -260,6 +260,7 @@ rust::Vec<TorrentRow> Session::snapshot() const {
         auto ti = st.torrent_file.lock();
         row.size = ti ? std::uint64_t(ti->total_size()) : 0;
         row.peers = std::uint32_t(st.num_peers);
+        row.save_path = st.save_path;
         out.push_back(std::move(row));
     }
     return out;
@@ -346,6 +347,14 @@ DiscoveryFlags Session::discovery_flags() const {
     lt::settings_pack s = ses_.get_settings();
     return DiscoveryFlags{s.get_bool(lt::settings_pack::enable_dht), s.get_bool(lt::settings_pack::enable_lsd),
                           s.get_bool(lt::settings_pack::enable_upnp), s.get_bool(lt::settings_pack::enable_natpmp)};
+}
+
+std::int32_t Session::encryption_mode() const {
+    lt::settings_pack s = ses_.get_settings();
+    int const out = s.get_int(lt::settings_pack::out_enc_policy);
+    if (out == lt::settings_pack::pe_forced) return 0;
+    if (out == lt::settings_pack::pe_enabled) return 1;
+    return 2;
 }
 
 void Session::pause(rust::Str id) const {

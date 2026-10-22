@@ -16,6 +16,7 @@ mod bridge {
         up_rate: u64,
         size: u64,
         peers: u32,
+        save_path: String,
     }
 
     /// Result of parsing a .torrent without adding it.
@@ -93,6 +94,7 @@ mod bridge {
         fn trackers(self: &Session, id: &str) -> Result<Vec<TrackerRow>>;
         fn have_pieces(self: &Session, id: &str) -> Result<Vec<u8>>;
         fn discovery_flags(self: &Session) -> DiscoveryFlags;
+        fn encryption_mode(self: &Session) -> i32;
 
         fn pause(self: &Session, id: &str) -> Result<()>;
         fn resume(self: &Session, id: &str) -> Result<()>;

@@ -183,6 +183,20 @@ pub fn safe_join(base: &Path, rel: &str) -> Result<PathBuf, ParseError> {
     Ok(out)
 }
 
+/// Builds a shareable magnet link for a torrent id (the inverse of `parse_magnet`).
+/// A 64-char id is a v2 hash and goes out as a multihash (`btmh`, prefix 1220).
+/// Why: the "copy magnet" action only knows the id, the name and the tracker list.
+pub fn build_magnet(id: &str, name: &str, trackers: &[String]) -> String {
+    use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
+    let xt = if id.len() == 64 { format!("urn:btmh:1220{id}") } else { format!("urn:btih:{id}") };
+    let mut uri = format!("magnet:?xt={xt}&dn={}", utf8_percent_encode(name, NON_ALPHANUMERIC));
+    for t in trackers {
+        uri.push_str("&tr=");
+        uri.push_str(&utf8_percent_encode(t, NON_ALPHANUMERIC).to_string());
+    }
+    uri
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,5 +302,17 @@ mod tests {
         assert!(safe_join(base, r"a\b\c.mkv").unwrap().starts_with(base));
         // names that merely contain a reserved word are fine
         assert!(safe_join(base, "console.txt").is_ok());
+    }
+
+    #[test]
+    fn build_magnet_round_trips_through_parse() {
+        let id = "ab".repeat(20);
+        let uri = build_magnet(&id, "My Film (2020)", &["http://t.example/announce".to_string()]);
+        let m = parse_magnet(&uri).unwrap();
+        assert_eq!(m.info_hash, id);
+        assert_eq!(m.name.as_deref(), Some("My Film (2020)"));
+        assert_eq!(m.trackers, vec!["http://t.example/announce".to_string()]);
+        let v2 = build_magnet(&"cd".repeat(32), "x", &[]);
+        assert_eq!(parse_magnet(&v2).unwrap().info_hash.len(), 64);
     }
 }

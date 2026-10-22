@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-list-torrents"
+description = "Enables the list_torrents command without any pre-configured scope."
+commands.allow = ["list_torrents"]
+
+[[permission]]
+identifier = "deny-list-torrents"
+description = "Denies the list_torrents command without any pre-configured scope."
+commands.deny = ["list_torrents"]

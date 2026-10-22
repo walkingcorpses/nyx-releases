@@ -1,0 +1,100 @@
+// commands.rs - the Tauri commands the UI can call. Each is a thin wrapper that forwards to
+// AppState (state.rs), where the logic and tests live. The list here must match
+// build.rs COMMANDS and capabilities/default.json, which is what limits the UI to these.
+
+use std::sync::Arc;
+
+use nyx_core::{Settings, TorrentId};
+use tauri::State;
+
+use crate::dto::{DetailDto, MetaDto, TorrentDto};
+use crate::state::AppState;
+use crate::{assoc, instance};
+
+type St<'a> = State<'a, Arc<AppState>>;
+
+/// Every torrent right now: the UI's starting point before it follows `torrents://update`.
+#[tauri::command]
+pub fn list_torrents(state: St) -> Result<Vec<TorrentDto>, String> {
+    Ok(state.list_torrents())
+}
+
+/// Adds a magnet link. `paused` lets the UI hold it while the user picks files.
+#[tauri::command]
+pub fn add_magnet(state: St, uri: String, save_path: String, category: Option<String>, paused: Option<bool>) -> Result<TorrentId, String> {
+    state.add_magnet(&uri, &save_path, category, paused.unwrap_or(false))
+}
+
+/// Adds a .torrent from a file path.
+#[tauri::command]
+pub fn add_torrent(state: St, path: String, save_path: String, category: Option<String>, paused: Option<bool>) -> Result<TorrentId, String> {
+    state.add_torrent(&path, &save_path, category, paused.unwrap_or(false))
+}
+
+/// Lists a .torrent's files for the add dialog, without adding it.
+#[tauri::command]
+pub fn inspect_torrent(state: St, path: String) -> Result<MetaDto, String> {
+    state.inspect_torrent(&path)
+}
+
+/// pause, resume, remove, remove_delete, recheck, open_folder, sequential_on, sequential_off.
+#[tauri::command]
+pub fn torrent_action(state: St, id: String, action: String) -> Result<(), String> {
+    state.torrent_action(&id, &action)
+}
+
+/// Per-file priorities for one torrent (0 = skip).
+#[tauri::command]
+pub fn set_priorities(state: St, id: String, priorities: Vec<u8>) -> Result<(), String> {
+    state.set_priorities(&id, priorities)
+}
+
+/// Files, peers and trackers for the detail drawer.
+#[tauri::command]
+pub fn get_detail(state: St, id: String) -> Result<DetailDto, String> {
+    state.get_detail(&id)
+}
+
+/// A shareable magnet link for "copy magnet".
+#[tauri::command]
+pub fn get_magnet(state: St, id: String) -> Result<String, String> {
+    state.get_magnet(&id)
+}
+
+/// Re-orders the queue.
+#[tauri::command]
+pub fn move_in_queue(state: St, id: String, position: u32) -> Result<(), String> {
+    state.move_in_queue(&id, position);
+    Ok(())
+}
+
+/// Current settings.
+#[tauri::command]
+pub fn get_settings(state: St) -> Result<Settings, String> {
+    Ok(state.get_settings())
+}
+
+/// Validates, saves and applies settings.
+#[tauri::command]
+pub fn set_settings(state: St, settings: Settings) -> Result<(), String> {
+    state.set_settings(settings)
+}
+
+/// "Make Nyx the default": registers .torrent and magnet: for this exe (current user only).
+#[tauri::command]
+pub fn register_associations() -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    assoc::register(&exe).map_err(|e| e.to_string())
+}
+
+/// Removes the registrations made by `register_associations`.
+#[tauri::command]
+pub fn unregister_associations() -> Result<(), String> {
+    assoc::unregister().map_err(|e| e.to_string())
+}
+
+/// Magnets / .torrent paths that arrived (command line, second launch) since the last call.
+#[tauri::command]
+pub fn take_pending_args(state: St) -> Result<Vec<String>, String> {
+    Ok(instance::drain(&state))
+}

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-unregister-associations"
+description = "Enables the unregister_associations command without any pre-configured scope."
+commands.allow = ["unregister_associations"]
+
+[[permission]]
+identifier = "deny-unregister-associations"
+description = "Denies the unregister_associations command without any pre-configured scope."
+commands.deny = ["unregister_associations"]

@@ -1,9 +1,17 @@
 # Nyx workspace root. Every crate lives under crates/ (nyx-engine, nyx-core, ...).
 [workspace]
 resolver = "2"
-members = ["crates/*"]
+members = ["crates/*", "src-tauri"]
 
 [workspace.package]
 edition = "2021"
 version = "0.1.0"
 license = "MIT"
+
+# Release builds: small and fast. LTO + one codegen unit shrink nyx.exe (target under 30 MB).
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-inspect-torrent"
+description = "Enables the inspect_torrent command without any pre-configured scope."
+commands.allow = ["inspect_torrent"]
+
+[[permission]]
+identifier = "deny-inspect-torrent"
+description = "Denies the inspect_torrent command without any pre-configured scope."
+commands.deny = ["inspect_torrent"]

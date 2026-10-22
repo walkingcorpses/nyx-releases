@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-add-magnet"
+description = "Enables the add_magnet command without any pre-configured scope."
+commands.allow = ["add_magnet"]
+
+[[permission]]
+identifier = "deny-add-magnet"
+description = "Denies the add_magnet command without any pre-configured scope."
+commands.deny = ["add_magnet"]

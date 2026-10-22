@@ -156,6 +156,7 @@ impl Engine {
                     up_rate: r.up_rate,
                     size: r.size,
                     peers: r.peers,
+                    save_path: PathBuf::from(r.save_path),
                 }
             })
             .collect()
@@ -274,6 +275,12 @@ impl Engine {
             )?),
             None => Ok(self.inner.set_proxy(false, "", 0, "", "")?),
         }
+    }
+
+    /// The encryption policy libtorrent currently has (read back, not remembered).
+    /// Anything other than the two user modes (test-only plaintext) reads as `Prefer`.
+    pub fn encryption_mode(&self) -> EncryptionMode {
+        if self.inner.encryption_mode() == 0 { EncryptionMode::Forced } else { EncryptionMode::Prefer }
     }
 
     /// DHT, LSD, UPnP and NAT-PMP as libtorrent currently has them.
