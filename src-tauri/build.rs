@@ -10,6 +10,7 @@ const COMMANDS: &[&str] = &[
     "torrent_action",
     "set_priorities",
     "set_torrent_options",
+    "set_torrent_limits",
     "get_detail",
     "get_magnet",
     "move_in_queue",

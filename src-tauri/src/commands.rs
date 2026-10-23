@@ -55,6 +55,12 @@ pub fn set_torrent_options(state: St, id: String, save_path: String, category: O
     state.set_torrent_options(&id, &save_path, category)
 }
 
+/// Per-torrent speed caps in bytes per second (0 = unlimited).
+#[tauri::command]
+pub fn set_torrent_limits(state: St, id: String, down: u64, up: u64) -> Result<(), String> {
+    state.set_torrent_limits(&id, down, up)
+}
+
 /// Files, peers and trackers for the detail drawer.
 #[tauri::command]
 pub fn get_detail(state: St, id: String) -> Result<DetailDto, String> {

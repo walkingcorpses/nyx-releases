@@ -26,6 +26,7 @@ const real = {
   setPriorities: (id: string, priorities: number[]) => invoke<void>('set_priorities', { id, priorities }),
   setTorrentOptions: (id: string, savePath: string, category: string | null) =>
     invoke<void>('set_torrent_options', { id, savePath, category }),
+  setTorrentLimits: (id: string, down: number, up: number) => invoke<void>('set_torrent_limits', { id, down, up }),
   getDetail: (id: string) => invoke<Detail>('get_detail', { id }),
   getMagnet: (id: string) => invoke<string>('get_magnet', { id }),
   moveInQueue: (id: string, position: number) => invoke<void>('move_in_queue', { id, position }),

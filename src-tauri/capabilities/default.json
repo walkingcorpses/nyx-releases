@@ -11,6 +11,7 @@
     "allow-torrent-action",
     "allow-set-priorities",
     "allow-set-torrent-options",
+    "allow-set-torrent-limits",
     "allow-get-detail",
     "allow-get-magnet",
     "allow-move-in-queue",

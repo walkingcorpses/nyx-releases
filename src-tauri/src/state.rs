@@ -246,6 +246,11 @@ impl AppState {
         self.engine.set_save_path(id, &dir).map_err(|e| e.to_string())
     }
 
+    /// Speed caps for one torrent, in bytes per second (0 = unlimited).
+    pub fn set_torrent_limits(&self, id: &TorrentId, down: u64, up: u64) -> Result<(), String> {
+        self.engine.set_limits(Some(id), down, up).map_err(|e| e.to_string())
+    }
+
     /// Files, peers and trackers for the drawer.
     pub fn get_detail(&self, id: &TorrentId) -> Result<DetailDto, String> {
         self.engine.torrent_detail(id).map(Into::into).map_err(|e| e.to_string())

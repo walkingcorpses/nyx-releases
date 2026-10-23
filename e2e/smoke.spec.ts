@@ -107,6 +107,11 @@ test.afterAll(async () => {
 });
 
 test('nyx smoke: empty state, add torrent, settings, tray quit', async () => {
+  // Any console error or uncaught page error (including a Tauri permission denial) fails the test.
+  const problems: string[] = [];
+  page.on('pageerror', (e) => problems.push(`pageerror: ${e.message}`));
+  page.on('console', (m) => m.type() === 'error' && problems.push(`console: ${m.text()}`));
+
   // (a) title bar and empty state
   await expect(page.locator('header').getByText('Nyx', { exact: true })).toBeVisible();
   await expect(page.getByText('Nothing here yet')).toBeVisible();
@@ -125,10 +130,29 @@ test('nyx smoke: empty state, add torrent, settings, tray quit', async () => {
   await expect(dialog).toBeHidden();
   await expect(page.locator('.item').filter({ hasText: 'e2e-sample.bin' })).toHaveCount(1, { timeout: 10_000 });
 
-  // (c) settings: encryption defaults to Forced
+  // The detail drawer loads files from the backend, and the per-torrent actions are accepted.
+  await page.locator('.item').filter({ hasText: 'e2e-sample.bin' }).click();
+  await expect(page.getByRole('region', { name: 'Torrent details' }).getByText('e2e-sample.bin').first()).toBeVisible();
+  await page.getByRole('button', { name: /More/ }).click();
+  await page.getByRole('button', { name: 'Move to front of queue' }).click();
+  await page.getByRole('button', { name: /More/ }).click();
+  await page.getByRole('button', { name: /Speed limit/ }).click();
+  await page.getByLabel('Torrent download limit').fill('500');
+  await page.getByRole('button', { name: 'Apply' }).click();
+  await expect(page.getByRole('dialog', { name: 'Torrent speed limits' })).toBeHidden();
+
+  // (c) settings: encryption defaults to Forced; saving round-trips through the backend
   await page.getByRole('button', { name: 'Settings' }).click();
   await expect(page.getByRole('radio', { name: /Forced/ })).toBeChecked();
+  await page.getByRole('tab', { name: 'Queue' }).click();
+  await page.getByLabel('Max active downloads').fill('5');
+  await page.getByRole('button', { name: 'Save' }).click();
+  await expect(page.getByRole('dialog', { name: 'Settings' })).toBeHidden();
+  await page.getByRole('button', { name: 'Settings' }).click();
+  await page.getByRole('tab', { name: 'Queue' }).click();
+  await expect(page.getByLabel('Max active downloads')).toHaveValue('5');
   await page.getByRole('button', { name: 'Cancel' }).click();
+  expect(problems).toEqual([]);
 
   // (d) Quit from the tray menu ends the process (the menu handler is triggered through the
   // test hook file, so no real menu pops up on the desktop)

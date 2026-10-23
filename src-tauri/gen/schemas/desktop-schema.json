@@ -243,6 +243,12 @@
           "markdownDescription": "Enables the set_settings command without any pre-configured scope."
         },
         {
+          "description": "Enables the set_torrent_limits command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-set-torrent-limits",
+          "markdownDescription": "Enables the set_torrent_limits command without any pre-configured scope."
+        },
+        {
           "description": "Enables the set_torrent_options command without any pre-configured scope.",
           "type": "string",
           "const": "allow-set-torrent-options",
@@ -331,6 +337,12 @@
           "type": "string",
           "const": "deny-set-settings",
           "markdownDescription": "Denies the set_settings command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the set_torrent_limits command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-set-torrent-limits",
+          "markdownDescription": "Denies the set_torrent_limits command without any pre-configured scope."
         },
         {
           "description": "Denies the set_torrent_options command without any pre-configured scope.",

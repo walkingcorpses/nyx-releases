@@ -1,6 +1,7 @@
 <!-- Toolbar.svelte - add buttons, actions for the selected torrent, status filter chips,
      search and the global speed readout. All actions go through api.ts. -->
 <script lang="ts">
+  import LimitDialog from './LimitDialog.svelte';
   import { api } from '../lib/api';
   import { addRequest, filter, search, selected, selectedId, settingsOpen, type Filter } from '../lib/store';
 
@@ -15,6 +16,7 @@
   let removeMenu = $state(false);
   let moreMenu = $state(false);
   let copied = $state(false);
+  let limitOpen = $state(false);
 
   /** File picker -> add dialog. */
   async function addFile(): Promise<void> {
@@ -28,6 +30,12 @@
     void api.torrentAction($selected.id, action);
     if (action.startsWith('remove')) selectedId.set(null);
     removeMenu = false;
+    moreMenu = false;
+  }
+
+  /** Re-orders the download queue: position 0 starts first, a huge position goes last. */
+  function queueMove(position: number): void {
+    if ($selected) void api.moveInQueue($selected.id, position);
     moreMenu = false;
   }
 
@@ -71,6 +79,9 @@
           <button onclick={() => act('open_folder')}>Open folder</button>
           <button onclick={() => { void copyMagnet(); moreMenu = false; }}>Copy magnet link</button>
           <button onclick={() => act('recheck')}>Force recheck</button>
+          <button onclick={() => { limitOpen = true; moreMenu = false; }}>Speed limit…</button>
+          <button onclick={() => queueMove(0)}>Move to front of queue</button>
+          <button onclick={() => queueMove(1_000_000)}>Move to back of queue</button>
         </div>
       {/if}
     </div>
@@ -91,6 +102,10 @@
     </svg>
   </button>
 </div>
+
+{#if limitOpen && $selected}
+  <LimitDialog torrent={$selected} onclose={() => (limitOpen = false)} />
+{/if}
 
 <style>
   .toolbar { display: flex; align-items: center; gap: 14px; padding: 10px 14px; flex-wrap: wrap; }

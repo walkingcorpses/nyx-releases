@@ -100,6 +100,7 @@ export const mockApi = {
   },
   setPriorities: async () => {},
   setTorrentOptions: async () => {},
+  setTorrentLimits: async () => {},
   getDetail: async (id: string): Promise<Detail> => ({
     files: files(id.length),
     peers: Array.from({ length: 6 }, (_, i) => ({

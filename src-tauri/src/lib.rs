@@ -68,6 +68,10 @@ pub fn run() {
         return;
     }
     let data = resolve_data_dir();
+    // Keep the WebView2 profile with the rest of Nyx's data (portable mode writes nothing elsewhere).
+    if std::env::var_os("WEBVIEW2_USER_DATA_FOLDER").is_none() {
+        std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", data.join("webview"));
+    }
     let mut ctx = tauri::generate_context!();
     if std::env::var_os("NYX_DATA_DIR").is_some() {
         // A test instance with its own data folder must not single-instance into the user's real
@@ -90,6 +94,7 @@ pub fn run() {
             commands::torrent_action,
             commands::set_priorities,
             commands::set_torrent_options,
+            commands::set_torrent_limits,
             commands::get_detail,
             commands::get_magnet,
             commands::move_in_queue,
