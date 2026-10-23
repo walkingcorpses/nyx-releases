@@ -8,10 +8,19 @@ WebView2 runtime, which ships with Windows 11.
 - Add torrents from `.torrent` files (picker, drag and drop, "open with") or magnet links (paste, magnet click),
   with a pre-download file tree, save folder, category and sequential option.
 - Peer encryption is forced by default (refuses plaintext peers). Optional SOCKS5 proxy for peers, trackers and
-  hostnames; no fallback to a direct connection, and no direct inbound connections while it is on.
-- Queue, categories, global and per-torrent limits, a weekly speed schedule, tray icon, notifications, single instance.
+  hostnames; no fallback to a direct connection, DHT/LSD/UPnP/NAT-PMP off and no direct inbound connections while
+  it is on. Kill switch (pauses everything when the proxy is unreachable), adapter binding for VPNs, IP blocklist.
+- Queue with drag-to-reorder, categories, global and per-torrent limits, a weekly speed schedule, tray icon,
+  notifications, single instance.
+- RSS auto-download (new feeds are baselined, never flooded), search through a provider you configure, opt-in
+  self-update that installs only a download whose SHA-256 matches the release.
 - Dark-only UI with a live speed graph; the table stays smooth with a thousand torrents.
-- No telemetry. The only network traffic is torrent traffic.
+- No telemetry. The only network traffic is torrent traffic plus the optional update check, RSS and search, which
+  all follow the proxy setting.
+
+Downloads and the user-facing README live in the public repo `walkingcorpses/nyx-releases`; this repo is private.
+Publish a release with `scripts\publish-release.ps1` (tag `vX.Y.Z`, asset `Nyx-X.Y.Z-windows-x64.exe`: the in-app
+updater depends on those names).
 
 Design: `docs/superpowers/specs/2026-10-21-nyx-design.md`. Plan and deviations: `docs/superpowers/plans/2026-10-21-nyx.md`.
 
@@ -66,7 +75,8 @@ Settings has a "Make Nyx the default" button for `.torrent` files and magnet lin
 ## Test
 
 ```powershell
-cargo test --workspace            # core, engine (real libtorrent sessions on loopback), app commands
+cargo test --workspace            # core, engine (real libtorrent sessions on loopback), app, instance tests
+cargo test -p nyx-engine --test swarm -- --ignored --nocapture   # real public swarm, direct and via proxy (needs internet)
 npm --prefix ui test              # UI unit and component tests (Vitest)
 npm --prefix ui run check         # svelte-check
 cd e2e; npx playwright test       # smoke test of the built exe (run build-release.ps1 first)

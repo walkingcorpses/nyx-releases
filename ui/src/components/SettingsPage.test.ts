@@ -30,6 +30,8 @@ function base(): Settings {
     encryption: 'Forced', proxy: null, max_active_downloads: 3, max_active_seeds: 3,
     down_limit: 0, up_limit: 0, schedule: { blocks: [] }, categories: [],
     default_save_dir: 'D:\\Downloads', start_minimized: false, minimize_to_tray: true,
+    kill_switch: true, bind_interface: null, blocklist: null, check_updates: false,
+    rss: { feeds: [], interval_minutes: 30 }, search_url: '',
   };
 }
 

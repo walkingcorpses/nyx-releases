@@ -3,7 +3,7 @@
 // the progress bars and speed graph move. `?rows=1000` in the URL loads 1,000 rows for a
 // scroll-performance check.
 
-import type { Detail, FileItem, Meta, Settings, Status, Torrent, UpdatePayload } from './types';
+import type { AppUpdate, Detail, FileItem, Meta, SearchResult, Settings, AppStatus, Status, Torrent, UpdatePayload } from './types';
 
 const NAMES = [
   'ubuntu-26.04-desktop-amd64.iso', 'Big Buck Bunny (2008) 1080p', 'Sintel.2010.4k.HDR',
@@ -43,7 +43,11 @@ let settings: Settings = {
   down_limit: 0, up_limit: 0, schedule: { blocks: [] },
   categories: [{ name: 'movies', save_dir: 'D:\\Media\\Movies' }, { name: 'software', save_dir: 'D:\\Software' }],
   default_save_dir: 'D:\\Downloads', start_minimized: false, minimize_to_tray: true,
+  kill_switch: true, bind_interface: null, blocklist: null, check_updates: false,
+  rss: { feeds: [{ name: 'Linux ISOs', url: 'https://example.org/feed.xml', filter: 'ubuntu|debian', category: 'software', enabled: true }], interval_minutes: 30 },
+  search_url: '',
 };
+let order: string[] = list.map((t) => t.id);
 
 const subs = new Set<(u: UpdatePayload) => void>();
 
@@ -66,7 +70,7 @@ function tick(): void {
     }
     return t;
   });
-  subs.forEach((cb) => cb({ changed, removed: [] }));
+  subs.forEach((cb) => cb({ changed, removed: [], queue: null }));
 }
 if (typeof window !== 'undefined') setInterval(tick, 1000);
 
@@ -96,7 +100,7 @@ export const mockApi = {
     if (action === 'remove' || action === 'remove_delete') list = list.filter((t) => t.id !== id);
     if (action === 'pause') list = list.map((t) => (t.id === id ? { ...t, status: 'paused', down_rate: 0, up_rate: 0 } : t));
     if (action === 'resume') list = list.map((t) => (t.id === id ? { ...t, status: t.progress >= 1 ? 'seeding' : 'downloading' } : t));
-    subs.forEach((cb) => cb({ changed: list.filter((t) => t.id === id), removed: list.some((t) => t.id === id) ? [] : [id] }));
+    subs.forEach((cb) => cb({ changed: list.filter((t) => t.id === id), removed: list.some((t) => t.id === id) ? [] : [id], queue: null }));
   },
   setPriorities: async () => {},
   setTorrentOptions: async () => {},
@@ -112,9 +116,31 @@ export const mockApi = {
       { url: 'udp://tracker.opentrackr.org:1337/announce', status: 'Working' },
       { url: 'udp://open.stealth.si:80/announce', status: 'Error: timed out' },
     ],
+    down_limit: 0, up_limit: 250 * 1024,
   }),
   getMagnet: async (id: string) => `magnet:?xt=urn:btih:${id}`,
-  moveInQueue: async () => {},
+  moveInQueue: async (id: string, position: number) => {
+    order = order.filter((x) => x !== id);
+    order.splice(Math.min(position, order.length), 0, id);
+    subs.forEach((cb) => cb({ changed: [], removed: [], queue: [...order] }));
+  },
+  getQueueOrder: async () => order,
+  getStatus: async (): Promise<AppStatus> => ({
+    version: '1.0.0',
+    proxy_down: new URLSearchParams(globalThis.location?.search ?? '').has('proxydown'),
+    killed: new URLSearchParams(globalThis.location?.search ?? '').has('proxydown'),
+    update: new URLSearchParams(globalThis.location?.search ?? '').has('update') ? { version: '1.1.0', notes: 'Faster everything.' } : null,
+    warnings: [],
+  }),
+  checkUpdate: async (): Promise<AppUpdate | null> => null,
+  installUpdate: async () => '1.1.0',
+  restartApp: async () => {},
+  rssRunNow: async () => ({ added: 0, baselined: 1, errors: [] }),
+  search: async (query: string): Promise<SearchResult[]> => [
+    { title: `${query} 26.04 Desktop amd64`, link: 'magnet:?xt=urn:btih:' + 'a'.repeat(40), size: 6_200_000_000, seeders: 412 },
+    { title: `${query} Server 26.04`, link: 'https://example.org/x.torrent', size: 2_100_000_000, seeders: 87 },
+  ],
+  fetchTorrentUrl: async () => 'D:\\Downloads\\fetched.torrent',
   getSettings: async () => settings,
   setSettings: async (s: Settings) => { settings = s; },
   registerAssociations: async () => {},
@@ -123,6 +149,8 @@ export const mockApi = {
   onUpdate: async (cb: (u: UpdatePayload) => void) => { subs.add(cb); return () => { subs.delete(cb); }; },
   onOpen: async () => () => {},
   onDrop: async () => () => {},
+  onDragState: async () => () => {},
+  pickFile: async () => 'D:\\lists\\blocklist.txt',
   pickTorrentFile: async () => 'D:\\Downloads\\example.torrent',
   pickFolder: async () => 'D:\\Downloads',
   windowMinimize: async () => {},

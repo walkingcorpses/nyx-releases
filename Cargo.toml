@@ -5,7 +5,7 @@ members = ["crates/*", "src-tauri"]
 
 [workspace.package]
 edition = "2021"
-version = "0.1.0"
+version = "1.0.0"
 license = "MIT"
 
 # Release builds: small and fast. LTO + one codegen unit shrink nyx.exe (target under 30 MB).

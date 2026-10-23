@@ -8,7 +8,7 @@
   import AddDialog from './AddDialog.svelte';
   import { api } from '../lib/api';
   import { isMagnet } from '../lib/format';
-  import { addRequest } from '../lib/store';
+  import { addRequest, dragging } from '../lib/store';
   import type { AddSource } from '../lib/types';
 
   /** Turns a magnet or a path into an add request (ignores anything else). */
@@ -42,6 +42,7 @@
     api.takePendingArgs().then((a) => alive && openFirst(a));
     api.onOpen(() => api.takePendingArgs().then(openFirst)).then((f) => (alive ? offs.push(f) : f()));
     api.onDrop(openFirst).then((f) => (alive ? offs.push(f) : f()));
+    api.onDragState((over) => dragging.set(over)).then((f) => (alive ? offs.push(f) : f()));
     return () => {
       alive = false;
       offs.forEach((f) => f());

@@ -3,9 +3,11 @@
      only hands it back on Save, so Cancel discards everything. -->
 <script lang="ts">
   import CategoryEditor from './CategoryEditor.svelte';
+  import RssEditor from './RssEditor.svelte';
   import ScheduleEditor from './ScheduleEditor.svelte';
   import { api } from '../lib/api';
   import { blockError } from '../lib/schedule';
+  import { appStatus } from '../lib/store';
   import type { Settings } from '../lib/types';
 
   let { settings, onsave, onclose }: {
@@ -14,12 +16,13 @@
     onclose: () => void;
   } = $props();
 
-  type Tab = 'connection' | 'limits' | 'queue' | 'categories' | 'system';
+  type Tab = 'connection' | 'limits' | 'queue' | 'categories' | 'automation' | 'system';
   const tabs: { id: Tab; label: string }[] = [
     { id: 'connection', label: 'Connection' },
     { id: 'limits', label: 'Limits' },
     { id: 'queue', label: 'Queue' },
     { id: 'categories', label: 'Categories' },
+    { id: 'automation', label: 'Automation' },
     { id: 'system', label: 'System' },
   ];
   let tab = $state<Tab>('connection');
@@ -39,6 +42,14 @@
     // svelte-ignore state_referenced_locally
     password: settings.proxy?.password ?? '',
   });
+  // Optional text settings are edited as plain strings; empty means "not set".
+  // svelte-ignore state_referenced_locally
+  let iface = $state(settings.bind_interface ?? '');
+  // svelte-ignore state_referenced_locally
+  let blocklistPath = $state(settings.blocklist ?? '');
+  let updateNote = $state('');
+  let checking = $state(false);
+  let rssNote = $state('');
   let saving = $state(false);
   let error = $state('');
   let note = $state('');
@@ -60,6 +71,8 @@
     error = '';
     const out: Settings = {
       ...$state.snapshot(draft),
+      bind_interface: iface.trim() || null,
+      blocklist: blocklistPath.trim() || null,
       proxy: proxyOn
         ? { host: proxy.host.trim(), port: proxy.port, username: proxy.username || null, password: proxy.password || null }
         : null,
@@ -84,11 +97,43 @@
     }
   }
 
+  /** Asks GitHub whether a newer Nyx exists (the same check the launch option does). */
+  async function checkNow(): Promise<void> {
+    checking = true;
+    updateNote = '';
+    try {
+      const u = await api.checkUpdate();
+      updateNote = u ? `Nyx ${u.version} is available. Use the "Update now" button that appears under the toolbar.` : 'You have the latest version.';
+      appStatus.set(await api.getStatus());
+    } catch (e) {
+      updateNote = String(e);
+    }
+    checking = false;
+  }
+
+  /** Polls the RSS feeds now, with the settings as last saved (save first to test edits). */
+  async function runFeeds(): Promise<void> {
+    rssNote = 'Checking feeds…';
+    try {
+      const r = await api.rssRunNow();
+      rssNote = `Added ${r.added}, recorded ${r.baselined} new feed${r.baselined === 1 ? '' : 's'} as a baseline.` + (r.errors.length ? ` Problems: ${r.errors.join('; ')}` : '');
+    } catch (e) {
+      rssNote = String(e);
+    }
+  }
+
+  async function browseBlocklist(): Promise<void> {
+    const p = await api.pickFile();
+    if (p) blocklistPath = p;
+  }
+
   async function browseDefault(): Promise<void> {
     const p = await api.pickFolder();
     if (p) draft.default_save_dir = p;
   }
 </script>
+
+<svelte:window onkeydown={(e) => e.key === 'Escape' && !saving && onclose()} />
 
 <div class="scrim" role="presentation">
   <div class="dialog glass" role="dialog" aria-modal="true" aria-label="Settings">
@@ -119,9 +164,21 @@
             <label>Username <input class="field" type="text" bind:value={proxy.username} aria-label="Proxy username" /></label>
             <label>Password <input class="field" type="password" bind:value={proxy.password} aria-label="Proxy password" /></label>
           </div>
-          <p class="muted small">Peers, trackers and hostname lookups go through the proxy. Local peer discovery, UPnP and NAT-PMP are switched off. If the proxy is unreachable, Nyx does not fall back to a direct connection.</p>
+          <p class="muted small">Peers, trackers and hostname lookups go through the proxy. DHT, local peer discovery, UPnP and NAT-PMP are switched off, and Nyx accepts no direct inbound connections. If the proxy is unreachable, Nyx does not fall back to a direct connection.</p>
           {#if proxyError}<p class="error-text" role="alert">{proxyError}</p>{/if}
+          <label class="radio"><input type="checkbox" bind:checked={draft.kill_switch} /> <span><b>Kill switch</b> <span class="muted">: pause every torrent while the proxy cannot be reached</span></span></label>
         {/if}
+
+        <h3>Network adapter</h3>
+        <input class="field" type="text" bind:value={iface} placeholder="Leave empty to use any adapter" aria-label="Network adapter" />
+        <p class="muted small">Name or IP of an adapter, for example your VPN. Nyx then listens and connects only through it, so if the adapter goes away nothing connects.</p>
+
+        <h3>IP blocklist</h3>
+        <div class="row">
+          <input class="field" type="text" bind:value={blocklistPath} placeholder="Path of a blocklist file (optional)" aria-label="Blocklist file" />
+          <button class="btn" onclick={browseBlocklist}>Browse…</button>
+        </div>
+        <p class="muted small">PeerGuardian text, plain ranges (1.2.3.4-1.2.3.9) or CIDR. Peers in the list are refused in both directions.</p>
 
       {:else if tab === 'limits'}
         <h3>Global speed limits</h3>
@@ -154,6 +211,17 @@
         <h3>Categories</h3>
         <CategoryEditor bind:categories={draft.categories} />
 
+      {:else if tab === 'automation'}
+        <h3>RSS feeds</h3>
+        <RssEditor bind:feeds={draft.rss.feeds} categories={draft.categories} bind:interval={draft.rss.interval_minutes} />
+        <div class="row">
+          <button class="btn" onclick={runFeeds}>Check feeds now</button>
+          {#if rssNote}<span class="small muted note">{rssNote}</span>{/if}
+        </div>
+        <h3>Search provider</h3>
+        <input class="field" type="text" bind:value={draft.search_url} placeholder="https://your-indexer.example/api?t=search&amp;q={'{query}'}" aria-label="Search provider address" />
+        <p class="muted small">An address that returns an RSS or Torznab feed, with <code>{'{query}'}</code> where the search words go (a Jackett or Prowlarr URL, for example). Nyx ships without a provider: you choose one you trust. Search requests follow your proxy setting.</p>
+
       {:else}
         <h3>Window</h3>
         <label class="radio"><input type="checkbox" bind:checked={draft.minimize_to_tray} /> <span>Closing the window keeps Nyx running in the tray</span></label>
@@ -165,6 +233,13 @@
         </div>
         <p class="muted small">Sets .torrent files and magnet links to open in Nyx, for your Windows account only.</p>
         {#if note}<p class="small">{note}</p>{/if}
+        <h3>Updates</h3>
+        <label class="radio"><input type="checkbox" bind:checked={draft.check_updates} aria-label="Check for updates at launch" /> <span>Check for a newer Nyx when it starts <span class="muted">(off by default: it contacts GitHub; goes through your proxy if one is set)</span></span></label>
+        <div class="row">
+          <button class="btn" disabled={checking} onclick={checkNow}>{checking ? 'Checking…' : 'Check now'}</button>
+          <span class="small muted note">Version {$appStatus?.version ?? ''}</span>
+        </div>
+        {#if updateNote}<p class="small">{updateNote}</p>{/if}
       {/if}
 
       {#if error}<p class="error-text" role="alert">{error}</p>{/if}
@@ -192,6 +267,7 @@
   .grid2 label { display: grid; gap: 4px; color: var(--text-dim); }
   .row { display: flex; gap: 8px; }
   .small { font-size: 12px; margin: 0; }
+  .note { align-self: center; }
   .notice { margin: 4px 0; padding: 10px 12px; border-radius: var(--radius-sm); background: var(--cyan-soft); border: 1px solid rgba(34, 211, 238, 0.25); color: #bdeefa; font-size: 12px; }
   footer { margin-top: auto; padding-top: 12px; display: flex; justify-content: flex-end; gap: 8px; }
 </style>

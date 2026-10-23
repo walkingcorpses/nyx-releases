@@ -1,0 +1,72 @@
+# ci.yml - builds Nyx on a clean Windows runner and runs every test layer:
+# UI (svelte-check + Vitest), the Rust workspace (real libtorrent sessions on loopback and the
+# real exe), and the Playwright smoke tests. libtorrent comes from vcpkg and is cached, so only the
+# first run (or a change to vcpkg.json) pays the long C++ build.
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    env:
+      VCPKG_ROOT: ${{ github.workspace }}\vcpkg-root
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            ui/package-lock.json
+            e2e/package-lock.json
+
+      # vcpkg is cloned in full first (the manifest's builtin-baseline needs its history), then the
+      # cache is restored into it.
+      - name: Clone vcpkg
+        run: git clone https://github.com/microsoft/vcpkg.git "$env:VCPKG_ROOT"
+
+      - name: Restore built libraries
+        uses: actions/cache@v4
+        with:
+          path: |
+            vcpkg-root/installed
+            vcpkg-root/downloads
+          key: vcpkg-${{ hashFiles('vcpkg.json', 'scripts/setup-toolchain.ps1') }}
+
+      - name: Toolchain (libtorrent, boost, openssl via vcpkg)
+        run: powershell -ExecutionPolicy Bypass -File scripts\setup-toolchain.ps1 -AllowPrune
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: UI checks and tests
+        run: |
+          npm --prefix ui ci
+          npm --prefix ui run check
+          npm --prefix ui test
+
+      - name: Build nyx.exe
+        run: powershell -ExecutionPolicy Bypass -File scripts\build-release.ps1
+
+      - name: Rust tests
+        env:
+          NYX_EXE: ${{ github.workspace }}\dist\nyx.exe
+        run: cargo test --workspace
+
+      - name: End-to-end smoke tests
+        run: |
+          npm --prefix e2e ci
+          npm --prefix e2e test
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nyx-windows-x64
+          path: dist/nyx.exe
+          retention-days: 7

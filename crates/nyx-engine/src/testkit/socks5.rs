@@ -198,8 +198,10 @@ fn serve(
 /// UDP ASSOCIATE: opens a relay socket, tells the client where it is, then forwards datagrams in
 /// both directions until the TCP control connection closes.
 fn udp_associate(mut c: TcpStream, udp: Arc<Udp>) -> std::io::Result<()> {
-    let sock = UdpSocket::bind("127.0.0.1:0")?;
-    let local = sock.local_addr()?;
+    // Bound to every interface so datagrams can reach the real internet, not just loopback; the
+    // client is told (and tests compare against) the loopback address of this same port.
+    let sock = UdpSocket::bind("0.0.0.0:0")?;
+    let local = SocketAddr::from(([127, 0, 0, 1], sock.local_addr()?.port()));
     udp.relays.lock().unwrap().push(local);
     sock.set_read_timeout(Some(Duration::from_millis(100)))?;
     let port = local.port().to_be_bytes();

@@ -2,7 +2,7 @@
 // selection, filter, sort and settings. No torrent logic lives here, only bookkeeping.
 
 import { derived, get, writable } from 'svelte/store';
-import type { AddSource, Settings, Status, Torrent, UpdatePayload } from './types';
+import type { AddSource, AppStatus, Settings, Status, Torrent, UpdatePayload } from './types';
 
 /** All torrents by id. Replaced (never mutated) on each update so subscribers re-render. */
 export const torrents = writable<Map<string, Torrent>>(new Map());
@@ -12,8 +12,21 @@ export function setAll(list: Torrent[]): void {
   torrents.set(new Map(list.map((t) => [t.id, t])));
 }
 
+/** Queue order (ids, first to start first). Kept current by updates. */
+export const queueOrder = writable<string[]>([]);
+
+/** Network guard / update / warning state, polled by App. */
+export const appStatus = writable<AppStatus | null>(null);
+
+/** True while a file is being dragged over the window (shows the drop hint). */
+export const dragging = writable(false);
+
+/** Set to open the search dialog. */
+export const searchOpen = writable(false);
+
 /** Applies one backend update: adds or replaces `changed` rows and drops `removed` ids. */
 export function applyUpdate(u: UpdatePayload): void {
+  if (u.queue) queueOrder.set(u.queue);
   torrents.update((m) => {
     const next = new Map(m);
     for (const t of u.changed) next.set(t.id, t);
@@ -33,8 +46,8 @@ export const filter = writable<Filter>('all');
 export const search = writable('');
 
 /** Sort column and direction. */
-export type SortKey = 'name' | 'size' | 'progress' | 'down_rate' | 'up_rate' | 'peers' | 'status';
-export const sort = writable<{ key: SortKey; dir: 1 | -1 }>({ key: 'name', dir: 1 });
+export type SortKey = 'queue' | 'name' | 'size' | 'progress' | 'down_rate' | 'up_rate' | 'peers' | 'status';
+export const sort = writable<{ key: SortKey; dir: 1 | -1 }>({ key: 'queue', dir: 1 });
 
 /** Current settings (loaded from the backend), null until then. */
 export const settings = writable<Settings | null>(null);
@@ -66,8 +79,10 @@ const STATUS_ORDER: Record<Status, number> = {
 };
 
 /** Sorts a copy of the list by the chosen column. */
-export function sortTorrents(list: Torrent[], key: SortKey, dir: 1 | -1): Torrent[] {
+export function sortTorrents(list: Torrent[], key: SortKey, dir: 1 | -1, order: string[] = []): Torrent[] {
+  const place = new Map(order.map((id, i) => [id, i]));
   const cmp = (a: Torrent, b: Torrent): number => {
+    if (key === 'queue') return (place.get(a.id) ?? 1e9) - (place.get(b.id) ?? 1e9);
     if (key === 'name') return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
     if (key === 'status') return STATUS_ORDER[a.status] - STATUS_ORDER[b.status];
     return a[key] - b[key];
@@ -76,10 +91,10 @@ export function sortTorrents(list: Torrent[], key: SortKey, dir: 1 | -1): Torren
 }
 
 /** The rows the table shows: filtered, searched and sorted. */
-export const visible = derived([torrents, filter, search, sort], ([$t, $f, $q, $s]) => {
+export const visible = derived([torrents, filter, search, sort, queueOrder], ([$t, $f, $q, $s, $o]) => {
   const q = $q.trim().toLowerCase();
   const rows = [...$t.values()].filter((t) => matchesFilter(t, $f) && (!q || t.name.toLowerCase().includes(q)));
-  return sortTorrents(rows, $s.key, $s.dir);
+  return sortTorrents(rows, $s.key, $s.dir, $o);
 });
 
 /** Total download and upload rate across all torrents (status bar). */

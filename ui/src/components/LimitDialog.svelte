@@ -1,6 +1,7 @@
 <!-- LimitDialog.svelte - sets download/upload speed caps for one torrent (KB/s, 0 = unlimited).
      The caps are kept by the engine and survive restarts. -->
 <script lang="ts">
+  import { onMount } from 'svelte';
   import { api } from '../lib/api';
   import type { Torrent } from '../lib/types';
 
@@ -9,6 +10,17 @@
   let down = $state(0);
   let up = $state(0);
   let error = $state('');
+
+  // Start from the caps the torrent has now.
+  onMount(async () => {
+    try {
+      const d = await api.getDetail(torrent.id);
+      down = Math.round(d.down_limit / 1024);
+      up = Math.round(d.up_limit / 1024);
+    } catch {
+      /* keep 0 = unlimited */
+    }
+  });
 
   /** Applies the caps (KB/s -> bytes/s) and closes. */
   async function apply(): Promise<void> {
@@ -20,6 +32,8 @@
     }
   }
 </script>
+
+<svelte:window onkeydown={(e) => e.key === 'Escape' && onclose()} />
 
 <div class="scrim" role="presentation">
   <div class="dialog glass" role="dialog" aria-modal="true" aria-label="Torrent speed limits">

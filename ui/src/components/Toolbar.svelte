@@ -3,7 +3,7 @@
 <script lang="ts">
   import LimitDialog from './LimitDialog.svelte';
   import { api } from '../lib/api';
-  import { addRequest, filter, search, selected, selectedId, settingsOpen, type Filter } from '../lib/store';
+  import { addRequest, filter, search, searchOpen, selected, selectedId, settingsOpen, type Filter } from '../lib/store';
 
   const chips: { id: Filter; label: string }[] = [
     { id: 'all', label: 'All' },
@@ -55,6 +55,7 @@
       Add
     </button>
     <button class="btn" onclick={() => addRequest.set({ kind: 'paste' })}>Magnet…</button>
+    <button class="btn" onclick={() => searchOpen.set(true)}>Search…</button>
   </div>
 
   <div class="group">
@@ -119,5 +120,5 @@
   .chipbtn { border: 0; background: none; padding: 3px 12px; border-radius: 99px; color: var(--text-dim); cursor: pointer; transition: all 0.15s; }
   .chipbtn:hover { color: var(--text); }
   .chipbtn.on { background: var(--violet-soft); color: #d6c8ff; box-shadow: inset 0 0 0 1px rgba(139, 92, 246, 0.4); }
-  .search { width: 180px; margin-left: auto; }
+  .search { width: 150px; margin-left: auto; }
 </style>

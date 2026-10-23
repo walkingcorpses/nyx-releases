@@ -47,6 +47,9 @@ export interface Detail {
   files: FileItem[];
   peers: Peer[];
   trackers: Tracker[];
+  /** This torrent's own speed caps in bytes per second (0 = unlimited). */
+  down_limit: number;
+  up_limit: number;
 }
 
 /** A .torrent inspected before adding. */
@@ -60,6 +63,8 @@ export interface Meta {
 export interface UpdatePayload {
   changed: Torrent[];
   removed: string[];
+  /** New queue order (ids, first to start first), present only when it changed. */
+  queue: string[] | null;
 }
 
 /** SOCKS5 proxy settings; null in Settings means "no proxy". */
@@ -85,6 +90,15 @@ export interface Category {
   save_dir: string;
 }
 
+/** One RSS feed polled for new torrents. `filter` is a case-insensitive regular expression ('' = all). */
+export interface Feed {
+  name: string;
+  url: string;
+  filter: string;
+  category: string | null;
+  enabled: boolean;
+}
+
 /** Everything the settings page edits. */
 export interface Settings {
   encryption: 'Forced' | 'Prefer';
@@ -98,6 +112,42 @@ export interface Settings {
   default_save_dir: string;
   start_minimized: boolean;
   minimize_to_tray: boolean;
+  kill_switch: boolean;
+  bind_interface: string | null;
+  blocklist: string | null;
+  check_updates: boolean;
+  rss: { feeds: Feed[]; interval_minutes: number };
+  search_url: string;
+}
+
+/** A newer Nyx that can be installed. */
+export interface AppUpdate {
+  version: string;
+  notes: string;
+}
+
+/** Network guard, update and startup-warning state for the banners. */
+export interface AppStatus {
+  version: string;
+  proxy_down: boolean;
+  killed: boolean;
+  update: AppUpdate | null;
+  warnings: string[];
+}
+
+/** One search result. */
+export interface SearchResult {
+  title: string;
+  link: string;
+  size: number | null;
+  seeders: number | null;
+}
+
+/** What an RSS run did. */
+export interface RssReport {
+  added: number;
+  baselined: number;
+  errors: string[];
 }
 
 /** What the add dialog was asked to open: a magnet link, a .torrent file path, or an empty paste box. */

@@ -5,7 +5,7 @@
   import ProgressBar from './ProgressBar.svelte';
   import { api } from '../lib/api';
   import { formatBytes, formatEta, formatPercent, formatRate } from '../lib/format';
-  import { selectedId, sort, visible, type SortKey } from '../lib/store';
+  import { filter, queueOrder, search, selectedId, sort, visible, type SortKey } from '../lib/store';
   import type { Torrent } from '../lib/types';
 
   const ROW_H = 46;
@@ -24,6 +24,7 @@
   const slice = $derived($visible.slice(range.first, range.last));
 
   const columns: { key: SortKey; label: string; align?: 'right' }[] = [
+    { key: 'queue', label: '#' },
     { key: 'name', label: 'Name' },
     { key: 'size', label: 'Size', align: 'right' },
     { key: 'progress', label: 'Progress' },
@@ -32,6 +33,39 @@
     { key: 'peers', label: 'Peers', align: 'right' },
     { key: 'status', label: 'Status' },
   ];
+
+  // Queue position (1-based) of every torrent, and drag-to-reorder. Dragging only makes sense when the
+  // table is showing the queue itself: sorted by # ascending, nothing filtered out.
+  const place = $derived(new Map($queueOrder.map((id, i) => [id, i + 1])));
+  const canReorder = $derived($sort.key === 'queue' && $sort.dir === 1 && $filter === 'all' && !$search.trim());
+  let drag = $state<{ id: string; from: number; to: number } | null>(null);
+
+  /** Starts dragging a row by its grip. Pointer capture keeps the move/up events coming here. */
+  function startDrag(e: PointerEvent, t: Torrent, index: number): void {
+    if (!canReorder) return;
+    e.preventDefault();
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    drag = { id: t.id, from: index, to: index };
+  }
+
+  /** Follows the pointer: the target row is the one under it (scroll position included). */
+  function moveDrag(e: PointerEvent): void {
+    if (!drag || !viewport) return;
+    const y = e.clientY - viewport.getBoundingClientRect().top + viewport.scrollTop;
+    drag.to = Math.max(0, Math.min($visible.length - 1, Math.floor(y / ROW_H)));
+    // Scroll when the pointer is near the top or bottom edge of the list.
+    const r = viewport.getBoundingClientRect();
+    if (e.clientY < r.top + 30) viewport.scrollTop -= 14;
+    else if (e.clientY > r.bottom - 30) viewport.scrollTop += 14;
+  }
+
+  /** Drops: ask the backend to move the torrent to the target place in the queue. */
+  function endDrag(): void {
+    if (!drag) return;
+    const { id, from, to } = drag;
+    drag = null;
+    if (from !== to) void api.moveInQueue(id, to);
+  }
 
   /** Header click: sort by that column, or flip direction if it is already the sort column. */
   function sortBy(key: SortKey): void {
@@ -93,11 +127,27 @@
           <div
             class="row item"
             class:selected={$selectedId === t.id}
+            class:dragging={drag?.id === t.id}
+            class:target={drag !== null && drag.to === range.first + i && drag.id !== t.id}
             style="transform: translateY({(range.first + i) * ROW_H}px)"
             role="row"
             tabindex="-1"
             onclick={() => selectedId.set(t.id)}
           >
+            <div class="qcell num muted">
+              <button
+                class="grip"
+                class:off={!canReorder}
+                aria-label="Drag to reorder {t.name}"
+                title={canReorder ? 'Drag to change queue order' : 'Sort by # (ascending, no filter) to reorder'}
+                onpointerdown={(e) => startDrag(e, t, range.first + i)}
+                onpointermove={moveDrag}
+                onpointerup={endDrag}
+                onpointercancel={() => (drag = null)}
+                onclick={(e) => e.stopPropagation()}
+              >⋮⋮</button>
+              <span>{place.get(t.id) ?? '—'}</span>
+            </div>
             <div class="name" title={t.error ?? t.name}>
               <span class="text">{t.name}</span>
               {#if t.category}<span class="chip">{t.category}</span>{/if}
@@ -129,7 +179,7 @@
   .table { display: flex; flex-direction: column; min-height: 0; flex: 1; overflow: hidden; }
   .row {
     display: grid; align-items: center; column-gap: 12px; padding: 0 14px;
-    grid-template-columns: minmax(200px, 1fr) 84px 210px 92px 92px 54px 106px 30px;
+    grid-template-columns: 56px minmax(180px, 1fr) 84px 210px 92px 92px 54px 106px 30px;
   }
   .head { height: 34px; border-bottom: 1px solid var(--line); flex: none; }
   .th {
@@ -148,6 +198,12 @@
     transition: background 0.12s;
   }
   .item:hover { background: var(--glass); }
+  .item.dragging { opacity: 0.55; z-index: 2; background: var(--violet-soft); }
+  .item.target { box-shadow: inset 0 2px 0 var(--cyan); }
+  .qcell { display: flex; align-items: center; gap: 4px; }
+  .grip { background: none; border: 0; padding: 4px 2px; color: var(--text-faint); cursor: grab; letter-spacing: -2px; touch-action: none; }
+  .grip.off { cursor: not-allowed; opacity: 0.35; }
+  .grip:not(.off):hover { color: var(--cyan); }
   .item.selected { background: var(--violet-soft); box-shadow: inset 2px 0 var(--violet); }
 
   .name { display: flex; align-items: center; gap: 8px; min-width: 0; }

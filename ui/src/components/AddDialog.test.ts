@@ -35,6 +35,7 @@ vi.mock('../lib/api', () => {
     pickFolder: fn(async () => null),
     takePendingArgs: fn(async () => []),
     onOpen: fn(async () => () => {}),
+    onDragState: fn(async () => () => {}),
     onDrop: fn(async (cb: (paths: string[]) => void) => {
       h.dropHandlers.push(cb);
       return () => {};

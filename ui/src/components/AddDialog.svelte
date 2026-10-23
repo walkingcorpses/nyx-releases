@@ -131,6 +131,8 @@
   const totalSize = $derived(files.reduce((a, f, i) => a + (checked[i] ? f.size : 0), 0));
 </script>
 
+<svelte:window onkeydown={(e) => e.key === 'Escape' && !busy && cancel()} />
+
 <div class="scrim" role="presentation">
   <div class="dialog glass" role="dialog" aria-modal="true" aria-label="Add torrent">
     <h2>Add torrent</h2>
