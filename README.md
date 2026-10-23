@@ -98,7 +98,7 @@ To make Nyx open `.torrent` files and magnet links: **Settings → System → Ma
 
 **Is it safe to automate downloads?** Nyx never runs anything it downloads and only ever adds torrents. You are responsible for what your feeds and search provider point at.
 
-**Where is the source code?** In a private repository for now; this repository only holds the downloads and this page.
+**Where is the source code?** [github.com/walkingcorpses/nyx](https://github.com/walkingcorpses/nyx), MIT licensed. Every release here is tagged `vX.Y.Z` in that repo and also carries a `Nyx-<version>-source.zip` of exactly what was built.
 
 ## Please use it lawfully
 
@@ -108,7 +108,7 @@ Nyx is a neutral BitTorrent client, like any other. Only download and share cont
 
 ### 1.0.0
 
-First public release. Everything above: forced encryption, SOCKS5 proxy with leak protection and kill switch, adapter binding, IP blocklist, queue with drag-to-reorder, categories, schedule, RSS auto-download, search, opt-in checksummed self-update, tray, single instance and file associations.
+First public release, and the source is open. Everything above: forced encryption, SOCKS5 proxy with leak protection and kill switch, adapter binding, IP blocklist, queue with drag-to-reorder, categories, schedule, RSS auto-download, search, opt-in checksummed self-update, tray, single instance and file associations.
 
 ## Credits
 
