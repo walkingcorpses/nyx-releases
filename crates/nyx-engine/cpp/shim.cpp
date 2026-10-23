@@ -191,7 +191,8 @@ Session::Session(rust::Str listen, rust::Slice<const std::uint8_t> dht_state, bo
               }
               return sp;
           }()),
-      discovery_(discovery) {
+      discovery_(discovery),
+      listen_(listen) {
     // Rate limits must also bind LAN/loopback peers (libtorrent exempts them by default):
     // put every address, v4 and v6, in the global peer class and nothing in the local one.
     lt::ip_filter classes;
@@ -208,14 +209,17 @@ std::unique_ptr<Session> new_session(rust::Str listen, rust::Slice<const std::ui
     return std::make_unique<Session>(listen, dht_state, discovery);
 }
 
-// Magnets add with default_dont_download: nothing is fetched until the UI picks files.
+// Magnets add in upload mode: metadata is fetched (peers stay connected) but no piece is
+// requested until resume() clears the flag, after the UI has set the file priorities.
+// (default_dont_download was tried first: with nothing wanted the torrent counts as finished,
+// drops its seeds, and libtorrent did not reconnect them once files were wanted.)
 rust::String Session::add_magnet(rust::Str uri, rust::Str save_path, bool paused, bool sequential) const {
     lt::error_code ec;
     lt::add_torrent_params atp = lt::parse_magnet_uri(std::string(uri), ec);
     if (ec) throw std::runtime_error(ec.message());
     atp.save_path = std::string(save_path);
     base_flags(atp, paused, sequential);
-    atp.flags |= lt::torrent_flags::default_dont_download;
+    atp.flags |= lt::torrent_flags::upload_mode;
     return add_or_merge(ses_, std::move(atp));
 }
 
@@ -235,6 +239,8 @@ rust::String Session::add_resume(rust::Slice<const std::uint8_t> data) const {
     // Resume data carries its own paused flag; keep it, only drop auto-manage.
     atp.flags &= ~lt::torrent_flags::auto_managed;
     lt::torrent_handle h = ses_.add_torrent(std::move(atp));
+    // Upload mode only ever means "magnet awaiting the file choice"; never revive it after a restart.
+    h.unset_flags(lt::torrent_flags::upload_mode);
     return rust::String(id_of(h.info_hashes()));
 }
 
@@ -244,6 +250,7 @@ rust::Vec<TorrentRow> Session::snapshot() const {
     // Drain alerts so libtorrent's queue never fills (errors are read from status instead).
     std::vector<lt::alert*> drain;
     ses_.pop_alerts(&drain);
+    for (auto* a : drain) fprintf(stderr, "ALERT %s\n", a->message().c_str());
 
     rust::Vec<TorrentRow> out;
     for (lt::torrent_handle const& h : ses_.get_torrents()) {
@@ -366,6 +373,8 @@ void Session::pause(rust::Str id) const {
 void Session::resume(rust::Str id) const {
     lt::torrent_handle h = find(ses_, id);
     h.unset_flags(lt::torrent_flags::auto_managed);
+    // A magnet waiting for the user's file choice sits in upload mode; resuming starts it.
+    h.unset_flags(lt::torrent_flags::upload_mode);
     h.resume();
 }
 
@@ -457,7 +466,11 @@ void Session::set_proxy(bool enabled, rust::Str host, std::uint16_t port, rust::
         // uTP is UDP; keep peer traffic on TCP so it cannot bypass the SOCKS5 CONNECT path.
         p.set_bool(sp::enable_outgoing_utp, false);
         p.set_bool(sp::enable_incoming_utp, false);
+        // Do not accept direct inbound connections while proxied: answering one would reveal our
+        // real IP. Listen on loopback only (a port that outsiders cannot reach).
+        p.set_str(sp::listen_interfaces, "127.0.0.1:0");
     } else {
+        p.set_str(sp::listen_interfaces, listen_);
         p.set_int(sp::proxy_type, sp::none);
         p.set_bool(sp::enable_lsd, discovery_);
         p.set_bool(sp::enable_upnp, discovery_);

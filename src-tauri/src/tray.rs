@@ -10,6 +10,19 @@ use tauri::{AppHandle, Manager};
 use crate::instance::show_main;
 use crate::state::AppState;
 
+/// What each tray menu item does, by menu id. The menu's click handler calls this, and so does
+/// the test hook in the poller, so tests exercise the real handler without a popup menu.
+pub fn handle_menu_id(app: &AppHandle, id: &str) {
+    let state = app.try_state::<Arc<AppState>>();
+    match id {
+        "show" => show_main(app),
+        "pause_all" => state.iter().for_each(|s| s.pause_all()),
+        "resume_all" => state.iter().for_each(|s| s.resume_all()),
+        "quit" => app.exit(0),
+        _ => {}
+    }
+}
+
 /// Builds the tray icon and wires its menu.
 pub fn build(app: &AppHandle) -> tauri::Result<()> {
     let show = MenuItem::with_id(app, "show", "Show Nyx", true, None::<&str>)?;
@@ -24,16 +37,7 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
         .tooltip("Nyx")
         .menu(&menu)
         .show_menu_on_left_click(false)
-        .on_menu_event(|app, ev| {
-            let state = app.try_state::<Arc<AppState>>();
-            match ev.id.as_ref() {
-                "show" => show_main(app),
-                "pause_all" => state.iter().for_each(|s| s.pause_all()),
-                "resume_all" => state.iter().for_each(|s| s.resume_all()),
-                "quit" => app.exit(0),
-                _ => {}
-            }
-        })
+        .on_menu_event(|app, ev| handle_menu_id(app, ev.id.as_ref()))
         .on_tray_icon_event(|tray, ev| {
             if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = ev {
                 show_main(tray.app_handle());

@@ -86,3 +86,44 @@ fn download_completes_from_local_seeder() {
     let done = wait_until(Duration::from_secs(30), || leecher.snapshot()[0].progress >= 1.0);
     assert!(done, "download did not finish: {:?}", leecher.snapshot());
 }
+
+/// A magnet end to end: metadata comes from the seeder, nothing downloads until priorities are
+/// set (the pre-download file tree flow), then the download completes.
+#[test]
+fn magnet_downloads_after_priorities_are_set() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (seeder, seed_addr) = engine(tmp.path(), "seeder");
+    let (leecher, _) = engine(tmp.path(), "leecher");
+    let seed_dir = tmp.path().join("seed");
+    let bytes = make_torrent(&seed_dir, 256 * 1024);
+    seeder.add_torrent_file(&bytes, AddOptions::new(&seed_dir)).unwrap();
+    assert!(wait_until(Duration::from_secs(20), || seeder.snapshot()[0].progress >= 1.0));
+    let hash = nyx_engine::inspect_torrent(&bytes).unwrap().id;
+
+    let id = leecher.add_magnet(&magnet(&hash), AddOptions::new(tmp.path().join("dl"))).unwrap();
+    leecher.add_peer(&id, seed_addr).unwrap();
+    // Metadata arrives and the file list shows up, but the magnet sits in upload mode: no download.
+    assert!(wait_until(Duration::from_secs(20), || !leecher.torrent_detail(&id).unwrap().files.is_empty()));
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(leecher.snapshot()[0].progress, 0.0, "upload mode must not download");
+    leecher.set_file_priorities(&id, &[4]).unwrap();
+    leecher.resume(&id).unwrap();
+    assert!(wait_until(Duration::from_secs(30), || leecher.torrent_detail(&id).unwrap().files[0].progress >= 1.0));
+}
+
+/// Adding the same torrent again with another tracker keeps one torrent and merges the trackers.
+#[test]
+fn duplicate_add_merges_trackers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (e, _) = engine(tmp.path(), "e");
+    let hash = "ef".repeat(20);
+    let one = format!("magnet:?xt=urn:btih:{hash}&tr=http%3A%2F%2Fone.example%2Fannounce");
+    let two = format!("magnet:?xt=urn:btih:{hash}&tr=http%3A%2F%2Ftwo.example%2Fannounce");
+    let a = e.add_magnet(&one, AddOptions::new(tmp.path().join("dl"))).unwrap();
+    let b = e.add_magnet(&two, AddOptions::new(tmp.path().join("dl"))).unwrap();
+    assert_eq!(a, b);
+    assert_eq!(e.snapshot().len(), 1);
+    let urls: Vec<String> = e.torrent_detail(&a).unwrap().trackers.into_iter().map(|t| t.url).collect();
+    assert!(urls.iter().any(|u| u.contains("one.example")), "{urls:?}");
+    assert!(urls.iter().any(|u| u.contains("two.example")), "{urls:?}");
+}

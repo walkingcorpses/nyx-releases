@@ -2409,6 +2409,7 @@ dependencies = [
  "cxx",
  "cxx-build",
  "nyx-core",
+ "nyx-engine",
  "tempfile",
  "vcpkg",
 ]

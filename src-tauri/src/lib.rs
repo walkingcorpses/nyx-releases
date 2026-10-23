@@ -155,6 +155,22 @@ pub fn run() {
     }
 }
 
+/// Test hook, active only when NYX_TEST_LOG is set: a file named `test-tray-<menu id>` in the data
+/// folder triggers that tray menu action once. Lets the end-to-end test "click" Quit without
+/// popping a real menu over whatever the user is doing.
+fn test_tray_hook(app: &tauri::AppHandle, state: &AppState) {
+    if std::env::var_os("NYX_TEST_LOG").is_none() {
+        return;
+    }
+    for id in ["show", "pause_all", "resume_all", "quit"] {
+        let flag = state.data_dir.join(format!("test-tray-{id}"));
+        if flag.exists() {
+            let _ = std::fs::remove_file(&flag);
+            tray::handle_menu_id(app, id);
+        }
+    }
+}
+
 /// Background thread: once a second, poll the engine, push changes to the UI, raise completion
 /// notifications and (every minute) save resume data.
 fn spawn_poller(app: tauri::AppHandle, state: Arc<AppState>) {
@@ -162,6 +178,7 @@ fn spawn_poller(app: tauri::AppHandle, state: Arc<AppState>) {
         let mut ticks = 0u32;
         loop {
             std::thread::sleep(Duration::from_secs(1));
+            test_tray_hook(&app, &state);
             let tick = state.tick(chrono::Local::now().naive_local());
             if !tick.update.is_empty() {
                 let _ = app.emit("torrents://update", UpdateDto::from(&tick.update));

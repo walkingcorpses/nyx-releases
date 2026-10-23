@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
 
 namespace nyx {
 
@@ -91,6 +92,7 @@ public:
 private:
     mutable lt::session ses_;
     bool discovery_;  // configured value, restored when a proxy is removed
+    std::string listen_;  // configured listen_interfaces, restored when a proxy is removed
 };
 
 // cxx can only construct opaque C++ types through a free function returning unique_ptr.

@@ -105,3 +105,18 @@ fn proxy_disables_lsd_upnp_natpmp() {
     let f = e.discovery_flags();
     assert!(f.lsd && f.upnp && f.natpmp);
 }
+
+/// While a proxy is active the engine must not accept direct inbound connections (answering one
+/// would reveal the real IP); without a proxy it listens normally again.
+#[test]
+fn proxy_active_refuses_direct_inbound() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (e, addr) = engine(tmp.path(), "e");
+    let reachable = || std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok();
+    assert!(wait_until(Duration::from_secs(5), reachable), "engine should listen without a proxy");
+    let stub = Socks5Stub::start("127.0.0.1:0".parse().unwrap(), None);
+    e.set_proxy(Some(cfg(&stub, None))).unwrap();
+    assert!(wait_until(Duration::from_secs(5), || !reachable()), "still accepting direct connections with a proxy set");
+    e.set_proxy(None).unwrap();
+    assert!(wait_until(Duration::from_secs(5), reachable), "listening did not come back after removing the proxy");
+}

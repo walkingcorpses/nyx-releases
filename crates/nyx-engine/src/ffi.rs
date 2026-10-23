@@ -1,6 +1,8 @@
 //! cxx bridge declarations: the raw C++ functions exported by `cpp/shim.cpp`.
 //! Kept private to the crate; `lib.rs` wraps each one in a safe public API.
 
+// Some bridge functions are only called by the test-support helpers; keep them in the bridge anyway.
+#[allow(dead_code)]
 #[cxx::bridge(namespace = "nyx")]
 mod bridge {
     /// One torrent as libtorrent reports it. `state` is 0 metadata, 1 checking,

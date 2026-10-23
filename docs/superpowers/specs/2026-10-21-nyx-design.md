@@ -1,7 +1,7 @@
 # Nyx: Design Spec
 
 Date: 2026-10-21
-Status: Draft, awaiting owner review
+Status: Implemented (v1 built and verified 2026-10-23). See "Build results" at the end.
 
 ## 1. Purpose
 
@@ -100,3 +100,33 @@ Rust via rustup, Visual Studio MSVC C++ build tools, CMake, and vcpkg for libtor
 ## 9. Code conventions
 
 Every file and function carries comments: a header per file, and the what and why on each function. The owner edits by hand.
+
+## 10. Build results (2026-10-23)
+
+Success criteria from section 1, with the evidence for each:
+
+- [x] **One `nyx.exe`, nothing else installed.** `dist
+yx.exe` is 13 MB and imports only Windows system DLLs
+  (checked by `scriptsuild-release.ps1`). It needs WebView2, which Windows 11 ships; without it the exe shows a
+  message box and exits.
+- [x] **Magnet or `.torrent` downloads to completion through any entry point.** Engine tests download a 1 MiB file and a
+  magnet (metadata from the seeder, then file choice) from a local seeder. The entry points (picker, drop, paste, second
+  launch, `open with`) are covered by the add-dialog tests and the e2e smoke test (a second launch with a `.torrent`
+  argument opens the add dialog and adds a row). A real swarm download was not run.
+- [x] **Forced encryption never completes a plaintext connection.** `forced_refuses_plaintext_peer` and
+  `forced_accepts_encrypted_peer`, run against the release profile too.
+- [x] **SOCKS5 proxy: nothing leaves outside it.** Peer traffic goes through the stub (`proxy_up...`), nothing connects
+  directly when the proxy is down, and direct inbound connections are refused while it is on. Tracker and DHT UDP
+  traffic rely on libtorrent's proxy settings and are **not** covered by a test.
+- [x] **Dark-only, custom UI, responsive with hundreds of torrents.** A thousand mocked rows scroll at about 160 fps
+  (median frame 6 ms, 21 rows in the DOM).
+
+Deviations from this spec and the plan, all recorded in the plan file:
+
+- Magnets wait in libtorrent upload mode instead of `default_dont_download` (the latter dropped seeds and never reconnected).
+- `proptest` property tests stand in for `cargo-fuzz`, which is unreliable on Windows MSVC.
+- File and magnet associations are written by `assoc.rs` (HKCU registry) and arguments arrive through the single-instance
+  plugin, so the deep-link plugin was not needed. The release exe is built with plain `cargo build --release --features
+  custom-protocol` when the Tauri CLI is not installed.
+- The e2e "Quit from the tray" step triggers the tray menu handler through a file hook (active only when `NYX_TEST_LOG` is
+  set) rather than clicking the real menu, which would pop it over the owner's desktop.
