@@ -2383,7 +2383,7 @@ dependencies = [
 
 [[package]]
 name = "nyx"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "chrono",
  "nyx-core",
@@ -2407,7 +2407,7 @@ dependencies = [
 
 [[package]]
 name = "nyx-core"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "chrono",
  "data-encoding",
@@ -2420,7 +2420,7 @@ dependencies = [
 
 [[package]]
 name = "nyx-engine"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "cxx",
  "cxx-build",

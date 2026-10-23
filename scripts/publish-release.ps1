@@ -18,7 +18,12 @@ Set-Location $root
 $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
 $tag = "v$version"
 if (-not (Test-Path dist\nyx.exe)) { throw 'dist\nyx.exe is missing; run scripts\build-release.ps1 first' }
-if (gh release view $tag --repo $Repo 2>$null) { throw "release $tag already exists on $Repo" }
+# gh prints "release not found" on stderr when the tag is free; that must not stop the script.
+$ErrorActionPreference = 'Continue'
+gh release view $tag --repo $Repo *> $null
+$exists = ($LASTEXITCODE -eq 0)
+$ErrorActionPreference = 'Stop'
+if ($exists) { throw "release $tag already exists on $Repo" }
 
 $asset = "dist\Nyx-$version-windows-x64.exe"
 Copy-Item dist\nyx.exe $asset -Force

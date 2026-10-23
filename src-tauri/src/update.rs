@@ -245,4 +245,19 @@ mod tests {
         assert!(swap_exe(&dir.path().join("missing.exe"), &cur).is_err());
         assert_eq!(std::fs::read(&cur).unwrap(), b"old");
     }
+
+    /// Against the real GitHub release: the JSON parses into a newer version, and the asset downloads
+    /// and passes its checksum. Needs the internet, so it only runs with `--ignored`.
+    #[test]
+    #[ignore = "needs the internet"]
+    fn live_release_is_found_downloaded_and_verified() {
+        let agent = http::agent(None).unwrap();
+        let info = check(&agent, "0.0.1").unwrap().expect("a release newer than 0.0.1");
+        println!("found {} at {}", info.version, info.url);
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("nyx-new.exe");
+        download(&agent, &info, &dest).unwrap();
+        assert!(std::fs::metadata(&dest).unwrap().len() > 1_000_000);
+        assert!(check(&agent, &info.version).unwrap().is_none(), "the latest release is not newer than itself");
+    }
 }
