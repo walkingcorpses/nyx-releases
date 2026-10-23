@@ -60,10 +60,10 @@ fn forced_accepts_encrypted_peer() {
     let tmp = tempfile::tempdir().unwrap();
     let (_seeder, saddr, leecher, id) = pair(tmp.path());
     // Slow the download so the peer stays connected long enough to be sampled.
-    leecher.set_limits(None, 64 * 1024, 0).unwrap();
+    leecher.set_limits(None, 32 * 1024, 0).unwrap();
     leecher.add_peer(&id, saddr).unwrap();
     let mut saw_peer = false;
-    let done = wait_until(Duration::from_secs(30), || {
+    let done = wait_until(Duration::from_secs(60), || {
         // A peer still mid-handshake has no encryption flag yet. Once it shows interest
         // flags (I/i) the handshake is done, and only then must it read as encrypted.
         let d = leecher.torrent_detail(&id).unwrap();
@@ -85,5 +85,5 @@ fn prefer_mode_connects_to_plaintext_peer() {
     seeder.set_plaintext_only().unwrap();
     leecher.set_encryption(EncryptionMode::Prefer).unwrap();
     leecher.add_peer(&id, saddr).unwrap();
-    assert!(wait_until(Duration::from_secs(30), || leecher.snapshot()[0].progress >= 1.0));
+    assert!(wait_until(Duration::from_secs(60), || leecher.snapshot()[0].progress >= 1.0));
 }

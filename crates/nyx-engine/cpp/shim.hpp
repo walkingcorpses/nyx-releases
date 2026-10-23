@@ -9,8 +9,15 @@
 #include <libtorrent/session.hpp>
 
 #include <cstdint>
+#include <atomic>
+#include <condition_variable>
+#include <map>
 #include <memory>
+#include <mutex>
+#include <set>
 #include <string>
+#include <thread>
+#include <vector>
 
 namespace nyx {
 
@@ -46,6 +53,9 @@ public:
     // `listen` is a libtorrent listen_interfaces string; `dht_state` is the blob from
     // save_session_state() (may be empty); `discovery` toggles DHT/LSD/UPnP/NAT-PMP.
     Session(rust::Str listen, rust::Slice<const std::uint8_t> dht_state, bool discovery);
+    ~Session();
+    Session(Session const&) = delete;
+    Session& operator=(Session const&) = delete;
 
     // Adding. Both return the torrent id (lowercase hex info hash) and treat a repeat
     // add as "same torrent": no error, trackers merged, metadata filled in if missing.
@@ -93,6 +103,17 @@ private:
     mutable lt::session ses_;
     bool discovery_;  // configured value, restored when a proxy is removed
     std::string listen_;  // configured listen_interfaces, restored when a proxy is removed
+
+    // Alert pump (see Session::pump): one thread reads every libtorrent alert.
+    void pump();
+    mutable std::mutex mu_;                  // guards the three fields below
+    mutable std::condition_variable cv_;     // signalled when resume data arrives
+    mutable std::set<std::string> parked_;   // magnets to pause once their metadata arrives
+    mutable std::map<std::string, std::vector<char>> resume_done_;
+    mutable int resume_failed_ = 0;
+    mutable std::mutex save_mu_;             // one save_resume() at a time
+    std::atomic<bool> stop_{false};
+    std::thread pump_;                       // declared last: started last, joined first
 };
 
 // cxx can only construct opaque C++ types through a free function returning unique_ptr.

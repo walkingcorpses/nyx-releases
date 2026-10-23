@@ -83,7 +83,7 @@ impl Engine {
     }
 
     /// Adds a magnet link. The torrent fetches metadata but downloads nothing until the caller
-    /// sets file priorities and calls `resume` (it waits in libtorrent's upload mode).
+    /// sets file priorities and calls `resume` (it is paused as soon as its metadata arrives).
     /// Adding the same torrent again returns the same id.
     pub fn add_magnet(&self, uri: &str, opts: AddOptions) -> Result<TorrentId, EngineError> {
         parse_magnet(uri)?;

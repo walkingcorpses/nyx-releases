@@ -123,7 +123,7 @@ yx.exe` is 13 MB and imports only Windows system DLLs
 
 Deviations from this spec and the plan, all recorded in the plan file:
 
-- Magnets wait in libtorrent upload mode instead of `default_dont_download` (the latter dropped seeds and never reconnected).
+- Magnets are paused the moment their metadata arrives instead of using `default_dont_download` (which drops seeds and did not reliably reconnect them).
 - `proptest` property tests stand in for `cargo-fuzz`, which is unreliable on Windows MSVC.
 - File and magnet associations are written by `assoc.rs` (HKCU registry) and arguments arrive through the single-instance
   plugin, so the deep-link plugin was not needed. The release exe is built with plain `cargo build --release --features

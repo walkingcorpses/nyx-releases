@@ -102,10 +102,11 @@ fn magnet_downloads_after_priorities_are_set() {
 
     let id = leecher.add_magnet(&magnet(&hash), AddOptions::new(tmp.path().join("dl"))).unwrap();
     leecher.add_peer(&id, seed_addr).unwrap();
-    // Metadata arrives and the file list shows up, but the magnet sits in upload mode: no download.
+    // Metadata arrives and the file list shows up, but the magnet is parked (paused): nothing downloads.
     assert!(wait_until(Duration::from_secs(20), || !leecher.torrent_detail(&id).unwrap().files.is_empty()));
     std::thread::sleep(Duration::from_secs(1));
-    assert_eq!(leecher.snapshot()[0].progress, 0.0, "upload mode must not download");
+    assert_eq!(leecher.snapshot()[0].progress, 0.0, "a parked magnet must not download");
+    assert_eq!(leecher.snapshot()[0].status, TorrentStatus::Paused);
     leecher.set_file_priorities(&id, &[4]).unwrap();
     leecher.resume(&id).unwrap();
     assert!(wait_until(Duration::from_secs(30), || leecher.torrent_detail(&id).unwrap().files[0].progress >= 1.0));

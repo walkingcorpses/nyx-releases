@@ -24,6 +24,9 @@
 #include <libtorrent/write_resume_data.hpp>
 
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -182,7 +185,11 @@ Session::Session(rust::Str listen, rust::Slice<const std::uint8_t> dht_state, bo
               pack.set_bool(lt::settings_pack::enable_upnp, discovery);
               pack.set_bool(lt::settings_pack::enable_natpmp, discovery);
               pack.set_bool(lt::settings_pack::allow_multiple_connections_per_ip, true);
-              pack.set_int(lt::settings_pack::alert_mask, lt::alert_category::error);
+              // Default is 60 s before libtorrent redials a peer it was connected to. Pausing and
+              // resuming (and the parked-magnet flow) should pick peers back up within seconds.
+              // Failing peers still back off: the delay is multiplied by their fail count.
+              pack.set_int(lt::settings_pack::min_reconnect_time, 5);
+              pack.set_int(lt::settings_pack::alert_mask, lt::alert_category::error | lt::alert_category::status);
               lt::session_params sp(std::move(pack));
               if (discovery && !dht_state.empty()) {
                   lt::session_params old = lt::read_session_params(lt::span<char const>(
@@ -202,6 +209,45 @@ Session::Session(rust::Str listen, rust::Slice<const std::uint8_t> dht_state, bo
                      kGlobalClassBit);
     ses_.set_peer_class_filter(classes);
     set_encryption(0);  // forced RC4 until the app says otherwise
+    pump_ = std::thread([this] { pump(); });
+}
+
+// Stops the alert thread before the session goes away.
+Session::~Session() {
+    stop_ = true;
+    if (pump_.joinable()) pump_.join();
+}
+
+// The one place alerts are read. Handles two things:
+//  - a parked magnet's metadata arrived -> pause it at once, so nothing is downloaded before
+//    the user has picked files (resume() starts it);
+//  - resume data answers, which save_resume() waits for.
+// Everything else is dropped so libtorrent's alert queue never fills.
+void Session::pump() {
+    while (!stop_) {
+        ses_.wait_for_alert(std::chrono::milliseconds(100));
+        std::vector<lt::alert*> alerts;
+        ses_.pop_alerts(&alerts);
+        for (lt::alert* a : alerts) {
+            if (auto* md = lt::alert_cast<lt::metadata_received_alert>(a)) {
+                std::string const id = id_of(md->handle.info_hashes());
+                bool parked;
+                {
+                    std::lock_guard<std::mutex> lk(mu_);
+                    parked = parked_.erase(id) > 0;
+                }
+                if (parked) md->handle.pause();
+            } else if (auto* ok = lt::alert_cast<lt::save_resume_data_alert>(a)) {
+                std::lock_guard<std::mutex> lk(mu_);
+                resume_done_[id_of(ok->params.info_hashes)] = lt::write_resume_data_buf(ok->params);
+                cv_.notify_all();
+            } else if (lt::alert_cast<lt::save_resume_data_failed_alert>(a)) {
+                std::lock_guard<std::mutex> lk(mu_);
+                ++resume_failed_;
+                cv_.notify_all();
+            }
+        }
+    }
 }
 
 std::unique_ptr<Session> new_session(rust::Str listen, rust::Slice<const std::uint8_t> dht_state,
@@ -209,18 +255,23 @@ std::unique_ptr<Session> new_session(rust::Str listen, rust::Slice<const std::ui
     return std::make_unique<Session>(listen, dht_state, discovery);
 }
 
-// Magnets add in upload mode: metadata is fetched (peers stay connected) but no piece is
-// requested until resume() clears the flag, after the UI has set the file priorities.
-// (default_dont_download was tried first: with nothing wanted the torrent counts as finished,
-// drops its seeds, and libtorrent did not reconnect them once files were wanted.)
+// Magnets are parked: the torrent runs just long enough to fetch metadata, then pump() pauses it
+// until the UI has set file priorities and calls resume(). (Tried and rejected: default_dont_download
+// and upload_mode both make the torrent upload-only, so libtorrent drops seed peers and did not
+// reliably reconnect them; a 1 B/s download limit also throttles the metadata exchange itself.)
 rust::String Session::add_magnet(rust::Str uri, rust::Str save_path, bool paused, bool sequential) const {
     lt::error_code ec;
     lt::add_torrent_params atp = lt::parse_magnet_uri(std::string(uri), ec);
     if (ec) throw std::runtime_error(ec.message());
     atp.save_path = std::string(save_path);
     base_flags(atp, paused, sequential);
-    atp.flags |= lt::torrent_flags::upload_mode;
-    return add_or_merge(ses_, std::move(atp));
+    rust::String id = add_or_merge(ses_, std::move(atp));
+    lt::torrent_handle h = find(ses_, rust::Str(std::string(id)));
+    if (!h.torrent_file()) {  // still needs metadata: park it once that arrives
+        std::lock_guard<std::mutex> lk(mu_);
+        parked_.insert(std::string(id));
+    }
+    return id;
 }
 
 rust::String Session::add_torrent(rust::Slice<const std::uint8_t> bytes, rust::Str save_path,
@@ -239,8 +290,6 @@ rust::String Session::add_resume(rust::Slice<const std::uint8_t> data) const {
     // Resume data carries its own paused flag; keep it, only drop auto-manage.
     atp.flags &= ~lt::torrent_flags::auto_managed;
     lt::torrent_handle h = ses_.add_torrent(std::move(atp));
-    // Upload mode only ever means "magnet awaiting the file choice"; never revive it after a restart.
-    h.unset_flags(lt::torrent_flags::upload_mode);
     return rust::String(id_of(h.info_hashes()));
 }
 
@@ -372,14 +421,20 @@ void Session::pause(rust::Str id) const {
 
 void Session::resume(rust::Str id) const {
     lt::torrent_handle h = find(ses_, id);
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        parked_.erase(std::string(id));  // the user has decided; do not pause it when metadata arrives
+    }
     h.unset_flags(lt::torrent_flags::auto_managed);
-    // A magnet waiting for the user's file choice sits in upload mode; resuming starts it.
-    h.unset_flags(lt::torrent_flags::upload_mode);
     h.resume();
 }
 
 void Session::remove(rust::Str id, bool delete_files) const {
     lt::torrent_handle h = find(ses_, id);
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        parked_.erase(std::string(id));
+    }
     ses_.remove_torrent(h, delete_files ? lt::session::delete_files : lt::remove_flags_t{});
 }
 
@@ -488,33 +543,30 @@ rust::Vec<std::uint8_t> Session::save_session_state() const {
     return out;
 }
 
-// Asks every torrent for resume data and waits (up to timeout) for the answers.
-// Failures (e.g. nothing changed, no metadata) are skipped; their old file stays valid.
+// Asks every torrent for resume data and waits (up to timeout) for the pump thread to collect the
+// answers. Failures (e.g. nothing changed, no metadata) are skipped; their old file stays valid.
 rust::Vec<ResumeBlob> Session::save_resume(std::uint32_t timeout_ms) const {
+    std::lock_guard<std::mutex> one_at_a_time(save_mu_);
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        resume_done_.clear();
+        resume_failed_ = 0;
+    }
     int pending = 0;
     for (lt::torrent_handle const& h : ses_.get_torrents()) {
         if (!h.is_valid()) continue;
         h.save_resume_data(lt::torrent_handle::save_info_dict);
         ++pending;
     }
+    std::unique_lock<std::mutex> lk(mu_);
+    cv_.wait_for(lk, std::chrono::milliseconds(timeout_ms),
+                 [&] { return int(resume_done_.size()) + resume_failed_ >= pending; });
     rust::Vec<ResumeBlob> out;
-    auto const deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-    while (pending > 0 && std::chrono::steady_clock::now() < deadline) {
-        ses_.wait_for_alert(std::chrono::milliseconds(100));
-        std::vector<lt::alert*> alerts;
-        ses_.pop_alerts(&alerts);
-        for (lt::alert* a : alerts) {
-            if (auto* ok = lt::alert_cast<lt::save_resume_data_alert>(a)) {
-                std::vector<char> buf = lt::write_resume_data_buf(ok->params);
-                ResumeBlob b;
-                b.id = id_of(ok->params.info_hashes);
-                for (char c : buf) b.data.push_back(std::uint8_t(c));
-                out.push_back(std::move(b));
-                --pending;
-            } else if (lt::alert_cast<lt::save_resume_data_failed_alert>(a)) {
-                --pending;
-            }
-        }
+    for (auto const& [id, buf] : resume_done_) {
+        ResumeBlob b;
+        b.id = id;
+        for (char c : buf) b.data.push_back(std::uint8_t(c));
+        out.push_back(std::move(b));
     }
     return out;
 }
