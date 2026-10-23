@@ -28,6 +28,32 @@ pub struct ProxySettings {
     pub password: Option<String>,
 }
 
+/// One RSS feed Nyx polls for new torrents. Items whose title matches `filter` (a regular
+/// expression, case-insensitive; empty matches everything) are added automatically.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Feed {
+    pub name: String,
+    pub url: String,
+    pub filter: String,
+    pub category: Option<String>,
+    pub enabled: bool,
+}
+
+/// RSS auto-download settings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RssSettings {
+    pub feeds: Vec<Feed>,
+    /// Minutes between polls (at least 5).
+    pub interval_minutes: u32,
+}
+
+impl Default for RssSettings {
+    fn default() -> Self {
+        RssSettings { feeds: Vec::new(), interval_minutes: 30 }
+    }
+}
+
 /// Everything the settings page edits. `#[serde(default)]` lets older files that lack newer
 /// fields still load. Rate limits are bytes per second, 0 = unlimited.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,6 +70,17 @@ pub struct Settings {
     pub default_save_dir: PathBuf,
     pub start_minimized: bool,
     pub minimize_to_tray: bool,
+    /// While a proxy is set: pause everything when the proxy cannot be reached.
+    pub kill_switch: bool,
+    /// Network adapter (name or IP) to bind to, e.g. a VPN adapter. If it disappears, nothing connects.
+    pub bind_interface: Option<String>,
+    /// Path of an IP blocklist file (PeerGuardian, plain ranges or CIDR), applied to peers.
+    pub blocklist: Option<PathBuf>,
+    /// Ask GitHub for a newer Nyx at launch. Off by default: Nyx makes no other non-torrent connections.
+    pub check_updates: bool,
+    pub rss: RssSettings,
+    /// Search provider: an http(s) URL containing `{query}` that returns an RSS/Torznab feed.
+    pub search_url: String,
 }
 
 impl Default for Settings {
@@ -63,6 +100,12 @@ impl Default for Settings {
             default_save_dir: home.join("Downloads"),
             start_minimized: false,
             minimize_to_tray: true,
+            kill_switch: true,
+            bind_interface: None,
+            blocklist: None,
+            check_updates: false,
+            rss: RssSettings::default(),
+            search_url: String::new(),
         }
     }
 }

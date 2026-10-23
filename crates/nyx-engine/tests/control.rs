@@ -195,3 +195,53 @@ fn magnet_save_path_and_category_can_change() {
     e.set_category(&id, None);
     assert_eq!(e.snapshot()[0].category, None);
 }
+
+/// A blocklisted address is refused in both directions; clearing the list lets the peer in again.
+#[test]
+fn blocklist_refuses_peer_until_cleared() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bytes = make_torrent(&tmp.path().join("seed"), 256 * 1024);
+    let (seeder, saddr) = engine(tmp.path(), "seeder");
+    let (leecher, _) = engine(tmp.path(), "leecher");
+    seeder.add_torrent_file(&bytes, AddOptions::new(tmp.path().join("seed"))).unwrap();
+    assert!(wait_until(Duration::from_secs(20), || seeder.snapshot()[0].progress >= 1.0));
+    let id = leecher.add_torrent_file(&bytes, AddOptions::new(tmp.path().join("dl"))).unwrap();
+    let list = nyx_core::parse_blocklist("Loopback:127.0.0.0-127.255.255.255
+");
+    leecher.set_ip_filter(&list).unwrap();
+    leecher.add_peer(&id, saddr).unwrap();
+    std::thread::sleep(Duration::from_secs(4));
+    assert_eq!(progress(&leecher), 0.0, "downloaded from a blocked address");
+    leecher.set_ip_filter(&[]).unwrap();
+    leecher.add_peer(&id, saddr).unwrap();
+    assert!(wait_until(Duration::from_secs(40), || progress(&leecher) >= 1.0), "peer stayed blocked after clearing");
+}
+
+/// Bound to an adapter that does not exist, nothing connects (the kill-switch behaviour).
+#[test]
+fn missing_interface_blocks_all_connections() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bytes = make_torrent(&tmp.path().join("seed"), 128 * 1024);
+    let (seeder, saddr) = engine(tmp.path(), "seeder");
+    let (leecher, _) = engine(tmp.path(), "leecher");
+    seeder.add_torrent_file(&bytes, AddOptions::new(tmp.path().join("seed"))).unwrap();
+    assert!(wait_until(Duration::from_secs(20), || seeder.snapshot()[0].progress >= 1.0));
+    leecher.set_interface(Some("NoSuchAdapter9")).unwrap();
+    let id = leecher.add_torrent_file(&bytes, AddOptions::new(tmp.path().join("dl"))).unwrap();
+    leecher.add_peer(&id, saddr).unwrap();
+    std::thread::sleep(Duration::from_secs(5));
+    assert_eq!(progress(&leecher), 0.0, "connected through a missing adapter");
+}
+
+/// The detail view reports a torrent's own caps (0 = unlimited).
+#[test]
+fn detail_reports_torrent_limits() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (e, _) = engine(tmp.path(), "e");
+    let bytes = make_torrent(&tmp.path().join("seed"), 64 * 1024);
+    let id = e.add_torrent_file(&bytes, AddOptions::new(tmp.path().join("dl"))).unwrap();
+    assert_eq!((e.torrent_detail(&id).unwrap().down_limit, e.torrent_detail(&id).unwrap().up_limit), (0, 0));
+    e.set_limits(Some(&id), 123_456, 7_000).unwrap();
+    let d = e.torrent_detail(&id).unwrap();
+    assert_eq!((d.down_limit, d.up_limit), (123_456, 7_000));
+}

@@ -4,10 +4,13 @@
 pub mod assoc;
 pub mod commands;
 pub mod dto;
+pub mod feeds;
+pub mod http;
 pub mod instance;
 pub mod poller;
 pub mod state;
 pub mod tray;
+pub mod update;
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -58,8 +61,26 @@ fn resolve_data_dir() -> PathBuf {
     data_dir(&exe_dir, &appdata)
 }
 
+/// After a self-update the new exe is started by the old one, which is still shutting down. Wait
+/// (up to 20 s) for it to exit so single-instance does not turn the new exe away.
+fn wait_for_previous_instance() {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
+    let Some(pid) = std::env::var("NYX_WAIT_PID").ok().and_then(|v| v.parse::<u32>().ok()) else { return };
+    std::env::remove_var("NYX_WAIT_PID");
+    // SAFETY: plain Win32 calls; the handle is closed before returning.
+    unsafe {
+        let h = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
+        if !h.is_null() {
+            WaitForSingleObject(h, 20_000);
+            CloseHandle(h);
+        }
+    }
+}
+
 /// Starts Nyx. Returns when the app exits.
 pub fn run() {
+    wait_for_previous_instance();
     if !webview2_installed() {
         fatal(
             "Nyx",
@@ -103,6 +124,14 @@ pub fn run() {
             commands::register_associations,
             commands::unregister_associations,
             commands::take_pending_args,
+            commands::get_status,
+            commands::get_queue_order,
+            commands::check_update,
+            commands::install_update,
+            commands::restart_app,
+            commands::rss_run_now,
+            commands::search,
+            commands::fetch_torrent_url,
         ])
         .on_window_event(|window, event| {
             // Close button: hide to the tray when that setting is on, otherwise let the app exit.
@@ -131,6 +160,7 @@ pub fn run() {
             let has_args = instance::queue_own_args(app.handle(), &args);
             tray::build(app.handle())?;
             spawn_poller(app.handle().clone(), state.clone());
+            spawn_background(state.clone());
 
             let minimized = state.get_settings().start_minimized || args.iter().any(|a| a == "--minimized");
             if let Some(w) = app.get_webview_window("main") {
@@ -195,6 +225,38 @@ fn spawn_poller(app: tauri::AppHandle, state: Arc<AppState>) {
             if ticks % SAVE_EVERY_TICKS == 0 {
                 let _ = state.engine.save_state();
             }
+        }
+    });
+}
+
+/// Slow background jobs: probe the proxy every few seconds (feeds the kill switch), poll RSS feeds on
+/// their interval, and look for an update once at launch when the user has switched that on.
+fn spawn_background(state: Arc<AppState>) {
+    // Proxy health, every 5 s.
+    let s = state.clone();
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_secs(5));
+        s.probe_proxy();
+    });
+    // RSS: wake every 30 s, run when the interval has passed and there is a feed to poll.
+    let s = state.clone();
+    std::thread::spawn(move || {
+        let mut last = std::time::Instant::now();
+        loop {
+            std::thread::sleep(Duration::from_secs(30));
+            let cfg = s.get_settings().rss;
+            let due = last.elapsed() >= Duration::from_secs(u64::from(cfg.interval_minutes.max(5)) * 60);
+            if due && cfg.feeds.iter().any(|f| f.enabled) {
+                last = std::time::Instant::now();
+                let _ = s.rss_run();
+            }
+        }
+    });
+    // Update check at launch (opt-in).
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(8));
+        if state.get_settings().check_updates {
+            let _ = state.check_update();
         }
     });
 }

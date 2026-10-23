@@ -7,7 +7,7 @@ use std::sync::Arc;
 use nyx_core::{Settings, TorrentId};
 use tauri::State;
 
-use crate::dto::{DetailDto, MetaDto, TorrentDto};
+use crate::dto::{AppUpdateDto, DetailDto, MetaDto, RssReportDto, SearchResultDto, StatusDto, TorrentDto};
 use crate::state::AppState;
 use crate::{assoc, instance};
 
@@ -109,4 +109,59 @@ pub fn unregister_associations() -> Result<(), String> {
 #[tauri::command]
 pub fn take_pending_args(state: St) -> Result<Vec<String>, String> {
     Ok(instance::drain(&state))
+}
+
+/// Proxy / kill-switch / update / startup-warning state for the banners.
+#[tauri::command]
+pub fn get_status(state: St) -> Result<StatusDto, String> {
+    Ok(state.status())
+}
+
+/// The queue order, first to start first.
+#[tauri::command]
+pub fn get_queue_order(state: St) -> Result<Vec<TorrentId>, String> {
+    Ok(state.queue_order())
+}
+
+/// Asks GitHub for a newer Nyx. Returns it, or null when up to date.
+#[tauri::command]
+pub fn check_update(state: St) -> Result<Option<AppUpdateDto>, String> {
+    state.check_update()
+}
+
+/// Installs the update the last check found (download, checksum, swap). Takes effect on restart.
+#[tauri::command]
+pub fn install_update(state: St) -> Result<String, String> {
+    state.install_update()
+}
+
+/// Starts the (updated) exe again and quits this one.
+#[tauri::command]
+pub fn restart_app(app: tauri::AppHandle) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    // The new process waits for this one to exit before it starts (single-instance would turn it away).
+    std::process::Command::new(exe)
+        .env("NYX_WAIT_PID", std::process::id().to_string())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    app.exit(0);
+    Ok(())
+}
+
+/// Polls the RSS feeds now (same as the timer) and reports what happened.
+#[tauri::command]
+pub fn rss_run_now(state: St) -> Result<RssReportDto, String> {
+    Ok(state.rss_run())
+}
+
+/// Searches the configured provider.
+#[tauri::command]
+pub fn search(state: St, query: String) -> Result<Vec<SearchResultDto>, String> {
+    state.search(&query)
+}
+
+/// Downloads a .torrent from a search result link into a temp file; returns its path.
+#[tauri::command]
+pub fn fetch_torrent_url(state: St, url: String) -> Result<String, String> {
+    state.fetch_torrent_url(&url)
 }

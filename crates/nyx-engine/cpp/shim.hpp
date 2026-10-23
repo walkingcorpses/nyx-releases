@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <map>
 #include <memory>
@@ -30,6 +31,9 @@ struct FileRow;
 struct TrackerRow;
 struct ResumeBlob;
 struct DiscoveryFlags;
+struct IpSpan;
+struct SessionInit;
+struct LimitRow;
 
 // Returns the linked libtorrent version string (lt::version()), e.g. "2.0.11.0".
 rust::String lt_version();
@@ -50,9 +54,9 @@ rust::Vec<std::uint8_t> make_torrent(rust::Str dir, rust::Slice<const std::uint6
 // One libtorrent session plus the little state Nyx keeps beside it.
 class Session {
 public:
-    // `listen` is a libtorrent listen_interfaces string; `dht_state` is the blob from
-    // save_session_state() (may be empty); `discovery` toggles DHT/LSD/UPnP/NAT-PMP.
-    Session(rust::Str listen, rust::Slice<const std::uint8_t> dht_state, bool discovery);
+    // `dht_state` is the blob from save_session_state() (may be empty). `init` carries the listen
+    // address and the privacy policy the session must start with (see SessionInit in ffi.rs).
+    Session(rust::Slice<const std::uint8_t> dht_state, SessionInit const& init);
     ~Session();
     Session(Session const&) = delete;
     Session& operator=(Session const&) = delete;
@@ -79,6 +83,13 @@ public:
     // Controls.
     void pause(rust::Str id) const;
     void resume(rust::Str id) const;
+    // Lets a parked magnet (paused at metadata, waiting for the file choice) download after a resume.
+    void unpark(rust::Str id) const;
+    LimitRow torrent_limits(rust::Str id) const;
+    // Replaces the peer blocklist (empty clears it).
+    void set_ip_filter(rust::Slice<const IpSpan> ranges) const;
+    // Binds listening and outgoing connections to one network adapter (name or IP); empty unbinds.
+    void set_interface(rust::Str name) const;
     void remove(rust::Str id, bool delete_files) const;
     void recheck(rust::Str id) const;
     void set_priorities(rust::Str id, rust::Slice<const std::uint8_t> prios) const;
@@ -103,6 +114,11 @@ private:
     mutable lt::session ses_;
     bool discovery_;  // configured value, restored when a proxy is removed
     std::string listen_;  // configured listen_interfaces, restored when a proxy is removed
+    mutable std::string iface_;   // adapter binding, empty = none
+    mutable bool proxied_ = false;
+    std::string listen_value() const;
+    void schedule_reannounce() const;
+    mutable std::vector<std::chrono::steady_clock::time_point> reannounce_;  // guarded by mu_  // listen_interfaces for the current proxy/adapter state
 
     // Alert pump (see Session::pump): one thread reads every libtorrent alert.
     void pump();
@@ -117,7 +133,6 @@ private:
 };
 
 // cxx can only construct opaque C++ types through a free function returning unique_ptr.
-std::unique_ptr<Session> new_session(rust::Str listen, rust::Slice<const std::uint8_t> dht_state,
-                                     bool discovery);
+std::unique_ptr<Session> new_session(rust::Slice<const std::uint8_t> dht_state, SessionInit const& init);
 
 } // namespace nyx

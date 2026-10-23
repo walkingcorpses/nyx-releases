@@ -1,12 +1,21 @@
-//! Minimal SOCKS5 server for tests (RFC 1928/1929, CONNECT only). It counts the CONNECT
-//! requests it receives and relays bytes, so tests can prove traffic went through it.
+//! Minimal SOCKS5 server for tests (RFC 1928/1929: CONNECT and UDP ASSOCIATE). It counts what it
+//! relays, so tests can prove traffic went through it and see where UDP datagrams were sent.
 
 use std::io::{Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+
+/// What the UDP relay saw.
+#[derive(Default)]
+struct Udp {
+    datagrams: AtomicUsize,
+    dest_ports: std::sync::Mutex<Vec<u16>>,
+    /// Local addresses of the relay sockets: packets arriving from one of these were relayed.
+    relays: std::sync::Mutex<Vec<SocketAddr>>,
+}
 
 /// A running SOCKS5 stub. Dropping it stops the accept loop (the proxy "goes down").
 pub struct Socks5Stub {
@@ -14,6 +23,8 @@ pub struct Socks5Stub {
     connects: Arc<AtomicUsize>,
     /// Destination ports of every CONNECT seen, in order.
     ports: Arc<std::sync::Mutex<Vec<u16>>>,
+    /// UDP relay state (UDP ASSOCIATE).
+    udp: Arc<Udp>,
     stop: Arc<AtomicBool>,
 }
 
@@ -27,14 +38,15 @@ impl Socks5Stub {
         let connects = Arc::new(AtomicUsize::new(0));
         let ports = Arc::new(std::sync::Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
-        let (c, p, s) = (connects.clone(), ports.clone(), stop.clone());
+        let udp = Arc::new(Udp::default());
+        let (c, p, s, u) = (connects.clone(), ports.clone(), stop.clone(), udp.clone());
         thread::spawn(move || {
             while !s.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((conn, _)) => {
-                        let (c, p, creds) = (c.clone(), p.clone(), creds.clone());
+                        let (c, p, u, creds) = (c.clone(), p.clone(), u.clone(), creds.clone());
                         thread::spawn(move || {
-                            let _ = serve(conn, creds, c, p);
+                            let _ = serve(conn, creds, c, p, u);
                         });
                     }
                     Err(_) => thread::sleep(Duration::from_millis(20)),
@@ -42,7 +54,7 @@ impl Socks5Stub {
             }
             // listener drops here, so new connections are refused
         });
-        Socks5Stub { addr, connects, ports, stop }
+        Socks5Stub { addr, connects, ports, udp, stop }
     }
 
     /// Address clients should use as the proxy.
@@ -58,6 +70,22 @@ impl Socks5Stub {
     /// Whether any CONNECT targeted this destination port.
     pub fn saw_port(&self, port: u16) -> bool {
         self.ports.lock().unwrap().contains(&port)
+    }
+
+    /// How many UDP datagrams the relay forwarded to destinations.
+    pub fn udp_count(&self) -> usize {
+        self.udp.datagrams.load(Ordering::SeqCst)
+    }
+
+    /// Whether any relayed datagram was addressed to this destination port.
+    pub fn saw_udp_port(&self, port: u16) -> bool {
+        self.udp.dest_ports.lock().unwrap().contains(&port)
+    }
+
+    /// Local addresses of the UDP relay sockets. A destination that receives a datagram whose source
+    /// is one of these got it through the proxy; any other source means a direct send.
+    pub fn udp_relay_addrs(&self) -> Vec<SocketAddr> {
+        self.udp.relays.lock().unwrap().clone()
     }
 
     /// Stops accepting; existing relays finish on their own.
@@ -80,6 +108,7 @@ fn serve(
     creds: Option<(String, String)>,
     connects: Arc<AtomicUsize>,
     ports: Arc<std::sync::Mutex<Vec<u16>>>,
+    udp: Arc<Udp>,
 ) -> std::io::Result<()> {
     c.set_nonblocking(false)?;
     let mut b = [0u8; 2];
@@ -137,6 +166,9 @@ fn serve(
             return Ok(());
         }
     };
+    if req[1] == 3 {
+        return udp_associate(c, udp);
+    }
     if req[1] != 1 {
         c.write_all(&[5, 7, 0, 1, 0, 0, 0, 0, 0, 0])?;
         return Ok(());
@@ -160,5 +192,67 @@ fn serve(
     let _ = std::io::copy(&mut u3, &mut c);
     let _ = c.shutdown(Shutdown::Write);
     let _ = t.join();
+    Ok(())
+}
+
+/// UDP ASSOCIATE: opens a relay socket, tells the client where it is, then forwards datagrams in
+/// both directions until the TCP control connection closes.
+fn udp_associate(mut c: TcpStream, udp: Arc<Udp>) -> std::io::Result<()> {
+    let sock = UdpSocket::bind("127.0.0.1:0")?;
+    let local = sock.local_addr()?;
+    udp.relays.lock().unwrap().push(local);
+    sock.set_read_timeout(Some(Duration::from_millis(100)))?;
+    let port = local.port().to_be_bytes();
+    c.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, port[0], port[1]])?;
+    c.set_read_timeout(Some(Duration::from_millis(50)))?;
+    let mut client: Option<SocketAddr> = None;
+    let mut buf = vec![0u8; 65_536];
+    let mut probe = [0u8; 1];
+    loop {
+        // The association ends when the TCP connection does.
+        match c.read(&mut probe) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+            Err(_) => break,
+        }
+        let Ok((n, from)) = sock.recv_from(&mut buf) else { continue };
+        if client.is_none() || client == Some(from) {
+            // From the client: strip the SOCKS5 UDP header (RSV RSV FRAG ATYP ADDR PORT) and forward.
+            client = Some(from);
+            let d = &buf[..n];
+            if n < 10 || d[2] != 0 {
+                continue;
+            }
+            let (dest, off) = match d[3] {
+                1 => (SocketAddr::from(([d[4], d[5], d[6], d[7]], u16::from_be_bytes([d[8], d[9]]))), 10),
+                3 => {
+                    let l = d[4] as usize;
+                    if n < 5 + l + 2 {
+                        continue;
+                    }
+                    let host = String::from_utf8_lossy(&d[5..5 + l]).into_owned();
+                    let p = u16::from_be_bytes([d[5 + l], d[6 + l]]);
+                    match std::net::ToSocketAddrs::to_socket_addrs(&(host.as_str(), p)).ok().and_then(|mut i| i.next()) {
+                        Some(a) => (a, 7 + l),
+                        None => continue,
+                    }
+                }
+                _ => continue,
+            };
+            udp.datagrams.fetch_add(1, Ordering::SeqCst);
+            udp.dest_ports.lock().unwrap().push(dest.port());
+            let _ = sock.send_to(&d[off..], dest);
+        } else if let Some(cl) = client {
+            // From a destination: wrap it in a SOCKS5 UDP header naming the sender and hand it back.
+            if let SocketAddr::V4(v4) = from {
+                let mut out = vec![0, 0, 0, 1];
+                out.extend_from_slice(&v4.ip().octets());
+                out.extend_from_slice(&v4.port().to_be_bytes());
+                out.extend_from_slice(&buf[..n]);
+                let _ = sock.send_to(&out, cl);
+            }
+        }
+    }
     Ok(())
 }

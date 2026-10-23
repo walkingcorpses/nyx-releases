@@ -56,11 +56,13 @@ impl From<&TorrentState> for TorrentDto {
 pub struct UpdateDto {
     pub changed: Vec<TorrentDto>,
     pub removed: Vec<TorrentId>,
+    /// New queue order when it changed.
+    pub queue: Option<Vec<TorrentId>>,
 }
 
 impl From<&Update> for UpdateDto {
     fn from(u: &Update) -> Self {
-        UpdateDto { changed: u.changed.iter().map(TorrentDto::from).collect(), removed: u.removed.clone() }
+        UpdateDto { changed: u.changed.iter().map(TorrentDto::from).collect(), removed: u.removed.clone(), queue: u.queue.clone() }
     }
 }
 
@@ -122,6 +124,9 @@ pub struct DetailDto {
     pub files: Vec<FileDto>,
     pub peers: Vec<PeerDto>,
     pub trackers: Vec<TrackerDto>,
+    /// This torrent's own speed caps in bytes per second (0 = unlimited).
+    pub down_limit: u64,
+    pub up_limit: u64,
 }
 
 impl From<TorrentDetail> for DetailDto {
@@ -130,6 +135,8 @@ impl From<TorrentDetail> for DetailDto {
             files: d.files.into_iter().map(Into::into).collect(),
             peers: d.peers.into_iter().map(Into::into).collect(),
             trackers: d.trackers.into_iter().map(Into::into).collect(),
+            down_limit: d.down_limit,
+            up_limit: d.up_limit,
         }
     }
 }
@@ -146,4 +153,43 @@ impl From<TorrentMeta> for MetaDto {
     fn from(m: TorrentMeta) -> Self {
         MetaDto { id: m.id, name: m.name, files: m.files.into_iter().map(Into::into).collect() }
     }
+}
+
+/// A newer Nyx that can be installed.
+#[derive(Debug, Clone, Serialize)]
+pub struct AppUpdateDto {
+    pub version: String,
+    pub notes: String,
+}
+
+/// What the UI banners need: network guard state, update and startup warnings.
+#[derive(Debug, Clone, Serialize)]
+pub struct StatusDto {
+    /// This Nyx's version.
+    pub version: String,
+    /// A proxy is configured but cannot be reached.
+    pub proxy_down: bool,
+    /// The kill switch has paused everything because of that.
+    pub killed: bool,
+    pub update: Option<AppUpdateDto>,
+    /// Things that went wrong at startup (for example an unreadable blocklist).
+    pub warnings: Vec<String>,
+}
+
+/// One search result.
+#[derive(Debug, Clone, Serialize)]
+pub struct SearchResultDto {
+    pub title: String,
+    pub link: String,
+    pub size: Option<u64>,
+    pub seeders: Option<u32>,
+}
+
+/// What an RSS run did.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct RssReportDto {
+    pub added: u32,
+    /// Feeds seen for the first time: their current items were recorded, not downloaded.
+    pub baselined: u32,
+    pub errors: Vec<String>,
 }

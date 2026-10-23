@@ -78,7 +78,7 @@ lt::torrent_handle find(lt::session& ses, rust::Str id) {
 }
 
 // .torrent limits shared by add and inspect.
-lt::load_torrent_limits torrent_limits() {
+lt::load_torrent_limits load_limits() {
     lt::load_torrent_limits lim;
     lim.max_buffer_size = kMaxTorrentBytes;
     lim.max_decode_depth = kMaxBencodeDepth;
@@ -144,6 +144,68 @@ std::uint8_t state_code(lt::torrent_status const& st) {
     }
 }
 
+// Encryption policy: 0 = forced RC4 only, 1 = prefer encrypted, 2 = plaintext only (tests).
+void fill_encryption(lt::settings_pack& p, std::int32_t mode) {
+    using sp = lt::settings_pack;
+    if (mode == 0) {
+        p.set_int(sp::out_enc_policy, sp::pe_forced);
+        p.set_int(sp::in_enc_policy, sp::pe_forced);
+        p.set_int(sp::allowed_enc_level, sp::pe_rc4);
+        p.set_bool(sp::prefer_rc4, true);
+    } else if (mode == 1) {
+        p.set_int(sp::out_enc_policy, sp::pe_enabled);
+        p.set_int(sp::in_enc_policy, sp::pe_enabled);
+        p.set_int(sp::allowed_enc_level, sp::pe_both);
+    } else {
+        p.set_int(sp::out_enc_policy, sp::pe_disabled);
+        p.set_int(sp::in_enc_policy, sp::pe_disabled);
+        p.set_int(sp::allowed_enc_level, sp::pe_plaintext);
+    }
+}
+
+// With a proxy: everything (peers, trackers, hostnames) goes through it and the features that
+// talk to the network directly are switched off to avoid leaks: LSD, UPnP, NAT-PMP, DHT (UDP to
+// arbitrary nodes) and uTP (UDP peer traffic must not bypass the SOCKS5 CONNECT path).
+// Without one, everything returns to the configured `discovery` state.
+void fill_proxy(lt::settings_pack& p, bool enabled, std::string const& host, std::uint16_t port,
+                std::string const& user, std::string const& pass, bool discovery) {
+    using sp = lt::settings_pack;
+    if (enabled) {
+        p.set_int(sp::proxy_type, user.empty() ? sp::socks5 : sp::socks5_pw);
+        p.set_str(sp::proxy_hostname, host);
+        p.set_int(sp::proxy_port, port);
+        p.set_str(sp::proxy_username, user);
+        p.set_str(sp::proxy_password, pass);
+        p.set_bool(sp::proxy_hostnames, true);
+        p.set_bool(sp::proxy_peer_connections, true);
+        p.set_bool(sp::proxy_tracker_connections, true);
+        p.set_bool(sp::enable_dht, false);
+        p.set_bool(sp::enable_lsd, false);
+        p.set_bool(sp::enable_upnp, false);
+        p.set_bool(sp::enable_natpmp, false);
+        p.set_bool(sp::enable_outgoing_utp, false);
+        p.set_bool(sp::enable_incoming_utp, false);
+    } else {
+        p.set_int(sp::proxy_type, sp::none);
+        p.set_bool(sp::enable_dht, discovery);
+        p.set_bool(sp::enable_lsd, discovery);
+        p.set_bool(sp::enable_upnp, discovery);
+        p.set_bool(sp::enable_natpmp, discovery);
+        p.set_bool(sp::enable_outgoing_utp, true);
+        p.set_bool(sp::enable_incoming_utp, true);
+    }
+}
+
+// listen_interfaces for a proxy/adapter state: loopback only while proxied (nothing inbound from
+// outside, since answering would reveal our real IP), else the adapter binding if there is one,
+// else the configured address.
+std::string listen_for(std::string const& listen, std::string const& iface, bool proxied) {
+    if (proxied) return "127.0.0.1:0";
+    if (iface.empty()) return listen;
+    std::size_t const colon = listen.rfind(':');
+    return iface + (colon == std::string::npos ? ":6881" : listen.substr(colon));
+}
+
 } // namespace
 
 // Real session start/stop: links the session, networking and crypto code paths,
@@ -172,34 +234,38 @@ rust::String lt_version() {
     return rust::String(lt::version());
 }
 
-// Builds the session settings once: encryption forced, rate limits applied even on
-// LAN, loopback peers allowed (several engines share 127.0.0.1 in tests).
-Session::Session(rust::Str listen, rust::Slice<const std::uint8_t> dht_state, bool discovery)
+// Builds the session with every privacy setting already in place (encryption, proxy, adapter
+// binding), so not even the first packet of a session can go out under the wrong policy.
+Session::Session(rust::Slice<const std::uint8_t> dht_state, SessionInit const& init)
     : ses_(
           [&] {
+              std::string const iface(init.interface);
               lt::settings_pack pack;
-              pack.set_str(lt::settings_pack::listen_interfaces, std::string(listen));
+              pack.set_str(lt::settings_pack::listen_interfaces,
+                           listen_for(std::string(init.listen), iface, init.proxy_enabled));
+              pack.set_str(lt::settings_pack::outgoing_interfaces, iface);
               pack.set_str(lt::settings_pack::user_agent, "Nyx/0.1");
-              pack.set_bool(lt::settings_pack::enable_dht, discovery);
-              pack.set_bool(lt::settings_pack::enable_lsd, discovery);
-              pack.set_bool(lt::settings_pack::enable_upnp, discovery);
-              pack.set_bool(lt::settings_pack::enable_natpmp, discovery);
               pack.set_bool(lt::settings_pack::allow_multiple_connections_per_ip, true);
               // Default is 60 s before libtorrent redials a peer it was connected to. Pausing and
               // resuming (and the parked-magnet flow) should pick peers back up within seconds.
               // Failing peers still back off: the delay is multiplied by their fail count.
               pack.set_int(lt::settings_pack::min_reconnect_time, 5);
               pack.set_int(lt::settings_pack::alert_mask, lt::alert_category::error | lt::alert_category::status);
+              fill_encryption(pack, init.encryption);
+              fill_proxy(pack, init.proxy_enabled, std::string(init.proxy_host), init.proxy_port,
+                         std::string(init.proxy_user), std::string(init.proxy_pass), init.discovery);
               lt::session_params sp(std::move(pack));
-              if (discovery && !dht_state.empty()) {
+              if (init.discovery && !init.proxy_enabled && !dht_state.empty()) {
                   lt::session_params old = lt::read_session_params(lt::span<char const>(
                       reinterpret_cast<char const*>(dht_state.data()), dht_state.size()));
                   sp.dht_state = std::move(old.dht_state);
               }
               return sp;
           }()),
-      discovery_(discovery),
-      listen_(listen) {
+      discovery_(init.discovery),
+      listen_(init.listen),
+      iface_(init.interface),
+      proxied_(init.proxy_enabled) {
     // Rate limits must also bind LAN/loopback peers (libtorrent exempts them by default):
     // put every address, v4 and v6, in the global peer class and nothing in the local one.
     lt::ip_filter classes;
@@ -208,8 +274,17 @@ Session::Session(rust::Str listen, rust::Slice<const std::uint8_t> dht_state, bo
     classes.add_rule(lt::make_address_v6("::"), lt::make_address_v6("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"),
                      kGlobalClassBit);
     ses_.set_peer_class_filter(classes);
-    set_encryption(0);  // forced RC4 until the app says otherwise
+    if (proxied_) schedule_reannounce();
     pump_ = std::thread([this] { pump(); });
+}
+
+// A UDP tracker announce sent before the proxy's UDP association is up fails and would only be
+// retried after a long backoff. Re-announce shortly after a proxy comes into effect.
+void Session::schedule_reannounce() const {
+    auto const now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lk(mu_);
+    reannounce_.push_back(now + std::chrono::milliseconds(1500));
+    reannounce_.push_back(now + std::chrono::milliseconds(6000));
 }
 
 // Stops the alert thread before the session goes away.
@@ -226,6 +301,17 @@ Session::~Session() {
 void Session::pump() {
     while (!stop_) {
         ses_.wait_for_alert(std::chrono::milliseconds(100));
+        bool reannounce = false;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            auto const now = std::chrono::steady_clock::now();
+            for (auto it = reannounce_.begin(); it != reannounce_.end();) {
+                if (*it <= now) { reannounce = true; it = reannounce_.erase(it); } else { ++it; }
+            }
+        }
+        if (reannounce) {
+            for (lt::torrent_handle const& h : ses_.get_torrents()) h.force_reannounce();
+        }
         std::vector<lt::alert*> alerts;
         ses_.pop_alerts(&alerts);
         for (lt::alert* a : alerts) {
@@ -250,9 +336,8 @@ void Session::pump() {
     }
 }
 
-std::unique_ptr<Session> new_session(rust::Str listen, rust::Slice<const std::uint8_t> dht_state,
-                                     bool discovery) {
-    return std::make_unique<Session>(listen, dht_state, discovery);
+std::unique_ptr<Session> new_session(rust::Slice<const std::uint8_t> dht_state, SessionInit const& init) {
+    return std::make_unique<Session>(dht_state, init);
 }
 
 // Magnets are parked: the torrent runs just long enough to fetch metadata, then pump() pauses it
@@ -278,7 +363,7 @@ rust::String Session::add_torrent(rust::Slice<const std::uint8_t> bytes, rust::S
                                   bool paused, bool sequential) const {
     lt::add_torrent_params atp = lt::load_torrent_buffer(
         lt::span<char const>(reinterpret_cast<char const*>(bytes.data()), bytes.size()),
-        torrent_limits());
+        load_limits());
     atp.save_path = std::string(save_path);
     base_flags(atp, paused, sequential);
     return add_or_merge(ses_, std::move(atp));
@@ -419,12 +504,43 @@ void Session::pause(rust::Str id) const {
     h.pause();
 }
 
+// The user has decided about a magnet: do not pause it when its metadata arrives.
+void Session::unpark(rust::Str id) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    parked_.erase(std::string(id));
+}
+
+LimitRow Session::torrent_limits(rust::Str id) const {
+    lt::torrent_handle h = find(ses_, id);
+    int const d = h.download_limit(), u = h.upload_limit();
+    return LimitRow{d > 0 ? std::uint64_t(d) : 0, u > 0 ? std::uint64_t(u) : 0};
+}
+
+void Session::set_ip_filter(rust::Slice<const IpSpan> ranges) const {
+    lt::ip_filter f;
+    for (IpSpan const& r : ranges) {
+        lt::error_code a, b;
+        lt::address first = lt::make_address(std::string(r.first), a);
+        lt::address last = lt::make_address(std::string(r.last), b);
+        if (!a && !b) f.add_rule(first, last, lt::ip_filter::blocked);
+    }
+    ses_.set_ip_filter(f);
+}
+
+std::string Session::listen_value() const { return listen_for(listen_, iface_, proxied_); }
+
+// Binding to an adapter: both listening and outgoing connections use it, so if the adapter (a
+// VPN, say) goes away nothing connects: a built-in kill switch.
+void Session::set_interface(rust::Str name) const {
+    iface_ = std::string(name);
+    lt::settings_pack p;
+    p.set_str(lt::settings_pack::outgoing_interfaces, iface_);
+    p.set_str(lt::settings_pack::listen_interfaces, listen_value());
+    ses_.apply_settings(std::move(p));
+}
+
 void Session::resume(rust::Str id) const {
     lt::torrent_handle h = find(ses_, id);
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        parked_.erase(std::string(id));  // the user has decided; do not pause it when metadata arrives
-    }
     h.unset_flags(lt::torrent_flags::auto_managed);
     h.resume();
 }
@@ -481,59 +597,18 @@ void Session::add_peer(rust::Str id, rust::Str ip, std::uint16_t port) const {
 // Forced = both directions pe_forced, RC4 only: plaintext peers are refused.
 void Session::set_encryption(std::int32_t mode) const {
     lt::settings_pack p;
-    using sp = lt::settings_pack;
-    if (mode == 0) {
-        p.set_int(sp::out_enc_policy, sp::pe_forced);
-        p.set_int(sp::in_enc_policy, sp::pe_forced);
-        p.set_int(sp::allowed_enc_level, sp::pe_rc4);
-        p.set_bool(sp::prefer_rc4, true);
-    } else if (mode == 1) {
-        p.set_int(sp::out_enc_policy, sp::pe_enabled);
-        p.set_int(sp::in_enc_policy, sp::pe_enabled);
-        p.set_int(sp::allowed_enc_level, sp::pe_both);
-    } else {
-        p.set_int(sp::out_enc_policy, sp::pe_disabled);
-        p.set_int(sp::in_enc_policy, sp::pe_disabled);
-        p.set_int(sp::allowed_enc_level, sp::pe_plaintext);
-    }
+    fill_encryption(p, mode);
     ses_.apply_settings(std::move(p));
 }
 
-// With a proxy: everything (peers, trackers, hostnames) goes through it and the
-// features that talk to the network directly are switched off to avoid leaks.
 void Session::set_proxy(bool enabled, rust::Str host, std::uint16_t port, rust::Str user,
                         rust::Str pass) const {
+    proxied_ = enabled;
     lt::settings_pack p;
-    using sp = lt::settings_pack;
-    if (enabled) {
-        bool const auth = !user.empty();
-        p.set_int(sp::proxy_type, auth ? sp::socks5_pw : sp::socks5);
-        p.set_str(sp::proxy_hostname, std::string(host));
-        p.set_int(sp::proxy_port, port);
-        p.set_str(sp::proxy_username, std::string(user));
-        p.set_str(sp::proxy_password, std::string(pass));
-        p.set_bool(sp::proxy_hostnames, true);
-        p.set_bool(sp::proxy_peer_connections, true);
-        p.set_bool(sp::proxy_tracker_connections, true);
-        p.set_bool(sp::enable_lsd, false);
-        p.set_bool(sp::enable_upnp, false);
-        p.set_bool(sp::enable_natpmp, false);
-        // uTP is UDP; keep peer traffic on TCP so it cannot bypass the SOCKS5 CONNECT path.
-        p.set_bool(sp::enable_outgoing_utp, false);
-        p.set_bool(sp::enable_incoming_utp, false);
-        // Do not accept direct inbound connections while proxied: answering one would reveal our
-        // real IP. Listen on loopback only (a port that outsiders cannot reach).
-        p.set_str(sp::listen_interfaces, "127.0.0.1:0");
-    } else {
-        p.set_str(sp::listen_interfaces, listen_);
-        p.set_int(sp::proxy_type, sp::none);
-        p.set_bool(sp::enable_lsd, discovery_);
-        p.set_bool(sp::enable_upnp, discovery_);
-        p.set_bool(sp::enable_natpmp, discovery_);
-        p.set_bool(sp::enable_outgoing_utp, true);
-        p.set_bool(sp::enable_incoming_utp, true);
-    }
+    fill_proxy(p, enabled, std::string(host), port, std::string(user), std::string(pass), discovery_);
+    p.set_str(lt::settings_pack::listen_interfaces, listen_value());
     ses_.apply_settings(std::move(p));
+    if (enabled) schedule_reannounce();
 }
 
 rust::Vec<std::uint8_t> Session::save_session_state() const {
@@ -574,7 +649,7 @@ rust::Vec<ResumeBlob> Session::save_resume(std::uint32_t timeout_ms) const {
 TorrentMeta inspect_torrent(rust::Slice<const std::uint8_t> bytes) {
     lt::add_torrent_params atp = lt::load_torrent_buffer(
         lt::span<char const>(reinterpret_cast<char const*>(bytes.data()), bytes.size()),
-        torrent_limits());
+        load_limits());
     TorrentMeta m;
     m.id = id_of(atp.ti->info_hashes());
     m.name = atp.ti->name();

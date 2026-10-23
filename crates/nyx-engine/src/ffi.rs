@@ -66,6 +66,32 @@ mod bridge {
         natpmp: bool,
     }
 
+    /// What a session must start with: listen address and the whole privacy policy, so no packet
+    /// can leave before it applies. `encryption`: 0 forced, 1 prefer.
+    struct SessionInit {
+        listen: String,
+        discovery: bool,
+        encryption: i32,
+        proxy_enabled: bool,
+        proxy_host: String,
+        proxy_port: u16,
+        proxy_user: String,
+        proxy_pass: String,
+        interface: String,
+    }
+
+    /// An inclusive address range to block.
+    struct IpSpan {
+        first: String,
+        last: String,
+    }
+
+    /// Per-torrent speed caps in bytes per second (0 = unlimited).
+    struct LimitRow {
+        down: u64,
+        up: u64,
+    }
+
     unsafe extern "C++" {
         include!("nyx-engine/cpp/shim.hpp");
 
@@ -84,7 +110,7 @@ mod bridge {
         /// The opaque libtorrent session wrapper.
         type Session;
 
-        fn new_session(listen: &str, dht_state: &[u8], discovery: bool) -> Result<UniquePtr<Session>>;
+        fn new_session(dht_state: &[u8], init: &SessionInit) -> Result<UniquePtr<Session>>;
 
         fn add_magnet(self: &Session, uri: &str, save_path: &str, paused: bool, sequential: bool) -> Result<String>;
         fn add_torrent(self: &Session, bytes: &[u8], save_path: &str, paused: bool, sequential: bool) -> Result<String>;
@@ -100,6 +126,10 @@ mod bridge {
 
         fn pause(self: &Session, id: &str) -> Result<()>;
         fn resume(self: &Session, id: &str) -> Result<()>;
+        fn unpark(self: &Session, id: &str) -> Result<()>;
+        fn torrent_limits(self: &Session, id: &str) -> Result<LimitRow>;
+        fn set_ip_filter(self: &Session, ranges: &[IpSpan]) -> Result<()>;
+        fn set_interface(self: &Session, name: &str) -> Result<()>;
         fn remove(self: &Session, id: &str, delete_files: bool) -> Result<()>;
         fn recheck(self: &Session, id: &str) -> Result<()>;
         fn set_priorities(self: &Session, id: &str, prios: &[u8]) -> Result<()>;

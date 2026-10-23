@@ -11,12 +11,14 @@ use nyx_engine::{TorrentState, TorrentStatus};
 pub struct Update {
     pub changed: Vec<TorrentState>,
     pub removed: Vec<TorrentId>,
+    /// The new queue order, present only when it changed since the last update.
+    pub queue: Option<Vec<TorrentId>>,
 }
 
 impl Update {
     /// True when nothing changed, so no event needs to be sent.
     pub fn is_empty(&self) -> bool {
-        self.changed.is_empty() && self.removed.is_empty()
+        self.changed.is_empty() && self.removed.is_empty() && self.queue.is_none()
     }
 }
 
@@ -27,7 +29,7 @@ pub fn diff(prev: &HashMap<TorrentId, TorrentState>, next: &[TorrentState]) -> U
     let mut removed: Vec<TorrentId> =
         prev.keys().filter(|id| !next.iter().any(|t| &t.id == *id)).cloned().collect();
     removed.sort();
-    Update { changed, removed }
+    Update { changed, removed, queue: None }
 }
 
 /// Names of torrents that went from downloading to seeding between two snapshots.

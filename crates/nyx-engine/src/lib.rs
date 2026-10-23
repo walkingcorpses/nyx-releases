@@ -76,8 +76,22 @@ impl Engine {
         let io_err = |e: io::Error| EngineError::Backend(e.to_string());
         fs::create_dir_all(cfg.state_dir.join("resume")).map_err(io_err)?;
         let dht = fs::read(cfg.state_dir.join("session.dat")).unwrap_or_default();
-        let inner = ffi::new_session(&cfg.listen.to_string(), &dht, cfg.discovery)?;
+        let p = cfg.proxy.as_ref();
+        let init = ffi::SessionInit {
+            listen: cfg.listen.to_string(),
+            discovery: cfg.discovery,
+            encryption: match cfg.encryption { EncryptionMode::Forced => 0, EncryptionMode::Prefer => 1 },
+            proxy_enabled: p.is_some(),
+            proxy_host: p.map(|c| c.host.clone()).unwrap_or_default(),
+            proxy_port: p.map(|c| c.port).unwrap_or(0),
+            proxy_user: p.and_then(|c| c.username.clone()).unwrap_or_default(),
+            proxy_pass: p.and_then(|c| c.password.clone()).unwrap_or_default(),
+            interface: cfg.interface.clone().unwrap_or_default(),
+        };
+        let inner = ffi::new_session(&dht, &init)?;
         let engine = Engine { inner, meta: Mutex::new(Meta::default()), state_dir: cfg.state_dir };
+        // Blocklist before any torrent exists, so a restored torrent never talks to a blocked address.
+        engine.set_ip_filter(&cfg.blocklist)?;
         engine.restore();
         Ok(engine)
     }
@@ -184,6 +198,7 @@ impl Engine {
             }
         }
         self.meta.lock().unwrap().held.remove(id);
+        self.inner.unpark(id)?;
         Ok(self.inner.resume(id)?)
     }
 
@@ -220,6 +235,19 @@ impl Engine {
     /// Sequential download on or off (pieces in order, for streaming).
     pub fn set_sequential(&self, id: &TorrentId, on: bool) -> Result<(), EngineError> {
         Ok(self.inner.set_sequential(id, on)?)
+    }
+
+    /// Replaces the peer blocklist: connections to and from these ranges are refused. An empty
+    /// list clears it.
+    pub fn set_ip_filter(&self, ranges: &[nyx_core::IpRange]) -> Result<(), EngineError> {
+        let spans: Vec<ffi::IpSpan> =
+            ranges.iter().map(|r| ffi::IpSpan { first: r.first.to_string(), last: r.last.to_string() }).collect();
+        Ok(self.inner.set_ip_filter(&spans)?)
+    }
+
+    /// Binds to one network adapter (name or IP), or unbinds with `None`.
+    pub fn set_interface(&self, name: Option<&str>) -> Result<(), EngineError> {
+        Ok(self.inner.set_interface(name.unwrap_or(""))?)
     }
 
     /// Changes the save folder of a torrent (created first). For a magnet still fetching metadata
@@ -273,7 +301,8 @@ impl Engine {
             .into_iter()
             .map(|t| TrackerInfo { url: t.url, status: t.status })
             .collect();
-        Ok(TorrentDetail { files, peers, trackers })
+        let lim = self.inner.torrent_limits(id)?;
+        Ok(TorrentDetail { files, peers, trackers, down_limit: lim.down, up_limit: lim.up })
     }
 
     /// Sets peer encryption: `Forced` refuses plaintext peers, `Prefer` accepts them.

@@ -85,6 +85,9 @@ pub struct TorrentDetail {
     pub files: Vec<FileInfo>,
     pub peers: Vec<PeerInfo>,
     pub trackers: Vec<TrackerInfo>,
+    /// This torrent's own speed caps in bytes per second (0 = unlimited).
+    pub down_limit: u64,
+    pub up_limit: u64,
 }
 
 /// Parsed `.torrent` contents, used by the pre-download file tree.
@@ -126,12 +129,27 @@ pub struct EngineConfig {
     pub listen: SocketAddr,
     pub state_dir: PathBuf,
     pub discovery: bool,
+    /// Privacy policy the session starts with, applied before any torrent is restored.
+    pub encryption: EncryptionMode,
+    pub proxy: Option<ProxyConfig>,
+    /// Network adapter (name or IP) to bind to.
+    pub interface: Option<String>,
+    /// Blocked address ranges, applied before any torrent is restored.
+    pub blocklist: Vec<nyx_core::IpRange>,
 }
 
 impl EngineConfig {
     /// Config for tests: loopback only, no discovery features.
     pub fn for_test(listen: SocketAddr, state_dir: impl Into<PathBuf>) -> Self {
-        EngineConfig { listen, state_dir: state_dir.into(), discovery: false }
+        EngineConfig {
+            listen,
+            state_dir: state_dir.into(),
+            discovery: false,
+            encryption: EncryptionMode::Forced,
+            proxy: None,
+            interface: None,
+            blocklist: Vec::new(),
+        }
     }
 }
 

@@ -1,8 +1,6 @@
 // queue.rs - download/seed queue planning. Pure logic: given the torrents and the limits,
 // say which should run and which should wait. The app applies the answer each tick.
 
-use std::collections::HashMap;
-
 use crate::TorrentId;
 
 /// What the queue wants done with a torrent.
@@ -21,19 +19,19 @@ pub struct QueueEntry {
     pub user_paused: bool,
 }
 
-/// Queue limits plus any manual re-ordering the user has done.
+/// Queue limits plus the user's ordering. `order` is the queue: index 0 starts first. Torrents
+/// the queue has not seen yet sort after the known ones, by their list position.
 #[derive(Debug, Clone)]
 pub struct Queue {
     max_active_downloads: usize,
     max_active_seeds: usize,
-    /// Manual position overrides, stored as a sort key just before the target slot.
-    overrides: HashMap<TorrentId, f64>,
+    order: Vec<TorrentId>,
 }
 
 impl Queue {
     /// Queue allowing this many running downloads and running seeds at once.
     pub fn new(max_active_downloads: usize, max_active_seeds: usize) -> Queue {
-        Queue { max_active_downloads, max_active_seeds, overrides: HashMap::new() }
+        Queue { max_active_downloads, max_active_seeds, order: Vec::new() }
     }
 
     /// Changes the limits (settings page) without losing manual ordering.
@@ -42,12 +40,32 @@ impl Queue {
         self.max_active_seeds = max_active_seeds;
     }
 
+    /// Brings the order in line with the torrents that exist: ids that are gone drop out, new ids
+    /// join at the back (in the order given). Returns true when the order changed.
+    pub fn sync(&mut self, ids: &[TorrentId]) -> bool {
+        let before = self.order.len();
+        self.order.retain(|id| ids.contains(id));
+        let mut changed = self.order.len() != before;
+        for id in ids {
+            if !self.order.contains(id) {
+                self.order.push(id.clone());
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// The queue order, first to start first.
+    pub fn order(&self) -> &[TorrentId] {
+        &self.order
+    }
+
     /// Decides Start or Hold for every torrent the user has not paused. Downloads and seeds
-    /// are counted against their own limits, and lower positions win. User-paused torrents
+    /// are counted against their own limits, and earlier in the queue wins. User-paused torrents
     /// are left out of the answer entirely: the queue never overrides a user's pause.
     pub fn plan(&self, torrents: &[QueueEntry]) -> Vec<(TorrentId, Action)> {
         let mut order: Vec<&QueueEntry> = torrents.iter().filter(|t| !t.user_paused).collect();
-        order.sort_by(|a, b| self.key(a).total_cmp(&self.key(b)).then_with(|| a.id.cmp(&b.id)));
+        order.sort_by(|a, b| self.key(a).cmp(&self.key(b)).then_with(|| a.id.cmp(&b.id)));
         let (mut downloads, mut seeds) = (0usize, 0usize);
         order
             .into_iter()
@@ -68,19 +86,21 @@ impl Queue {
             .collect()
     }
 
-    /// Moves a torrent so it sorts just before whatever currently sits at `position`.
-    pub fn move_to(&mut self, id: &TorrentId, position: u32) {
-        self.overrides.insert(id.clone(), position as f64 - 0.5);
+    /// Moves a torrent to `index` in the queue (clamped to the end). An unknown id is added first.
+    pub fn move_to(&mut self, id: &TorrentId, index: usize) {
+        self.order.retain(|x| x != id);
+        let at = index.min(self.order.len());
+        self.order.insert(at, id.clone());
     }
 
-    /// Forgets a removed torrent's manual position.
+    /// Forgets a removed torrent.
     pub fn forget(&mut self, id: &TorrentId) {
-        self.overrides.remove(id);
+        self.order.retain(|x| x != id);
     }
 
-    /// Sort key: manual override if the user moved it, otherwise its list position.
-    fn key(&self, e: &QueueEntry) -> f64 {
-        self.overrides.get(&e.id).copied().unwrap_or(e.position as f64)
+    /// Sort key: its place in the queue if known, otherwise after all known ones by list position.
+    fn key(&self, e: &QueueEntry) -> usize {
+        self.order.iter().position(|x| x == &e.id).unwrap_or(self.order.len() + e.position as usize)
     }
 }
 
@@ -125,7 +145,20 @@ mod tests {
         let mut q = Queue::new(1, 1);
         let list = [e("a", 0, false, false), e("b", 1, false, false), e("c", 2, false, false)];
         assert_eq!(started(&q.plan(&list)), ["a"]);
+        q.sync(&["a".to_string(), "b".to_string(), "c".to_string()]);
         q.move_to(&"c".to_string(), 0);
+        assert_eq!(q.order(), ["c", "a", "b"]);
         assert_eq!(started(&q.plan(&list)), ["c"]);
+        q.move_to(&"c".to_string(), 99);
+        assert_eq!(q.order(), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn queue_sync_drops_gone_and_appends_new() {
+        let mut q = Queue::new(1, 1);
+        assert!(q.sync(&["a".to_string(), "b".to_string()]));
+        assert!(!q.sync(&["a".to_string(), "b".to_string()]));
+        assert!(q.sync(&["b".to_string(), "c".to_string()]));
+        assert_eq!(q.order(), ["b", "c"]);
     }
 }

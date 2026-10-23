@@ -189,6 +189,18 @@
           "markdownDescription": "Enables the add_torrent command without any pre-configured scope."
         },
         {
+          "description": "Enables the check_update command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-check-update",
+          "markdownDescription": "Enables the check_update command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the fetch_torrent_url command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-fetch-torrent-url",
+          "markdownDescription": "Enables the fetch_torrent_url command without any pre-configured scope."
+        },
+        {
           "description": "Enables the get_detail command without any pre-configured scope.",
           "type": "string",
           "const": "allow-get-detail",
@@ -201,16 +213,34 @@
           "markdownDescription": "Enables the get_magnet command without any pre-configured scope."
         },
         {
+          "description": "Enables the get_queue_order command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-queue-order",
+          "markdownDescription": "Enables the get_queue_order command without any pre-configured scope."
+        },
+        {
           "description": "Enables the get_settings command without any pre-configured scope.",
           "type": "string",
           "const": "allow-get-settings",
           "markdownDescription": "Enables the get_settings command without any pre-configured scope."
         },
         {
+          "description": "Enables the get_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-status",
+          "markdownDescription": "Enables the get_status command without any pre-configured scope."
+        },
+        {
           "description": "Enables the inspect_torrent command without any pre-configured scope.",
           "type": "string",
           "const": "allow-inspect-torrent",
           "markdownDescription": "Enables the inspect_torrent command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the install_update command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-install-update",
+          "markdownDescription": "Enables the install_update command without any pre-configured scope."
         },
         {
           "description": "Enables the list_torrents command without any pre-configured scope.",
@@ -229,6 +259,24 @@
           "type": "string",
           "const": "allow-register-associations",
           "markdownDescription": "Enables the register_associations command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the restart_app command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-restart-app",
+          "markdownDescription": "Enables the restart_app command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the rss_run_now command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-rss-run-now",
+          "markdownDescription": "Enables the rss_run_now command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the search command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-search",
+          "markdownDescription": "Enables the search command without any pre-configured scope."
         },
         {
           "description": "Enables the set_priorities command without any pre-configured scope.",
@@ -285,6 +333,18 @@
           "markdownDescription": "Denies the add_torrent command without any pre-configured scope."
         },
         {
+          "description": "Denies the check_update command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-check-update",
+          "markdownDescription": "Denies the check_update command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the fetch_torrent_url command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-fetch-torrent-url",
+          "markdownDescription": "Denies the fetch_torrent_url command without any pre-configured scope."
+        },
+        {
           "description": "Denies the get_detail command without any pre-configured scope.",
           "type": "string",
           "const": "deny-get-detail",
@@ -297,16 +357,34 @@
           "markdownDescription": "Denies the get_magnet command without any pre-configured scope."
         },
         {
+          "description": "Denies the get_queue_order command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-queue-order",
+          "markdownDescription": "Denies the get_queue_order command without any pre-configured scope."
+        },
+        {
           "description": "Denies the get_settings command without any pre-configured scope.",
           "type": "string",
           "const": "deny-get-settings",
           "markdownDescription": "Denies the get_settings command without any pre-configured scope."
         },
         {
+          "description": "Denies the get_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-status",
+          "markdownDescription": "Denies the get_status command without any pre-configured scope."
+        },
+        {
           "description": "Denies the inspect_torrent command without any pre-configured scope.",
           "type": "string",
           "const": "deny-inspect-torrent",
           "markdownDescription": "Denies the inspect_torrent command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the install_update command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-install-update",
+          "markdownDescription": "Denies the install_update command without any pre-configured scope."
         },
         {
           "description": "Denies the list_torrents command without any pre-configured scope.",
@@ -325,6 +403,24 @@
           "type": "string",
           "const": "deny-register-associations",
           "markdownDescription": "Denies the register_associations command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the restart_app command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-restart-app",
+          "markdownDescription": "Denies the restart_app command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the rss_run_now command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-rss-run-now",
+          "markdownDescription": "Denies the rss_run_now command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the search command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-search",
+          "markdownDescription": "Denies the search command without any pre-configured scope."
         },
         {
           "description": "Denies the set_priorities command without any pre-configured scope.",

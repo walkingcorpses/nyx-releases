@@ -19,6 +19,14 @@ const COMMANDS: &[&str] = &[
     "register_associations",
     "unregister_associations",
     "take_pending_args",
+    "get_status",
+    "get_queue_order",
+    "check_update",
+    "install_update",
+    "restart_app",
+    "rss_run_now",
+    "search",
+    "fetch_torrent_url",
 ];
 
 fn main() {
