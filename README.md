@@ -6,6 +6,11 @@
 </p>
 
 <p align="center">
+  <b>Nyx is open source (MIT).</b> The full source code is in this repository, and every release is tagged so you can read exactly what was built.<br>
+  <a href="#build-from-source">Build it yourself</a> · <a href="https://github.com/walkingcorpses/nyx-releases/issues">Report a bug or request a feature</a>
+</p>
+
+<p align="center">
   <a href="https://github.com/walkingcorpses/nyx-releases/releases/latest"><b>Download the latest version</b></a>
 </p>
 
