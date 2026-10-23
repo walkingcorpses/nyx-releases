@@ -18,7 +18,7 @@ WebView2 runtime, which ships with Windows 11.
 - No telemetry. The only network traffic is torrent traffic plus the optional update check, RSS and search, which
   all follow the proxy setting.
 
-Downloads and the user-facing README live in the public repo `walkingcorpses/nyx-releases`; this repo is private.
+Nyx is open source (MIT). Downloads and the user-facing README live in `walkingcorpses/nyx-releases`; each release there is tagged `vX.Y.Z` in this repo and carries a matching source zip.
 Publish a release with `scripts\publish-release.ps1` (tag `vX.Y.Z`, asset `Nyx-X.Y.Z-windows-x64.exe`: the in-app
 updater depends on those names).
 
