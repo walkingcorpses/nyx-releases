@@ -402,6 +402,38 @@ fn peer_dying_holds_torrents_then_recovers() {
     assert_eq!(a.list_torrents()[0].status, "metadata");
 }
 
+/// F1 (lab): a one-way path failure. The VPN server keeps sending handshake initiations but
+/// nothing from us reaches it. The lock must hold once the stale threshold passes and keep
+/// holding for as long as the cut lasts (the initiations are no proof of a live tunnel); once the
+/// path is whole again a real handshake releases the torrents.
+#[test]
+fn one_way_cut_holds_torrents_and_keeps_them_held() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peer = TestPeer::start();
+    let timing = NetTiming { stale_after: Duration::from_secs(3), start_grace: Duration::from_secs(5) };
+    let a = vpn_app(tmp.path(), &vpn_settings(&peer, &conf_text(&peer.client_config())), timing);
+    a.add_magnet(&magnet(16), &tmp.path().join("dl").to_string_lossy(), None, false).unwrap();
+    assert!(tick_until(&a, 10, |a| a.status().route == "up"));
+
+    peer.set_inbound_cut(true);
+    assert!(tick_until(&a, 8, |a| a.status().killed), "{:?}", a.network_status());
+    // Two more stale periods with initiations arriving every second: the lock never lets go.
+    let end = std::time::Instant::now() + Duration::from_secs(6);
+    while std::time::Instant::now() < end {
+        a.tick(Local::now().naive_local());
+        let st = a.status();
+        assert!(st.killed && st.route == "stale", "lock released during the cut: {:?}", a.network_status());
+        assert_eq!(a.list_torrents()[0].status, "queued");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert_eq!(a.check_update().unwrap_err(), LOCK_ERR);
+
+    peer.set_inbound_cut(false);
+    assert!(tick_until(&a, 15, |a| !a.status().killed), "recovers once the path is whole: {:?}", a.network_status());
+    assert_eq!(a.status().route, "up");
+    assert_eq!(a.list_torrents()[0].status, "metadata");
+}
+
 /// An active profile that cannot be opened starts behind a blocked SOCKS port: the route is not
 /// up, the lock holds, and the engine never connects anywhere directly.
 #[test]

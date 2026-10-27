@@ -53,8 +53,9 @@ struct Net {
 }
 
 impl Net {
-    /// The route for this tunnel, or `None` without a profile. Reads the live handshake age, so a
-    /// dead worker shows as an ever older handshake, never as up.
+    /// The route for this tunnel, or `None` without a profile. Reads the live handshake age
+    /// (time since confirmed contact), so a dead worker or a one-way cut shows as an ever older
+    /// age, never as up.
     fn route(&self, timing: NetTiming) -> Option<Route> {
         let t = self.tunnel.as_ref()?;
         Some(if self.blocked { Route::Down } else { timing.evaluate(t.stats().handshake_age, self.started.elapsed()) })

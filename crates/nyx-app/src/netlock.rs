@@ -1,5 +1,7 @@
 // netlock.rs - the network lock's view of the VPN tunnel: turns the tunnel's handshake age into a
-// route state. AppState holds every torrent and refuses HTTP requests unless the route is `Up`
+// route state. That age is nyx-tunnel's time since CONFIRMED contact (a handshake we initiated
+// that completed, or authenticated data/keepalive), so a server whose initiations reach us while
+// our packets do not reach it ages into Stale (lab finding F1). AppState holds every torrent and refuses HTTP requests unless the route is `Up`
 // (spec 4.2). Pure functions only, so the thresholds are tested without a tunnel.
 
 use std::time::Duration;
