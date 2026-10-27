@@ -51,7 +51,13 @@ profile A already active (settings pre-seeded), kill switch on, discovery at its
 
 - `cold_start`: from the first captured packet until the tunnel is up.
 - `steady_download`: the client downloads the torrent from the seeder via the tracker; the file's
-  SHA-256 is verified.
+  SHA-256 is verified; then 60 s of seeding. It fails unless the capture was live all through:
+  WireGuard to exit A in the window and a packet in its last 30 s (keepalive is 25 s).
+- `positive_control` (last): deliberate leaks from client-a's namespace: TCP to the tracker, a DNS
+  query to the lab dns, UDP to exit A on port 9999. All three egress findings and the tracker/dns
+  identity findings must be detected, or the run fails with "lab blind". These expected findings
+  are reported in their own section and do not count as leaks; any other finding in that window
+  still does.
 
 Analyzer unit tests: `docker build -f lab/images/runner/Dockerfile -t nyx-lab/runner lab` then
 `docker run --rm nyx-lab/runner python -m unittest test_analyzer`.

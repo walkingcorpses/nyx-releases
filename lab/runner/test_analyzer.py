@@ -7,7 +7,8 @@ import unittest
 
 import dpkt
 
-from analyzer import Finding, check_egress, check_identity, count_udp_to
+from analyzer import (CONTROL_SIGNATURES, Finding, capture_live, check_egress, check_identity,
+                      count_udp_to, split_control)
 
 CLIENT_MAC = b"\x02\x42\x0a\x4d\x00\x0a"
 GW_MAC = b"\x02\x42\x0a\x4d\x00\x01"
@@ -108,6 +109,47 @@ class Analyzer(unittest.TestCase):
         """count_udp_to sees the WireGuard packets and nothing else."""
         p = self.pcap(udp("10.88.0.10", 1, 51820), udp("10.88.0.11", 1, 51820), udp("10.88.0.10", 1, 51820))
         self.assertEqual(count_udp_to(p, EXIT_A), 2)
+
+    def test_capture_live_fails_on_empty_capture(self):
+        """An empty capture (header only) proves nothing: the liveness check must fail."""
+        ok, why = capture_live(self.pcap(), EXIT_A, 0, 2000)
+        self.assertFalse(ok)
+        self.assertIn("no WireGuard", why)
+
+    def test_capture_live_fails_when_capture_stalls_before_window_end(self):
+        """WireGuard early in the window but nothing in its last 30 s: the writer stalled."""
+        p = self.pcap(udp("10.88.0.10", 1, 51820))  # ts 1000
+        ok, why = capture_live(p, EXIT_A, 0, 1100, tail=30)
+        self.assertFalse(ok)
+        self.assertIn("last 30", why)
+
+    def test_capture_live_passes_with_recent_packet(self):
+        """WireGuard in the window and a packet within the tail: live."""
+        p = self.pcap(udp("10.88.0.10", 1, 51820), udp("10.88.0.10", 1, 51820))  # ts 1000, 1001
+        self.assertEqual(capture_live(p, EXIT_A, 0, 1020, tail=30), (True, ""))
+
+    def test_split_control_excludes_only_expected_signatures_in_control_window(self):
+        """Control findings matching the expected signatures are set aside; a different leak in the
+        same window, and a matching leak in another window, still count as real."""
+        sigs = CONTROL_SIGNATURES
+        fs = [Finding("egress", "positive_control", "TCP -> 10.88.0.20:8000 (HTTP tracker): 3 packets, first at 1.0"),
+              Finding("egress", "positive_control", "UDP -> 10.88.0.23:53 (DNS): 1 packets, first at 1.0"),
+              Finding("egress", "positive_control", "UDP -> 10.88.0.10:9999: 1 packets, first at 1.0"),
+              Finding("identity", "positive_control", "tracker saw 10.88.0.1 at 1.000: {}"),
+              Finding("identity", "positive_control", "dns saw 10.88.0.1 at 1.000: {}"),
+              Finding("egress", "positive_control", "UDP -> 10.88.0.23:5353 (mDNS): 1 packets, first at 1.0"),
+              Finding("egress", "steady_download", "TCP -> 10.88.0.20:8000 (HTTP tracker): 1 packets, first at 0.5")]
+        real, missing = split_control(fs, "positive_control", sigs)
+        self.assertEqual(missing, [])
+        self.assertEqual(real, [fs[5], fs[6]])
+
+    def test_split_control_reports_missing_signature(self):
+        """A control leak that was not detected is reported as missing (the lab is blind to it)."""
+        fs = [Finding("egress", "positive_control", "TCP -> 10.88.0.20:8000 (HTTP tracker): 3 packets, first at 1.0")]
+        real, missing = split_control(fs, "positive_control", CONTROL_SIGNATURES)
+        self.assertEqual(real, [])
+        self.assertEqual(len(missing), len(CONTROL_SIGNATURES) - 1)
+        self.assertNotIn("TCP to the tracker", missing)
 
     def test_server_log_with_gateway_source_is_a_finding(self):
         """A server that logged the gateway (the client's real address) caught a leak."""

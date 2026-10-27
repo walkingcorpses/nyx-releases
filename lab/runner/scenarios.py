@@ -34,6 +34,7 @@ TRACKERS = [["udp://10.88.0.20:6969/announce"], ["http://10.88.0.20:8000/announc
 PAYLOAD_SIZE = 20 * 1024 * 1024
 DOWNLOAD_TIMEOUT = 600
 DWELL = 60
+CONTROL = "positive_control"
 
 
 def container(service):
@@ -160,6 +161,23 @@ def steady_download(client):
     return f"20 MB in {secs:.0f}s, SHA-256 verified"
 
 
+def positive_control(client):
+    """Deliberately leaks from the client's network namespace (bash /dev/tcp and /dev/udp, so the
+    client image needs no extra tools): TCP to the tracker, a DNS query to the lab dns, and UDP to
+    exit A off its WireGuard port. Each must come back as a finding, or the lab is blind."""
+    # DNS query for control.lab, type A (id 0x1234, recursion desired).
+    dns_query = r"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07control\x03lab\x00\x00\x01\x00\x01"
+    script = ("exec 3<>/dev/tcp/10.88.0.20/8000; printf 'GET /positive-control HTTP/1.0\\r\\n\\r\\n' >&3; timeout 3 cat <&3 >/dev/null; "
+              # Read the answer before closing: a reply to a closed port makes the kernel send
+              # ICMP port-unreachable, which would be a stray finding of the control itself.
+              f"exec 4<>/dev/udp/10.88.0.23/53; printf '{dns_query}' >&4; timeout 3 head -c 1 <&4 >/dev/null; exec 4<&-; "
+              "printf 'positive-control' > /dev/udp/10.88.0.10/9999")
+    p = subprocess.run(["docker", "exec", container(client), "bash", "-c", script], capture_output=True, text=True, timeout=30)
+    if p.returncode != 0:
+        raise RuntimeError(f"control leak commands failed: {p.stderr.strip()}")
+    time.sleep(3)  # let the capture and the server logs record them
+
+
 def read_logs():
     """All server log entries from /out/*.log (JSON lines), skipping unreadable lines."""
     out = []
@@ -179,7 +197,7 @@ def observations(logs, client):
     notes = []
     exits = set(EXITS.values())
     for e in logs:
-        if e["server"] == "tracker" and e["src"] in exits | {analyzer.GATEWAY_IDENTITY}:
+        if e["server"] == "tracker" and e["src"] in exits | {analyzer.GATEWAY_IDENTITY} and e.get("path") != "/positive-control":
             notes.append(f"tracker {e.get('proto')} announce from {e['src']}: peer_id={e.get('peer_id')} key={e.get('key')} "
                          f"port={e.get('port')} ip={e.get('ip') or '-'} event={e.get('event')} UA={e.get('user_agent', '-')}")
         if e["server"] == "observer" and e["src"] in exits | {analyzer.GATEWAY_IDENTITY}:
@@ -228,14 +246,31 @@ def main():
     # Dwell while seeding: the transfer takes seconds, and periodic or delayed traffic (DHT
     # bootstrap, LSD, UPnP/NAT-PMP, re-announces) must get a chance to show in the capture.
     time.sleep(DWELL)
-    windows["steady_download"] = (t_up, float("inf"))
+    t_ctl = time.time()
+    windows["steady_download"] = (t_up, t_ctl)
+    # A clean window only counts if the capture was recording all through it.
+    live, why = analyzer.capture_live(pcap, (EXITS["wg-exit-a"], WG_PORT), t_up, t_ctl)
+    if not live and scenarios[-1][1]:
+        scenarios[-1] = ("steady_download", False, f"capture not live: {why}")
+    print(scenarios[-1], flush=True)
+
+    try:
+        positive_control(client)
+        scenarios.append(("positive_control", True, "deliberate leaks sent from client-a's namespace"))
+    except Exception as e:
+        traceback.print_exc()
+        scenarios.append(("positive_control", False, str(e)))
+    windows[CONTROL] = (t_ctl, float("inf"))
     print(scenarios[-1], flush=True)
 
     logs = read_logs()
     for name, (since, until) in windows.items():
         findings += analyzer.check_egress(pcap, allowed, name, since, until)
         findings += analyzer.check_identity([e for e in logs if since <= e.get("ts", 0) <= until], name)
-    code = report.write(f"{OUT}/report.md", scenarios, findings, observations(logs, client))
+    real, missing = analyzer.split_control(findings, CONTROL, analyzer.CONTROL_SIGNATURES)
+    for m in missing:
+        print(f"lab blind: expected finding {m!r} not detected", flush=True)
+    code = report.write(f"{OUT}/report.md", scenarios, real, observations(logs, client), missing)
     print(open(f"{OUT}/report.md", encoding="utf-8").read(), flush=True)
     for path in glob.glob(f"{OUT}/*"):  # live volume -> lab/out on the host
         shutil.copy(path, HOST_OUT)

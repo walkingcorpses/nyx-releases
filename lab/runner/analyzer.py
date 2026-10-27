@@ -104,6 +104,46 @@ def count_udp_to(pcap, endpoint, since=0.0, until=float("inf")):
     return n
 
 
+def capture_live(pcap, endpoint, since, until, tail=30.0):
+    """Proves the capture was recording through [since, until], so a clean check_egress over that
+    window means something. Needs a WireGuard packet to `endpoint` in the window and an outbound
+    packet in its last `tail` seconds (PersistentKeepalive is 25 s, so a live tunnel always has
+    one). Returns (True, "") or (False, reason)."""
+    if count_udp_to(pcap, endpoint, since, until) == 0:
+        return False, f"no WireGuard packet to {endpoint[0]}:{endpoint[1]} in the capture window: capture dead or empty"
+    with open(pcap, "rb") as f:
+        last = max((ts for ts, _ in dpkt.pcap.Reader(f) if ts <= until), default=0.0)
+    if last < until - tail:
+        return False, f"no packet captured in the last {tail:.0f} s of the window (last at {last:.3f}): capture stalled"
+    return True, ""
+
+
+# The positive control's deliberate leaks: (name, check, start of the finding's detail). Only
+# findings in the control's own window that start with one of these are set aside.
+CONTROL_SIGNATURES = [
+    ("TCP to the tracker", "egress", "TCP -> 10.88.0.20:8000"),
+    ("DNS query to the lab dns", "egress", "UDP -> 10.88.0.23:53"),
+    ("UDP to exit A off the WireGuard port", "egress", "UDP -> 10.88.0.10:9999"),
+    ("tracker logs the real address", "identity", f"tracker saw {GATEWAY_IDENTITY}"),
+    ("dns logs the real address", "identity", f"dns saw {GATEWAY_IDENTITY}"),
+]
+
+
+def split_control(findings, control_scenario, signatures):
+    """Separates the positive control's expected findings from real ones. A finding is set aside
+    only if it belongs to `control_scenario` AND matches a signature; everything else stays real.
+    Returns (real findings, names of expected signatures that were NOT detected)."""
+    def match(f, c, p):
+        """`f` is in the control window, of check `c`, and its detail is `p` followed by a word end
+        (so "...:53" does not match "...:5353")."""
+        return (f.scenario == control_scenario and f.check == c and f.detail.startswith(p)
+                and f.detail[len(p):len(p) + 1] in (" ", ":", ""))
+
+    real = [f for f in findings if not any(match(f, c, p) for _, c, p in signatures)]
+    missing = [name for name, c, p in signatures if not any(match(f, c, p) for f in findings)]
+    return real, missing
+
+
 def check_identity(server_logs, scenario=""):
     """Findings for every server log entry (dicts with server/ts/src) whose source is the client's
     real address, the gateway 10.88.0.1."""
