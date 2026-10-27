@@ -758,8 +758,9 @@ def identity_rotation(t0):
     observer (which has no MSE; MSE only wraps the same handshake, so what it reads is what an
     MSE peer learns). Rotation on, two rotate_now swaps (A -> B -> A) during a slowed download;
     each session (before, between, after the swaps) must reach the tracker and the observer.
-    Then check_linkability over the client's tracker and observer entries with the swap marks
-    (rotate_now's replies). The download must still finish, SHA-256 verified."""
+    Then check_linkability over the client's tracker and observer entries with the swap windows
+    (rotate_now called to rotate_now returned). The 60 s lab timer (NYX_LAB_ROTATE_SECS) may add
+    an unmarked swap while a session is awaited; the exit rule covers it. The download must still finish, SHA-256 verified."""
     enc = ctl(CLIENT, {"cmd": "get_settings"})["encryption"]
     marks, seen, done = [], [], []
     try:
@@ -771,12 +772,13 @@ def identity_rotation(t0):
         seen.append(session_seen(t0))
         set_rotation(True)
         for i in range(2):
+            start = time.time()
             old, new, err, took = rotate("identity_rotation")
             if err or new == old:
                 raise RuntimeError(f"rotate_now {i + 1} did not swap ({old} -> {new}): {err}")
-            marks.append(time.time())
+            marks.append((start, time.time()))  # the new session announces before rotate_now returns
             done.append(f"{old} -> {new} in {took:.1f} s")
-            seen.append(session_seen(marks[-1]))
+            seen.append(session_seen(marks[-1][1]))
     finally:
         set_rotation(False, active="wg-exit-a")
         change_settings(CLIENT, encryption=enc)
@@ -784,7 +786,7 @@ def identity_rotation(t0):
     found = analyzer.check_linkability(tracker, observer, marks, "identity_rotation")
     LAB["findings"].extend(found)
     ids = sorted({(e.get("peer_id"), e.get("key")) for e in tracker if e.get("info_hash") == setup_state["hash:ident"]})
-    LAB["notes"].append(f"identity_rotation: marks {[round(m, 3) for m in marks]}; (announces, handshakes) per session {seen}; "
+    LAB["notes"].append(f"identity_rotation: swap windows {[(round(a, 3), round(b, 3)) for a, b in marks]}; (announces, handshakes) per session {seen}; "
                         f"ident torrent (peer_id, key) at the tracker: {ids}")
     change_settings("seeder", up_limit=0)
     secs = wait_done("ident")

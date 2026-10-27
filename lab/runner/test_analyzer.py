@@ -444,6 +444,17 @@ class Linkability(unittest.TestCase):
         self.assertEqual(len(d), 2, d)  # peer_id and key
         self.assertTrue(any("10.88.0.11" in x for x in d), d)
 
+    def test_new_identity_inside_the_swap_window_is_clean(self):
+        """The new session announces before rotate_now replies: inside the swap window (call to
+        reply) an entry belongs to no session, so the new identity there is not "two sessions"."""
+        tracker = [announce(1000, peer_id="A" * 20, key="11111111"),
+                   announce(1999, src="10.88.0.11", peer_id="B" * 20, key="22222222"),
+                   announce(3000, src="10.88.0.11", peer_id="B" * 20, key="22222222")]
+        self.assertEqual(self.check(tracker, [], marks=[(1990.0, 2000.0)]), [])
+        # The old identity inside the window but from the new exit is still caught (exit rule).
+        leak = [announce(1000), announce(1995, src="10.88.0.11")]
+        self.assertEqual(len(self.check(leak, [], marks=[(1990.0, 2000.0)])), 2)
+
     def test_same_observer_peer_id_across_rotation_is_a_finding(self):
         """The peer_id a peer sees in the handshake counts too."""
         d = self.check([], [handshake(1000), handshake(3000, src="10.88.0.11")])

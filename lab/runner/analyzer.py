@@ -286,26 +286,31 @@ _CLIENT_NAME = re.compile(r"nyx|libtorrent|rasterbar", re.IGNORECASE)
 _LT_PEER_ID = re.compile(r"^-LT[0-9A-Za-z]{4}-", re.IGNORECASE)
 
 
-def _segment(ts, marks):
-    """Index of the session `ts` falls in: 0 before the first rotation mark, 1 after it, ..."""
-    return bisect.bisect_right(marks, ts)
+def _segment(ts, windows):
+    """Index of the session `ts` falls in: 0 before the first swap window, 1 after it, ...; None
+    inside a window (the swap is under way: old and new identity may both show up there)."""
+    if any(a <= ts <= b for a, b in windows):
+        return None
+    return bisect.bisect_right([b for _, b in windows], ts)
 
 
 def check_linkability(tracker_log, observer_log, rotation_marks, scenario=""):
     """Spec 7.3 check 3 (Task 15): what a tracker or a peer learns must neither link the client's
     sessions across a rotation nor name the client. `tracker_log` and `observer_log` are the
-    servers' entries for the window, `rotation_marks` the times each swap was complete (rotate_now
-    returned). Findings ("linkability"):
+    servers' entries for the window, `rotation_marks` the swaps: (start, end) windows (rotate_now
+    called, rotate_now returned) or bare times. Findings ("linkability"):
     - the same peer_id (tracker announce or peer handshake), tracker `key` or non-empty extension
       `v` seen in two sessions (either side of a mark) or from two exits: the server can tell the
-      new exit is the old client. The exit rule also catches an old identity slipping out through
-      the new tunnel before the mark;
+      new exit is the old client. Entries inside a swap window belong to no session (the new
+      session announces before rotate_now returns); the exit rule still covers them, and catches
+      an old identity slipping out through the new tunnel;
     - a peer_id prefix, `v` or tracker User-Agent naming Nyx or libtorrent (any session);
     - an announced listen port: the extension handshake `p` or the announce `port`, other than
       libtorrent's placeholder 1 (and 0). A proxied client cannot accept connections, so a real
       port is either its true listen port or a stable per-session token.
     Encrypted handshakes (unreadable) and entries without the field are skipped."""
-    marks = sorted(rotation_marks)
+    windows = sorted(m if isinstance(m, (tuple, list)) else (m, m) for m in rotation_marks)
+    marks = [b for _, b in windows]
     out = []
     # value -> [(session, exit)], per kind of identity
     seen = {"peer_id": {}, "key": {}, "v": {}}
@@ -314,7 +319,7 @@ def check_linkability(tracker_log, observer_log, rotation_marks, scenario=""):
     def note(kind, value, e):
         """Records that `value` (a `kind` identity) was seen in entry `e`."""
         if value not in (None, ""):
-            seen[kind].setdefault(str(value).lower() if kind == "key" else str(value), []).append((_segment(e.get("ts", 0), marks), e.get("src")))
+            seen[kind].setdefault(str(value).lower() if kind == "key" else str(value), []).append((_segment(e.get("ts", 0), windows), e.get("src")))
 
     def names(field, value, e):
         """Counts `value` (of `field`, from entry `e`) when it names Nyx or libtorrent; a peer_id by
@@ -354,7 +359,7 @@ def check_linkability(tracker_log, observer_log, rotation_marks, scenario=""):
                                                     f"from {e.get('src')} at {e.get('ts', 0):.3f}"))
     for kind, values in seen.items():
         for value, where in values.items():
-            sessions, exits = sorted({s for s, _ in where}), sorted({x for _, x in where if x})
+            sessions, exits = sorted({s for s, _ in where if s is not None}), sorted({x for _, x in where if x})
             if len(sessions) > 1 or len(exits) > 1:
                 out.append(Finding("linkability", scenario, f"same {kind} {value!r} in sessions {sessions} (rotations at "
                                                             f"{', '.join(f'{m:.3f}' for m in marks) or '-'}) from exits {exits}"))
