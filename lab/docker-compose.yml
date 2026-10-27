@@ -1,7 +1,9 @@
 # Nyx leak lab (spec section 7). Run with lab/run.ps1 or lab/run.sh, which build nyx-lab/daemon
 # from the repo root first and tear the lab down afterwards.
 #
-# real     10.77.0.0/24  the client's home LAN (see the note on the network). client-a .10, gateway .1
+# real     10.77.0.0/24 + fd77::/64  the client's home LAN (see the note on the network), IPv6 on so
+#                        IPv6 leaks can happen: client-a .10 / fd77::a, gateway .1 / fd77::1.
+#                        The host (Docker's bridge) is reachable on this LAN at 10.77.0.254 / fd77::fe.
 # internet 10.88.0.0/24  internal: gateway .1 (NAT, the client's real "ISP" identity),
 #                        wg-exit-a .10, wg-exit-b .11, tracker .20, seeder .21, observer .22,
 #                        dns .23, canary .24
@@ -19,9 +21,10 @@ networks:
   # egress is closed instead by: no host masquerade for this bridge, the client's default route
   # pointing at the lab gateway, and the gateway having no default route (gateway/entry.sh).
   real:
+    enable_ipv6: true
     driver_opts: { com.docker.network.bridge.enable_ip_masquerade: "false" }
     ipam:
-      config: [{ subnet: 10.77.0.0/24, gateway: 10.77.0.254 }]
+      config: [{ subnet: 10.77.0.0/24, gateway: 10.77.0.254 }, { subnet: "fd77::/64", gateway: "fd77::fe" }]
   internet:
     internal: true
     ipam:
@@ -55,7 +58,7 @@ services:
     cap_add: [NET_ADMIN]
     sysctls: { net.ipv4.ip_forward: 1 }
     networks:
-      real: { ipv4_address: 10.77.0.1 }
+      real: { ipv4_address: 10.77.0.1, ipv6_address: "fd77::1" }
       internet: { ipv4_address: 10.88.0.1 }
 
   wg-exit-a:
@@ -99,10 +102,12 @@ services:
   client-a:
     image: nyx-lab/client
     build: { context: images/client }
-    cap_add: [NET_ADMIN]  # only for the default route set in entry.sh
-    environment: { CLIENT_NAME: client-a, NYX_DATA_DIR: /data, NYX_LAB_DEBUG: "1" }
+    cap_add: [NET_ADMIN]  # only for the default routes set in entry.sh, which then drops it
+    # NYX_LAB_STALE_AFTER_SECS (lab-only override, read by nyx-daemon only): the network lock calls
+    # the tunnel stale after 20 s without a handshake instead of 180 s, for the kill-timing check.
+    environment: { CLIENT_NAME: client-a, NYX_DATA_DIR: /data, NYX_LAB_DEBUG: "1", NYX_LAB_STALE_AFTER_SECS: "20" }
     volumes: ["conf:/conf:ro"]
-    networks: { real: { ipv4_address: 10.77.0.10 } }
+    networks: { real: { ipv4_address: 10.77.0.10, ipv6_address: "fd77::a" } }
     depends_on: [gateway]
 
   # Records every packet LEAVING client-a (shares its network namespace).

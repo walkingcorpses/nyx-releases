@@ -1,7 +1,11 @@
 """tracker.py - leak lab BitTorrent tracker: HTTP on :8000 (/announce) and UDP (BEP 15) on :6969.
 Logs every announce with the source IP and everything a tracker could use to identify or link a
-client: peer_id, port, ip=, key, event, User-Agent. Always answers with the two lab peers (the
-seeder and the passive observer), so a client that announces gets someone to talk to."""
+client: peer_id, port, ip=, key, event, User-Agent. /announce answers with the two lab peers (the
+seeder and the passive observer), so a client that announces gets someone to talk to.
+Bait paths (scenario `bait`): /bait/peers answers with peers a careful client must never dial
+outside its tunnel: home-LAN addresses, private IP literals, a lab server by IP and IPv6
+addresses (non-compact list plus compact peers6). /bait/redirect answers 302 to the canary BY IP,
+so a client that follows tracker redirects outside its tunnel shows up in the canary log."""
 import socket
 import struct
 import threading
@@ -16,6 +20,13 @@ LOG = LabLog("tracker")
 PEERS = [("10.88.0.21", 6881), ("10.88.0.22", 6881)]
 COMPACT = b"".join(socket.inet_aton(ip) + struct.pack(">H", p) for ip, p in PEERS)
 INTERVAL = 60
+# The bait peer list: the real LAN (gateway, another host), a 192.168 host, the canary by IP and
+# IPv6 literals (the lab gateway's ULA and a documentation address).
+BAIT_PEERS = [{"ip": "10.77.0.1", "port": 6881}, {"ip": "10.77.0.5", "port": 6881},
+              {"ip": "192.168.1.10", "port": 6881}, {"ip": "10.88.0.24", "port": 80},
+              {"ip": "fd77::1", "port": 6881}, {"ip": "2001:db8::1", "port": 6881}]
+BAIT_PEERS6 = b"".join(socket.inet_pton(socket.AF_INET6, ip) + struct.pack(">H", 6881) for ip in ("fd77::fe", "2001:db8::2"))
+REDIRECT_TO = "http://10.88.0.24/bait-redirected"
 
 
 def parse_query(raw):
@@ -42,7 +53,16 @@ class Announce(BaseHTTPRequestHandler):
             port=text(q.get("port", b"")), ip=text(q.get("ip", b"")), key=text(q.get("key", b"")),
             event=text(q.get("event", b"")), user_agent=self.headers.get("User-Agent", ""),
             headers=dict(self.headers.items()), query=raw)
-        body = encode({"interval": INTERVAL, "peers": COMPACT})
+        if path == "/bait/redirect":
+            self.send_response(302)
+            self.send_header("Location", f"{REDIRECT_TO}?{raw}")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if path == "/bait/peers":
+            body = encode({"interval": INTERVAL, "peers": BAIT_PEERS, "peers6": BAIT_PEERS6})
+        else:
+            body = encode({"interval": INTERVAL, "peers": COMPACT})
         self.send_response(200)
         self.send_header("Content-Type", "text/plain")
         self.send_header("Content-Length", str(len(body)))

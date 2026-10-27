@@ -11,6 +11,9 @@ LOG = LabLog("dns")
 NAMES = {
     "tracker.lab": "10.88.0.20", "seeder.lab": "10.88.0.21", "observer.lab": "10.88.0.22",
     "dns.lab": "10.88.0.23", "canary.lab": "10.88.0.24",
+    # The update check's fixed host: pointed at the canary (its :443 logger) so the metadata
+    # scenario sees which path the update check's connection took.
+    "api.github.com": "10.88.0.24",
 }
 
 
