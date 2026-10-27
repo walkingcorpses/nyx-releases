@@ -49,6 +49,8 @@ pub struct AppState {
     pub engine: Engine,
     pub data_dir: PathBuf,
     settings: Mutex<Settings>,
+    /// Serialises every settings write (read-modify-write-save), see `write_settings`.
+    settings_write: Mutex<()>,
     queue: Mutex<Queue>,
     poll: Mutex<PollState>,
     /// Magnet links and .torrent paths that arrived (argv, second launch) and the UI has not
@@ -101,6 +103,7 @@ impl AppState {
             engine,
             data_dir: data_dir.to_path_buf(),
             settings: Mutex::new(settings),
+            settings_write: Mutex::new(()),
             queue: Mutex::new(queue),
             poll: Mutex::new(PollState::default()),
             pending_args: Mutex::new(Vec::new()),
@@ -132,25 +135,35 @@ impl AppState {
     /// The profile list in `new` is ignored (the UI only ever sees it without configs, so echoing
     /// it back must not wipe or alter what is stored); profiles change only through
     /// import/rename/delete. `active_profile` and `rotation` are taken from `new`.
-    pub fn set_settings(&self, mut new: Settings) -> Result<(), String> {
-        new.network.profiles = self.get_settings().network.profiles;
-        self.commit_settings(new)
+    pub fn set_settings(&self, new: Settings) -> Result<(), String> {
+        self.write_settings(|cur| {
+            // Pin the profiles at the moment of writing (under the writer lock), not before.
+            let profiles = std::mem::take(&mut cur.network.profiles);
+            *cur = new;
+            cur.network.profiles = profiles;
+        })
     }
 
     /// Changes settings from inside the app (profile import/rename/delete): applies `f` to a copy
     /// of the current settings, then validates, saves and applies like `set_settings`, but
     /// without pinning the profile list.
     pub(crate) fn update_settings(&self, f: impl FnOnce(&mut Settings)) -> Result<(), String> {
-        let mut new = self.get_settings();
-        f(&mut new);
-        self.commit_settings(new)
+        self.write_settings(f)
     }
 
-    /// Validates `new`, writes it to disk, makes it current and applies it.
-    fn commit_settings(&self, new: Settings) -> Result<(), String> {
-        validate_settings(&new)?;
-        new.save(&self.data_dir).map_err(|e| format!("could not save settings: {e}"))?;
-        *self.settings.lock().unwrap() = new;
+    /// The one write path for settings. `settings_write` is held across read, change, validate,
+    /// save and the in-memory store, so concurrent writers cannot overwrite each other with a
+    /// stale copy (a lost profile) and disk always matches memory. The lock is released before
+    /// `apply_settings`, which only reads settings and never writes them.
+    fn write_settings(&self, change: impl FnOnce(&mut Settings)) -> Result<(), String> {
+        {
+            let _writer = self.settings_write.lock().unwrap();
+            let mut new = self.get_settings();
+            change(&mut new);
+            validate_settings(&new)?;
+            new.save(&self.data_dir).map_err(|e| format!("could not save settings: {e}"))?;
+            *self.settings.lock().unwrap() = new;
+        }
         self.apply_settings()
     }
 

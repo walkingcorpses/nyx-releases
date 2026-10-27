@@ -344,4 +344,33 @@ mod tests {
         })
         .is_ok());
     }
+
+    #[test]
+    fn concurrent_import_and_set_settings_never_lose_a_profile() {
+        let (dir, st) = app();
+        let st = std::sync::Arc::new(st);
+        let path = write_conf(dir.path(), &conf("127.0.0.1:51820"));
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // A UI-style writer round-tripping settings (unrelated field changes) as fast as it can.
+        let setter = {
+            let (st, done) = (st.clone(), done.clone());
+            std::thread::spawn(move || {
+                let mut n = 0usize;
+                while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                    let mut s = st.settings_for_ui();
+                    s.max_active_downloads = 1 + n % 5;
+                    st.set_settings(s).unwrap();
+                    n += 1;
+                }
+            })
+        };
+        let imported: Vec<String> = (0..20).map(|i| st.import_profile(&path, &format!("P{i}"), "").unwrap().id).collect();
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        setter.join().unwrap();
+        let mem = st.get_settings().network.profiles;
+        let ids: Vec<&str> = mem.iter().map(|p| p.id.as_str()).collect();
+        assert!(imported.iter().all(|id| ids.contains(&id.as_str())), "a profile was lost: {ids:?}");
+        let disk = nyx_core::Settings::load(&dir.path().join("data")).network.profiles;
+        assert_eq!(mem, disk, "memory and settings.json differ");
+    }
 }
