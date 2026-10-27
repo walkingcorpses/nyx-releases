@@ -26,6 +26,31 @@ and does not touch app code.
 
 ### F1. A half-finished handshake counts as a live tunnel: the lock releases while still cut (kill_timing)
 
+- [x] **FIXED in Task 12a** (commits e249b5f, c5110cf; lab scenarios 03107b9). Proven by the full
+  lab run of 2026-10-27 16:03 UTC: no kill_timing finding; the only finding left is F2.
+  - Fix: `TunnelStats.handshake_age` (nyx-tunnel) is now the time since CONFIRMED contact, i.e.
+    a handshake response to OUR initiation that boringtun accepted (`completes_our_handshake`).
+    Received initiations (type 1), cookie replies (type 3) and inbound transport data (type 4)
+    never count. The client re-key also counts from that record, not from boringtun's
+    `time_since_last_handshake`.
+  - Why inbound data does not count either (lab evidence, one-way cut, data counted as contact):
+    the age reset at 1, 2, 5, 7, 14 and 27 s after the kill, each time rx grew by exactly one
+    1420-byte packet. These were the seeder's TCP retransmits (exponential backoff), sent by exit A
+    on its still-valid keypair while the client's packets were dropped.
+  - Full run results: `tunnel_killed_midtransfer` (one-way) held after 15.3 s, stayed held for
+    the whole cut, recovered 6.0 s after the restore. `tunnel_cut_both_ways` held after 12.9 s,
+    recovered after 2.5 s. `tunnel_cut_long` (one-way, 130 s) held after 7.0 s (age 13 s at the
+    kill), stayed held for all 130 s (past wireguard-go's ~90 s of attempts), recovered after
+    3.7 s. Every recovery showed rx and progress growth. The subset run before it gave the same
+    picture: ages grew from 0 to 129 s without one reset, while rx still grew from exit A's
+    retransmits.
+  - Tests: nyx-tunnel `half_handshake_does_not_count_as_contact`,
+    `initiation_alone_does_not_reset_age`, `data_alone_does_not_reset_age`,
+    `completed_rekey_counts_as_contact` (TestPeer `set_inbound_cut`); nyx-app
+    `one_way_cut_holds_torrents_and_keeps_them_held`.
+
+Original finding (Task 11 baseline):
+
 - Scenario: `tunnel_killed_midtransfer`, window "killed". The lab cut is ONE-WAY: exit A drops
   the client's WireGuard packets (`iptables -I INPUT -p udp --dport 51820 -j DROP` on wg-exit-a),
   but exit A can still send to the client.
