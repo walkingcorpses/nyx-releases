@@ -150,6 +150,32 @@ fn lab_timing_overrides_only_stale_after() {
     assert!(nyx_daemon::lab_timing(Some(OsStr::new("soon"))).is_err());
 }
 
+/// rotate_now is a known command: with rotation off it is an error reply that says so (the lab
+/// turns rotation on through set_settings first), never "unknown command".
+#[test]
+fn rotate_now_with_rotation_off_is_an_error_reply() {
+    let tmp = tempfile::tempdir().unwrap();
+    let r = call(&app(tmp.path()), json!({"cmd": "rotate_now"}));
+    assert!(r["err"].as_str().unwrap().contains("rotation is off"), "{r}");
+}
+
+/// NYX_LAB_ROTATE_SECS (lab-only): unset means no override; a positive number of seconds is the
+/// fixed rotation interval; zero, garbage or non-UTF-8 is a startup error.
+#[test]
+fn lab_rotate_every_parses_positive_seconds_only() {
+    use std::ffi::OsStr;
+    use std::time::Duration;
+    assert_eq!(nyx_daemon::lab_rotate_every(None).unwrap(), None);
+    assert_eq!(nyx_daemon::lab_rotate_every(Some(OsStr::new("40"))).unwrap(), Some(Duration::from_secs(40)));
+    assert!(nyx_daemon::lab_rotate_every(Some(OsStr::new("0"))).is_err());
+    assert!(nyx_daemon::lab_rotate_every(Some(OsStr::new("soon"))).is_err());
+    #[cfg(windows)]
+    let bad = <std::ffi::OsString as std::os::windows::ffi::OsStringExt>::from_wide(&[0xd800]);
+    #[cfg(unix)]
+    let bad = <std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(vec![0xff]);
+    assert!(nyx_daemon::lab_rotate_every(Some(&bad)).is_err());
+}
+
 /// A non-UTF-8 NYX_LAB_STALE_AFTER_SECS is a startup error, never read as unset (which would
 /// silently keep the 180 s threshold and make the lab's kill-timing check wait for nothing).
 #[test]

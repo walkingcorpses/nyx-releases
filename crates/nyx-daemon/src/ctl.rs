@@ -53,6 +53,9 @@ fn dispatch(state: &AppState, req: &Value) -> Result<Value, String> {
         "list_profiles" => ok(state.list_profiles()),
         // The Network card: route (up/starting/stale/down), profile, handshake age, byte counters.
         "network_status" => ok(state.network_status()),
+        // Rotate to another pool profile now (make-before-break); replies the new profile id.
+        // Takes up to 15 s, inside the ctl client's 30 s timeout.
+        "rotate_now" => ok(state.rotate_now()?),
         "rss_run" => ok(state.rss_run()),
         "check_update" => ok(state.check_update()?),
         "search" => ok(state.search(arg_str(req, "query")?)?),

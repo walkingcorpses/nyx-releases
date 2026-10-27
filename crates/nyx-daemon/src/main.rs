@@ -4,11 +4,13 @@
 //!   nyx-daemon --version      print "nyx-daemon <version>"
 //! Env for `run`: NYX_DATA_DIR (required), NYX_LISTEN (default 0.0.0.0:6881), NYX_NO_DISCOVERY (any value),
 //! NYX_LAB_STALE_AFTER_SECS (LAB-ONLY: shortens the network lock's 180 s stale threshold for the leak
-//! lab's kill-timing check; no other binary reads it, and unset keeps the production value).
+//! lab's kill-timing check; no other binary reads it, and unset keeps the production value),
+//! NYX_LAB_ROTATE_SECS (LAB-ONLY: a fixed rotation interval in seconds instead of the settings'
+//! minutes, so the lab sees a timer-driven rotation; unset keeps the settings' interval).
 
 use nyx_app::state::AppState;
 use nyx_daemon::ctl::{handle, is_shutdown, request};
-use nyx_daemon::{lab_timing, listen_addr};
+use nyx_daemon::{lab_rotate_every, lab_timing, listen_addr};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
@@ -45,9 +47,13 @@ fn run() -> Result<(), String> {
     let listen = listen_addr(std::env::var("NYX_LISTEN").ok().as_deref())?;
     let discovery = std::env::var_os("NYX_NO_DISCOVERY").is_none();
     let timing = lab_timing(std::env::var_os("NYX_LAB_STALE_AFTER_SECS").as_deref())?;
+    let rotate_every = lab_rotate_every(std::env::var_os("NYX_LAB_ROTATE_SECS").as_deref())?;
     // Bind the control port first: a taken port fails before the engine touches the network.
     let listener = TcpListener::bind(CTL_ADDR).map_err(|e| format!("cannot bind {CTL_ADDR}: {e}"))?;
     let state = Arc::new(AppState::new_with_timing(std::path::Path::new(&data), listen, discovery, timing)?);
+    if rotate_every.is_some() {
+        state.set_rotation_interval(rotate_every);
+    }
     spawn_poller(state.clone());
     spawn_background(state.clone());
     for conn in listener.incoming().flatten() {
