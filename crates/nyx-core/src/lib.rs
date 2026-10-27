@@ -3,6 +3,7 @@
 
 pub mod blocklist;
 pub mod categories;
+pub mod network;
 pub mod queue;
 pub mod scheduler;
 pub mod settings;
@@ -10,6 +11,7 @@ pub mod validate;
 
 pub use blocklist::{parse_blocklist, Range as IpRange};
 pub use categories::{Categories, CategoryDef};
+pub use network::{NetworkSettings, Profile, RotationSettings};
 pub use queue::{Action, Queue, QueueEntry};
 pub use scheduler::{Block, Schedule};
 pub use settings::{data_dir, EncryptionPref, Feed, ProxySettings, RssSettings, Settings};
