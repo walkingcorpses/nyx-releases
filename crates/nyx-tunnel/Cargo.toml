@@ -1,10 +1,22 @@
-# nyx-tunnel: built-in userspace WireGuard for Nyx (conf parser now; tunnel + SOCKS5 server in later tasks).
+# nyx-tunnel: built-in userspace WireGuard for Nyx (conf parser, SOCKS5 server, boringtun + smoltcp tunnel).
 [package]
 name = "nyx-tunnel"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
 
+[features]
+# Exposes `testpeer::TestPeer`, an in-process WireGuard peer used by the integration tests.
+test-support = []
+
 [dependencies]
 base64 = "0.22"
 rand = "0.9"
+# WireGuard protocol only (noise::Tunn); no device/tun features, so nothing OS-specific.
+boringtun = { version = "0.7.1", default-features = false }
+# Userspace TCP/IP over raw IP packets (Medium::Ip); only what the tunnel uses.
+smoltcp = { version = "0.14.0", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp", "socket-dns"] }
+
+[[test]]
+name = "tunnel"
+required-features = ["test-support"]
