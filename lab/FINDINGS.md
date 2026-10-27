@@ -97,6 +97,29 @@ Original finding (Task 11 baseline):
 
 ### F2. ICMP port-unreachable to the VPN endpoint while the daemon is down (egress)
 
+- [x] **RESOLVED BY NARROW ALLOWLIST in Task 12b** (lab analyzer, not app code).
+  - Why not an app fix: the packets are the client KERNEL's ICMP destination unreachable (type 3,
+    code 3, port unreachable) answers to datagrams that exit A (wireguard-go) keeps sending to the
+    client's WireGuard UDP port after the daemon closed that socket (clean shutdown or SIGKILL).
+    Linux rate-limits them to about 1/s. Datagrams in flight always arrive after the socket is
+    closed, and a crash cannot tear anything down, so no app-side teardown removes them.
+  - Why it is acceptable: they go only to the VPN endpoint IP, which is the WireGuard peer and
+    already knows the client's real address. They reveal nothing new.
+  - The allowance (`analyzer._wireguard_port_unreachable`, used by `check_egress`) accepts an
+    ICMP packet only if ALL hold: type 3 and code 3; destination is an allowed endpoint IP; the
+    quoted datagram is IPv4 UDP from that endpoint IP and its WireGuard port (51820) to the
+    client's own address (the ICMP packet's source). Any other ICMP type or code, any other
+    destination (the gateway, other hosts), a quoted TCP header, a wrong quoted port or address,
+    and a quote too short to check stay findings. There is no blanket ICMP allowance.
+  - Tests: `test_port_unreachable_answer_to_endpoint_wireguard_is_clean`,
+    `test_other_icmp_shapes_stay_findings` (type 3 code 1, echo, destination not an endpoint,
+    quoted source port not 51820, quoted TCP, quoted destination not the client, quoted source
+    not the endpoint, truncated quote, ICMP to the gateway). Checked on the real Task 12a capture:
+    21 ICMP packets, all of this shape. The positive control has no ICMP sender (bash
+    /dev/tcp and /dev/udp only), so the negative cases are covered by the unit tests.
+
+Original finding (Task 11 baseline):
+
 - Scenario: `shutdown_and_crash` (the clean `shutdown` and the SIGKILL, each followed by a few
   seconds down before the restart).
 - Evidence (run 3): `egress | shutdown_and_crash | ICMP type 3 -> 10.88.0.10: 13 packets`. The

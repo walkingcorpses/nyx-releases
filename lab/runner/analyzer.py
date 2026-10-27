@@ -3,8 +3,9 @@ server logs (no Docker here, so test_analyzer.py runs them on synthetic input).
 
 check_egress: the client's sidecar captures only packets LEAVING the client (tcpdump -Q out). The
 only allowed traffic is UDP to an allowed WireGuard endpoint, plus link housekeeping: ARP, and
-ICMPv6 neighbour discovery / MLD reports to a link-local or link-scope multicast (ff02::) address.
-Everything else is a finding, one per flow.
+ICMPv6 neighbour discovery / MLD reports to a link-local or link-scope multicast (ff02::) address,
+and (F2) the kernel's ICMP port unreachable to the endpoint about a datagram from its WireGuard
+port. Everything else is a finding, one per flow.
 
 check_identity: an allowlist of sources the lab servers may see: the two WireGuard exits and the lab
 servers themselves. 10.88.0.1 is the NAT gateway's internet-side address, i.e. the client's real
@@ -55,6 +56,32 @@ def _housekeeping_v6(ip6):
     return dst.is_link_local or dst in ipaddress.IPv6Network("ff02::/16")
 
 
+def _wireguard_port_unreachable(frame, allowed):
+    """F2 (FINDINGS.md): True only for the kernel's ICMP port unreachable (type 3, code 3) sent to
+    an allowed WireGuard endpoint about a datagram FROM that endpoint's WireGuard port TO this
+    client. Linux sends one (rate-limited, ~1/s) for every datagram the endpoint still sends after
+    the daemon closed its WireGuard socket (clean shutdown or crash); no app teardown can prevent
+    it, since packets in flight always arrive after the close. It reveals nothing new: it goes only
+    to the WireGuard peer, which already knows the client's real address. Everything else, any
+    other ICMP, destination or quoted header, and a quote too short to check, stays a finding.
+    Parsed from the raw bytes (Ethernet without VLAN, then IPv4), not dpkt's quote parser, so a
+    truncated quote cannot be half-parsed; anything that does not fit fails closed."""
+    ip = frame[14:]
+    if len(ip) < 20 or ip[0] >> 4 != 4:
+        return False
+    icmp = ip[(ip[0] & 15) * 4:]
+    if len(icmp) < 8 or icmp[0] != 3 or icmp[1] != 3:
+        return False
+    q = icmp[8:]  # the quoted datagram: its IPv4 header, then at least 8 bytes of UDP header
+    if len(q) < 20 or q[0] >> 4 != 4:
+        return False
+    qhl = (q[0] & 15) * 4
+    if qhl < 20 or len(q) < qhl + 8 or q[9] != dpkt.ip.IP_PROTO_UDP:
+        return False
+    endpoint = (socket.inet_ntoa(ip[16:20]), int.from_bytes(q[qhl:qhl + 2], "big"))
+    return endpoint in allowed and q[12:16] == ip[16:20] and q[16:20] == ip[12:16]
+
+
 def _reader(f):
     """A pcap reader over open file `f` that refuses anything but Ethernet captures: _flow parses
     Ethernet frames, so another link type would mis-parse every packet."""
@@ -80,6 +107,8 @@ def _flow(frame, allowed):
         if isinstance(l4, dpkt.tcp.TCP):
             return f"TCP -> {dst}:{l4.dport}{_label(l4.dport)}"
         if isinstance(l4, dpkt.icmp.ICMP):
+            if _wireguard_port_unreachable(frame, allowed):
+                return None
             return f"ICMP type {l4.type} -> {dst}"
         return f"IPv4 proto {pkt.p} -> {dst}"
     if isinstance(pkt, dpkt.ip6.IP6):

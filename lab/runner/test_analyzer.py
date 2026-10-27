@@ -304,6 +304,45 @@ class Analyzer(unittest.TestCase):
         fs = check_egress(p, {EXIT_A}, "positive_control") + check_identity(logs, "positive_control")
         self.assertEqual(split_control(fs, "positive_control", CONTROL_SIGNATURES), ([], []))
 
+    # ---- Task 12b, F2: the kernel's port-unreachable answer to the WireGuard endpoint ----
+
+    def unreach(self, dst="10.88.0.10", icmp_type=3, code=3, qsrc="10.88.0.10", qdst=CLIENT_IP, qsport=51820,
+                qproto=dpkt.ip.IP_PROTO_UDP, cut=None):
+        """A client ICMP packet to `dst` quoting a datagram (`qsrc`:`qsport` -> `qdst`:45000, proto
+        `qproto`) the way Linux answers a datagram to a closed UDP port; `cut` truncates the quote."""
+        l4 = (dpkt.udp.UDP(sport=qsport, dport=45000, data=b"\x04" + b"\x00" * 31) if qproto == dpkt.ip.IP_PROTO_UDP
+              else dpkt.tcp.TCP(sport=qsport, dport=45000, flags=dpkt.tcp.TH_ACK))
+        quoted = bytes(ip4(qsrc, qdst, qproto, l4))[:cut]
+        icmp = dpkt.icmp.ICMP(type=icmp_type, code=code, data=b"\x00\x00\x00\x00" + quoted)
+        return eth(ip4(CLIENT_IP, dst, dpkt.ip.IP_PROTO_ICMP, icmp))
+
+    def test_port_unreachable_answer_to_endpoint_wireguard_is_clean(self):
+        """F2: after the daemon closes its WireGuard socket, datagrams still in flight from the
+        endpoint get the kernel's ICMP port unreachable. It goes only to the endpoint, which
+        already knows the client's address, so this one narrow shape is allowed."""
+        self.assertEqual(check_egress(self.pcap(self.unreach(), self.unreach()), {EXIT_A}), [])
+
+    def test_other_icmp_shapes_stay_findings(self):
+        """Everything outside the narrow F2 shape stays a finding: another unreachable code, an
+        echo, a destination that is not the endpoint, a quote not from the WireGuard port, a TCP
+        quote, a quote not addressed to the client, and a quote too short to check."""
+        cases = {
+            "type 3 code 1": self.unreach(code=1),
+            "echo request": self.unreach(icmp_type=8, code=0),
+            "destination not an endpoint": self.unreach(dst="10.88.0.20", qsrc="10.88.0.20"),
+            "quoted source port not 51820": self.unreach(qsport=9999),
+            "quoted proto TCP": self.unreach(qproto=dpkt.ip.IP_PROTO_TCP),
+            "quoted destination not the client": self.unreach(qdst="10.77.0.99"),
+            "quoted source not the endpoint": self.unreach(qsrc="10.88.0.11"),
+            "truncated quote": self.unreach(cut=24),
+            "to the gateway": self.unreach(dst="10.77.0.1"),
+        }
+        for name, frame in cases.items():
+            with self.subTest(name):
+                f = check_egress(self.pcap(frame), {EXIT_A})
+                self.assertEqual(len(f), 1, f)
+                self.assertIn("ICMP", f[0].detail)
+
 
 class Report(unittest.TestCase):
     """report.write: sections and exit code."""
