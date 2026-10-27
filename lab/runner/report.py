@@ -11,10 +11,16 @@ def write(path, scenarios, findings, notes, control_missing):
     analyzer.Finding list (positive-control leaks already set aside), `notes` free-text lines,
     `control_missing` the names of control leaks that were not detected. Returns the exit code:
     0 only when every scenario ran, nothing real was found and the control saw everything."""
+    failed = sum(1 for _, ok, _ in scenarios if not ok)
+    verdict = (f"{failed} scenario{'' if failed == 1 else 's'} failed (infrastructure), "
+               f"{len(findings)} finding{'' if len(findings) == 1 else 's'} (leaks), "
+               f"positive control {'complete' if not control_missing else 'BLIND'}")
     lines = [f"# Nyx leak lab report", "", f"Run: {datetime.datetime.now(datetime.UTC):%Y-%m-%d %H:%M:%S} UTC", "",
-             "## Scenarios", "", "| Scenario | Ran | Detail |", "|---|---|---|"]
-    lines += [f"| {name} | {'yes' if ok else 'NO'} | {detail} |" for name, ok, detail in scenarios]
-    lines += ["", f"## Findings ({len(findings)})", ""]
+             f"Result: {verdict}", "",
+             "## Scenarios", "", "Ran = NO is an infrastructure failure: the scenario could not do its job (not a leak).", "",
+             "| Scenario | Ran | Detail |", "|---|---|---|"]
+    lines += [f"| {name} | {'yes' if ok else 'NO'} | {detail.replace('|', '/')} |" for name, ok, detail in scenarios]
+    lines += ["", f"## Findings: leaks ({len(findings)})", ""]
     if findings:
         lines += ["| # | Check | Scenario | Detail |", "|---|---|---|---|"]
         lines += [f"| {i} | {f.check} | {f.scenario} | {f.detail.replace('|', '/')} |" for i, f in enumerate(findings, 1)]
@@ -22,7 +28,7 @@ def write(path, scenarios, findings, notes, control_missing):
         lines.append("None.")
     lines += ["", "## Positive control: " + ("all detected" if not control_missing else "LAB BLIND"), "",
               "Deliberate leaks from client-a's namespace, excluded from the findings above:", ""]
-    lines += [f"- {name}: {'NOT DETECTED (lab blind)' if name in control_missing else 'detected'}" for name, _, _ in CONTROL_SIGNATURES]
+    lines += [f"- {sig[0]}: {'NOT DETECTED (lab blind)' if sig[0] in control_missing else 'detected'}" for sig in CONTROL_SIGNATURES]
     lines += ["", "## Notes", ""] + [f"- {n}" for n in notes]
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")

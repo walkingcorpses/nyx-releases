@@ -7,8 +7,9 @@ import unittest
 
 import dpkt
 
+import report
 from analyzer import (CONTROL_SIGNATURES, Finding, capture_live, check_egress, check_identity,
-                      count_udp_to, split_control)
+                      check_kill_timing, check_recovery, count_udp_to, load_logs, split_control)
 
 CLIENT_MAC = b"\x02\x42\x0a\x4d\x00\x0a"
 GW_MAC = b"\x02\x42\x0a\x4d\x00\x01"
@@ -40,11 +41,11 @@ def udp(dst, sport, dport, data=b"x"):
 class Analyzer(unittest.TestCase):
     """check_egress and check_identity on hand-made inputs."""
 
-    def pcap(self, *frames):
-        """Writes `frames` to a temp pcap (one second apart) and returns its path."""
+    def pcap(self, *frames, linktype=dpkt.pcap.DLT_EN10MB):
+        """Writes `frames` to a temp pcap (one second apart, from ts 1000) and returns its path."""
         fd, path = tempfile.mkstemp(suffix=".pcap")
         with os.fdopen(fd, "wb") as f:
-            w = dpkt.pcap.Writer(f)
+            w = dpkt.pcap.Writer(f, linktype=linktype)
             for i, fr in enumerate(frames):
                 w.writepkt(bytes(fr), ts=1000.0 + i)
         self.addCleanup(os.remove, path)
@@ -135,13 +136,14 @@ class Analyzer(unittest.TestCase):
         fs = [Finding("egress", "positive_control", "TCP -> 10.88.0.20:8000 (HTTP tracker): 3 packets, first at 1.0"),
               Finding("egress", "positive_control", "UDP -> 10.88.0.23:53 (DNS): 1 packets, first at 1.0"),
               Finding("egress", "positive_control", "UDP -> 10.88.0.10:9999: 1 packets, first at 1.0"),
-              Finding("identity", "positive_control", "tracker saw 10.88.0.1 at 1.000: {}"),
-              Finding("identity", "positive_control", "dns saw 10.88.0.1 at 1.000: {}"),
+              Finding("identity", "positive_control", "tracker saw 10.88.0.1 at 1.000: {'path': '/positive-control'}"),
+              Finding("identity", "positive_control", "dns saw 10.88.0.1 at 1.000: {'name': 'control.lab'}"),
+              Finding("egress", "positive_control", "IPv6 -> [fd77::1] port 9999: 1 packets, first at 1.0"),
               Finding("egress", "positive_control", "UDP -> 10.88.0.23:5353 (mDNS): 1 packets, first at 1.0"),
               Finding("egress", "steady_download", "TCP -> 10.88.0.20:8000 (HTTP tracker): 1 packets, first at 0.5")]
         real, missing = split_control(fs, "positive_control", sigs)
         self.assertEqual(missing, [])
-        self.assertEqual(real, [fs[5], fs[6]])
+        self.assertEqual(real, [fs[6], fs[7]])
 
     def test_split_control_reports_missing_signature(self):
         """A control leak that was not detected is reported as missing (the lab is blind to it)."""
@@ -163,6 +165,161 @@ class Analyzer(unittest.TestCase):
         logs = [{"server": "tracker", "ts": 1.0, "src": "10.88.0.10"}, {"server": "observer", "ts": 2.0, "src": "10.88.0.11"},
                 {"server": "tracker", "ts": 3.0, "src": "10.88.0.21"}]
         self.assertEqual(check_identity(logs), [])
+
+    # ---- Task 11: kill timing, recovery, identity allowlist, log parsing, control, datalink ----
+
+    # Real frames from client-a in lab run 1 (IPv6 on in the LAN): kernel link housekeeping.
+    MLD_REPORT = ("3333000000165ed173fc858d86dd6000000000380001fe800000000000005cd173fffefc858dff020000000000000000000000000016"
+                  "3a000502000001008f0093000000000204000000ff0200000000000000000001fffc858d04000000ff0200000000000000000001ff00000a")
+    NA_FROM_ULA = ("3333000000015ed173fc858d86dd6001ef2500203afffd77000000000000000000000000000aff020000000000000000000000000001"
+                   "8800034120000000fd77000000000000000000000000000a02015ed173fc858d")
+    NS_FROM_ULA = ("3333ff0000015ed173fc858d86dd6000000000203afffd77000000000000000000000000000aff0200000000000000000001ff000001"
+                   "8700264800000000fd77000000000000000000000000000101015ed173fc858d")
+
+    def test_ipv6_link_housekeeping_from_any_client_address_is_clean(self):
+        """MLD reports (behind a hop-by-hop header) and neighbour discovery to link-scope
+        multicast are the kernel's IPv6 'ARP', also when sent from the client's ULA address."""
+        frames = [bytes.fromhex(h) for h in (self.MLD_REPORT, self.NA_FROM_ULA, self.NS_FROM_ULA)]
+        self.assertEqual(check_egress(self.pcap(*frames), {EXIT_A}), [])
+
+    def test_icmpv6_echo_to_link_multicast_is_a_finding(self):
+        """Only neighbour discovery and MLD are housekeeping: a ping to all-nodes is not."""
+        echo = dpkt.icmp6.ICMP6(type=128, code=0, data=b"\x00" * 8)
+        pkt = ip6("fd77::a", "ff02::1", dpkt.ip.IP_PROTO_ICMP6, echo)
+        self.assertEqual(len(check_egress(self.pcap(eth(pkt, dpkt.ethernet.ETH_TYPE_IP6)), {EXIT_A})), 1)
+
+    def test_traffic_after_kill_is_a_finding(self):
+        """After the tunnel is killed, a packet outside the allowlist (here DNS to the lab dns) is a
+        leak, even though the torrents were held in time."""
+        p = self.pcap(udp("10.88.0.10", 1, 51820), udp("10.88.0.10", 1, 51820), udp("10.88.0.23", 1, 53))  # ts 1000..1002
+        f = check_kill_timing(p, 1000.5, {EXIT_A}, stale_after_s=20, held_at=1010.0)
+        self.assertEqual(len(f), 1)
+        self.assertEqual(f[0].check, "egress")
+        self.assertIn("10.88.0.23:53", f[0].detail)
+
+    def test_quiet_after_kill_is_clean(self):
+        """Leaks before the kill belong to another window; quiet after it and held in time is clean."""
+        p = self.pcap(udp("10.88.0.23", 1, 53), udp("10.88.0.10", 1, 51820))  # DNS at 1000, WG at 1001
+        self.assertEqual(check_kill_timing(p, 1000.5, {EXIT_A}, stale_after_s=20, held_at=1025.0), [])
+
+    def test_wireguard_keepalive_attempts_to_endpoint_are_clean(self):
+        """While the tunnel is dead the client keeps retrying handshakes/keepalives to its endpoint:
+        allowed traffic, not a leak."""
+        p = self.pcap(*[udp("10.88.0.10", 45000, 51820, data=b"\x01" + b"\x00" * 147) for _ in range(6)])
+        self.assertEqual(check_kill_timing(p, 999.0, {EXIT_A}, stale_after_s=20, held_at=1020.0), [])
+
+    def test_held_too_late_or_never_is_a_finding(self):
+        """Torrents must report held within stale_after + held_within_s of the kill."""
+        p = self.pcap(udp("10.88.0.10", 1, 51820))
+        late = check_kill_timing(p, 1000.0, {EXIT_A}, stale_after_s=20, held_at=1031.0, held_within_s=10)
+        self.assertEqual([x.check for x in late], ["kill_timing"])
+        self.assertIn("31", late[0].detail)
+        never = check_kill_timing(p, 1000.0, {EXIT_A}, stale_after_s=20, held_at=None)
+        self.assertEqual([x.check for x in never], ["kill_timing"])
+        self.assertIn("never", never[0].detail)
+        self.assertEqual(check_kill_timing(p, 1000.0, {EXIT_A}, stale_after_s=20, held_at=1030.0, held_within_s=10), [])
+
+    def test_lock_released_while_still_cut_is_a_finding(self):
+        """Once held, the torrents must stay held until the drop is lifted: a sample with the lock
+        off (killed False) while the tunnel is still cut is a finding, reported once."""
+        p = self.pcap(udp("10.88.0.10", 1, 51820))
+        samples = [(1015.0, True, "stale", 21), (1016.0, False, "up", 0), (1017.0, False, "up", 1)]
+        f = check_kill_timing(p, 1000.0, {EXIT_A}, stale_after_s=20, held_at=1015.0, samples=samples)
+        self.assertEqual([x.check for x in f], ["kill_timing"])
+        self.assertIn("released", f[0].detail)
+        self.assertIn("2 of 3", f[0].detail)
+        ok = [(1015.0, True, "stale", 21), (1016.0, True, "stale", 22)]
+        self.assertEqual(check_kill_timing(p, 1000.0, {EXIT_A}, stale_after_s=20, held_at=1015.0, samples=ok), [])
+
+    def test_check_recovery(self):
+        """After the drop is lifted the tunnel must be back (route up, torrents released) in time."""
+        self.assertEqual(check_recovery(1000.0, 1020.0, 60, "s"), [])
+        self.assertEqual([x.check for x in check_recovery(1000.0, None, 60, "s")], ["recovery"])
+        self.assertEqual(len(check_recovery(1000.0, 1061.0, 60, "s")), 1)
+
+    def test_non_ethernet_capture_is_refused(self):
+        """The frame parser assumes Ethernet; any other link type must fail loudly, not read as clean."""
+        p = self.pcap(b"\x45" + b"\x00" * 27, linktype=dpkt.pcap.DLT_RAW)
+        with self.assertRaises(ValueError):
+            check_egress(p, {EXIT_A})
+        with self.assertRaises(ValueError):
+            count_udp_to(p, EXIT_A)
+
+    def test_identity_is_an_allowlist(self):
+        """Only the exits and the lab servers may appear as sources. The client's raw LAN address
+        or any unknown address is a finding, like the gateway."""
+        logs = [{"server": "dns", "ts": 1.0, "src": "10.77.0.10", "name": "tracker.lab"},
+                {"server": "canary", "ts": 2.0, "src": "172.17.0.1"},
+                {"server": "tracker", "ts": 3.0, "src": "10.88.0.22"}]
+        f = check_identity(logs, "s")
+        self.assertEqual(len(f), 2)
+        self.assertTrue(f[0].detail.startswith("dns saw 10.77.0.10"))
+        self.assertTrue(f[1].detail.startswith("canary saw 172.17.0.1"))
+
+    def test_unparseable_log_lines_are_findings(self):
+        """A log line that is not a JSON object with a source cannot be checked: report it."""
+        fd, path = tempfile.mkstemp(suffix=".log")
+        with os.fdopen(fd, "w") as f:
+            f.write('{"server": "dns", "ts": 1.0, "src": "10.88.0.10"}\n{"server": "dns", "ts"\n[1,2]\n\n')
+        self.addCleanup(os.remove, path)
+        entries, bad = load_logs([path])
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(len(bad), 2)
+        self.assertEqual({b.check for b in bad}, {"logs"})
+
+    def test_split_control_pins_identity_signatures(self):
+        """Gateway entries in the control window only count as the control's own if they are the
+        control's request: the tracker path /positive-control, the dns name control.lab."""
+        own_t = Finding("identity", "positive_control", "tracker saw 10.88.0.1 at 1.000: {'proto': 'http', 'path': '/positive-control'}")
+        own_d = Finding("identity", "positive_control", "dns saw 10.88.0.1 at 1.000: {'name': 'control.lab', 'qtype': 1}")
+        other_t = Finding("identity", "positive_control", "tracker saw 10.88.0.1 at 1.000: {'proto': 'http', 'path': '/announce'}")
+        other_d = Finding("identity", "positive_control", "dns saw 10.88.0.1 at 1.000: {'name': 'tracker.lab', 'qtype': 1}")
+        real, missing = split_control([own_t, own_d, other_t, other_d], "positive_control", CONTROL_SIGNATURES)
+        self.assertEqual(real, [other_t, other_d])
+        self.assertNotIn("tracker logs the real address", missing)
+        self.assertNotIn("dns logs the real address", missing)
+
+    def test_split_control_on_real_check_output(self):
+        """End to end on real analyzer output: a capture and logs holding exactly the control's
+        leaks give no real finding and nothing missing."""
+        tcp = dpkt.tcp.TCP(sport=40000, dport=8000, flags=dpkt.tcp.TH_SYN)
+        v6 = ip6("fd77::a", "fd77::1", dpkt.ip.IP_PROTO_UDP, dpkt.udp.UDP(sport=1, dport=9999, data=b"x"))
+        p = self.pcap(eth(ip4(CLIENT_IP, "10.88.0.20", dpkt.ip.IP_PROTO_TCP, tcp)), udp("10.88.0.23", 1, 53),
+                      udp("10.88.0.10", 1, 9999), eth(v6, dpkt.ethernet.ETH_TYPE_IP6))
+        logs = [{"server": "tracker", "ts": 1.0, "src": "10.88.0.1", "proto": "http", "path": "/positive-control"},
+                {"server": "dns", "ts": 1.0, "src": "10.88.0.1", "name": "control.lab", "qtype": 1}]
+        fs = check_egress(p, {EXIT_A}, "positive_control") + check_identity(logs, "positive_control")
+        self.assertEqual(split_control(fs, "positive_control", CONTROL_SIGNATURES), ([], []))
+
+
+class Report(unittest.TestCase):
+    """report.write: sections and exit code."""
+
+    def write(self, scenarios, findings, missing):
+        """Writes a report to a temp file; returns (exit code, text)."""
+        fd, path = tempfile.mkstemp(suffix=".md")
+        os.close(fd)
+        self.addCleanup(os.remove, path)
+        code = report.write(path, scenarios, findings, [], missing)
+        return code, open(path, encoding="utf-8").read()
+
+    def test_control_missing_fails_and_says_blind(self):
+        """A blind lab fails the run even with every scenario run and no finding."""
+        code, text = self.write([("s", True, "ok")], [], ["DNS query to the lab dns"])
+        self.assertEqual(code, 1)
+        self.assertIn("LAB BLIND", text)
+        self.assertIn("DNS query to the lab dns: NOT DETECTED", text)
+
+    def test_clean_run_passes(self):
+        """Everything ran, nothing found, control complete: exit 0."""
+        self.assertEqual(self.write([("s", True, "ok")], [], [])[0], 0)
+
+    def test_infrastructure_failures_are_separate_from_leaks(self):
+        """The verdict counts scenarios that could not run apart from findings (leaks)."""
+        code, text = self.write([("a", False, "boom"), ("b", True, "ok")], [Finding("egress", "b", "UDP -> x")], [])
+        self.assertEqual(code, 1)
+        self.assertIn("1 scenario failed (infrastructure)", text)
+        self.assertIn("1 finding (leaks)", text)
 
 
 if __name__ == "__main__":
