@@ -2592,10 +2592,13 @@ dependencies = [
 name = "nyx-app"
 version = "1.0.0"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
  "nyx-core",
  "nyx-engine",
+ "nyx-tunnel",
  "quick-xml 0.38.4",
+ "rand 0.9.5",
  "regex",
  "serde",
  "serde_json",
@@ -2603,6 +2606,7 @@ dependencies = [
  "tempfile",
  "ureq",
  "urlencoding",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

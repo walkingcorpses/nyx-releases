@@ -23,7 +23,7 @@ fn dispatch(state: &AppState, req: &Value) -> Result<Value, String> {
     match cmd {
         "status" => ok(state.status()),
         "list" => ok(state.list_torrents()),
-        "get_settings" => ok(state.get_settings()),
+        "get_settings" => ok(state.settings_for_ui()),
         "set_settings" => {
             let s: Settings = serde_json::from_value(req.get("settings").cloned().ok_or("missing argument \"settings\"")?)
                 .map_err(|e| format!("bad settings: {e}"))?;

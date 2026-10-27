@@ -83,7 +83,7 @@ pub fn move_in_queue(state: St, id: String, position: u32) -> Result<(), String>
 /// Current settings.
 #[tauri::command]
 pub fn get_settings(state: St) -> Result<Settings, String> {
-    Ok(state.get_settings())
+    Ok(state.settings_for_ui())
 }
 
 /// Validates, saves and applies settings.

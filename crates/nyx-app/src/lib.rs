@@ -5,5 +5,7 @@ pub mod dto;
 pub mod feeds;
 pub mod http;
 pub mod poller;
+pub mod profiles;
+pub mod secret;
 pub mod state;
 pub mod update;

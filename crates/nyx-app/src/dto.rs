@@ -193,3 +193,15 @@ pub struct RssReportDto {
     pub baselined: u32,
     pub errors: Vec<String>,
 }
+
+/// One saved VPN profile as the UI sees it. Deliberately carries no config text or key material.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ProfileDto {
+    pub id: String,
+    pub name: String,
+    pub group: String,
+    /// "host:port" for display.
+    pub endpoint: String,
+    /// This is the profile the tunnel connects with.
+    pub active: bool,
+}

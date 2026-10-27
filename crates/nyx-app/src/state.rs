@@ -120,8 +120,34 @@ impl AppState {
         self.settings.lock().unwrap().clone()
     }
 
-    /// Validates, saves and applies new settings. Nothing changes if validation fails.
-    pub fn set_settings(&self, new: Settings) -> Result<(), String> {
+    /// The settings for the UI and the daemon's control port: the same as `get_settings`, but with
+    /// every profile's sealed config emptied, so encrypted key material never leaves the app.
+    pub fn settings_for_ui(&self) -> Settings {
+        let mut s = self.get_settings();
+        s.network.profiles.iter_mut().for_each(|p| p.sealed_conf.clear());
+        s
+    }
+
+    /// Validates, saves and applies new settings from the UI. Nothing changes if validation fails.
+    /// The profile list in `new` is ignored (the UI only ever sees it without configs, so echoing
+    /// it back must not wipe or alter what is stored); profiles change only through
+    /// import/rename/delete. `active_profile` and `rotation` are taken from `new`.
+    pub fn set_settings(&self, mut new: Settings) -> Result<(), String> {
+        new.network.profiles = self.get_settings().network.profiles;
+        self.commit_settings(new)
+    }
+
+    /// Changes settings from inside the app (profile import/rename/delete): applies `f` to a copy
+    /// of the current settings, then validates, saves and applies like `set_settings`, but
+    /// without pinning the profile list.
+    pub(crate) fn update_settings(&self, f: impl FnOnce(&mut Settings)) -> Result<(), String> {
+        let mut new = self.get_settings();
+        f(&mut new);
+        self.commit_settings(new)
+    }
+
+    /// Validates `new`, writes it to disk, makes it current and applies it.
+    fn commit_settings(&self, new: Settings) -> Result<(), String> {
         validate_settings(&new)?;
         new.save(&self.data_dir).map_err(|e| format!("could not save settings: {e}"))?;
         *self.settings.lock().unwrap() = new;
@@ -607,6 +633,25 @@ fn validate_settings(s: &Settings) -> Result<(), String> {
                 return Err(format!("feed \"{}\": category \"{c}\" does not exist", f.name));
             }
         }
+    }
+    let n = &s.network;
+    let known = |id: &str| n.profiles.iter().any(|p| p.id == id);
+    if let Some(a) = &n.active_profile {
+        if !known(a) {
+            return Err("the active profile does not exist".into());
+        }
+    }
+    if n.rotation.pool.iter().any(|id| !known(id)) {
+        return Err("the rotation pool lists a profile that does not exist".into());
+    }
+    if n.rotation.min_minutes < 1 {
+        return Err("rotation must stay on a profile for at least 1 minute".into());
+    }
+    if n.rotation.min_minutes > n.rotation.max_minutes {
+        return Err("the rotation minimum time cannot be longer than the maximum".into());
+    }
+    if n.rotation.enabled && n.rotation.pool.len() < 2 {
+        return Err("rotation needs at least 2 profiles in its pool".into());
     }
     let su = s.search_url.trim();
     if !su.is_empty() && !(http::is_http_url(su) && su.contains("{query}")) {

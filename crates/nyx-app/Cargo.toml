@@ -9,6 +9,7 @@ license.workspace = true
 [dependencies]
 nyx-core = { path = "../nyx-core" }
 nyx-engine = { path = "../nyx-engine" }
+nyx-tunnel = { path = "../nyx-tunnel" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
@@ -17,7 +18,15 @@ sha2 = "0.10"
 regex = "1"
 quick-xml = "0.38"
 urlencoding = "2"
+# Profile ids (16 random hex chars) and the base64 text form of sealed configs.
+rand = "0.9"
+base64 = "0.22"
+
+# DPAPI (CryptProtectData) seals WireGuard configs to the Windows user; LocalFree releases its output.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Security_Cryptography", "Win32_Foundation", "Win32_System_Memory"] }
 
 [dev-dependencies]
 tempfile = "3"
 nyx-engine = { path = "../nyx-engine", features = ["test-support"] }
+nyx-tunnel = { path = "../nyx-tunnel", features = ["test-support"] }
