@@ -2429,6 +2429,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "nyx-daemon"
+version = "1.0.0"
+dependencies = [
+ "chrono",
+ "nyx-app",
+ "nyx-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "nyx-engine"
 version = "1.0.0"
 dependencies = [

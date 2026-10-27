@@ -1,0 +1,21 @@
+# nyx-daemon: headless Nyx (no Tauri, no UI) with a loopback-only JSON control port. The Docker leak
+# lab runs it in a container and drives it with `nyx-daemon ctl '<json>'`.
+[package]
+name = "nyx-daemon"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "nyx-daemon"
+path = "src/main.rs"
+
+[dependencies]
+nyx-app = { path = "../nyx-app" }
+nyx-core = { path = "../nyx-core" }
+serde = "1"
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+
+[dev-dependencies]
+tempfile = "3"
