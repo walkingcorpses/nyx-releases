@@ -1,0 +1,14 @@
+# Build context filter for lab/images/nyx-daemon.Dockerfile (the context is the repo root).
+# Docker (BuildKit) uses <Dockerfile>.dockerignore next to the Dockerfile in preference to a root
+# .dockerignore, so this file applies only to the daemon image.
+# Allowlist: send only what `cargo build -p nyx-daemon` needs, never target/, node_modules, ui, etc.
+*
+!Cargo.toml
+!Cargo.lock
+!vcpkg.json
+!crates
+# src-tauri is a workspace member: Cargo must read its manifest (and see its source paths)
+# to resolve the workspace, even though it is never built in the image.
+!src-tauri/Cargo.toml
+!src-tauri/src
+**/target
