@@ -195,6 +195,8 @@ pub struct NetworkStatusDto {
     pub tx_bytes: u64,
     /// The public IP seen through the tunnel (Test button only, best effort).
     pub exit_ip: Option<String>,
+    /// Seconds until the next automatic rotation; `None` while rotation is off.
+    pub next_rotation_secs: Option<u64>,
 }
 
 /// One search result.

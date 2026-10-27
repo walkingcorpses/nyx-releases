@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use chrono::NaiveDateTime;
 use nyx_core::{
     build_magnet, parse_blocklist, safe_join, Categories, EncryptionPref, IpRange, Profile, ProxySettings, Queue,
-    QueueEntry, Settings, TorrentId,
+    QueueEntry, RotationSettings, Settings, TorrentId,
 };
 use nyx_engine::{
     AddOptions, Engine, EngineConfig, EncryptionMode, ProxyConfig, TorrentState, TorrentStatus,
@@ -29,6 +29,7 @@ use crate::http;
 use crate::netlock::{NetTiming, Route};
 use crate::secret;
 use crate::poller::{completions, diff, Update};
+use crate::rotation::{pick_next, Rotator};
 use crate::update::{self, UpdateInfo};
 
 /// Largest .torrent file the app will even open (matches nyx-core's limit).
@@ -39,6 +40,9 @@ const LOCK_HOLDING: &str = "the network lock is holding: no VPN tunnel";
 const TEST_WAIT: Duration = Duration::from_secs(15);
 /// Answers with the caller's public IP as plain text (Test button only, through the tunnel).
 const EXIT_IP_URL: &str = "https://api.ipify.org";
+/// How long a rotation waits for the new tunnel's confirmed contact (spec 4.3), capped by the
+/// start grace (only shorter in tests): a tunnel silent that long would read Down anyway.
+const ROTATE_WAIT: Duration = Duration::from_secs(15);
 
 /// The VPN side of the network: the tunnel for the active profile, or a blocked stand-in.
 struct Net {
@@ -71,6 +75,51 @@ impl Net {
                 s.bind_interface.as_deref().map(str::trim).filter(|i| !i.is_empty()).map(String::from),
             ),
         }
+    }
+}
+
+/// Automatic rotation's state (spec 4.3).
+#[derive(Default)]
+struct Rotation {
+    /// The rotation settings `timer` was built from; `apply_settings` rebuilds it when they change.
+    cfg: Option<RotationSettings>,
+    /// When the next rotation is due; `None` while rotation is off.
+    timer: Option<Rotator>,
+    /// A fixed interval instead of the settings' random minutes (tests and the leak lab only).
+    every: Option<Duration>,
+    /// A timer-started swap bringing up its new tunnel on a worker thread; `rotation_tick`
+    /// commits it once the thread is done, so no tick ever waits for a handshake.
+    pending: Option<std::thread::JoinHandle<Swap>>,
+}
+
+impl Rotation {
+    /// Starts the timer afresh from `now`, or clears it while rotation is off.
+    fn restart(&mut self, now: Instant) {
+        self.timer = match &self.cfg {
+            Some(c) if c.enabled => Some(match self.every {
+                Some(d) => Rotator::after(now, d),
+                None => Rotator::new(now, c, &mut rand::rng()),
+            }),
+            _ => None,
+        };
+    }
+}
+
+/// A swap's first half, done off every lock: the profile it leaves, the one it moves to, and that
+/// profile's tunnel with confirmed contact (or why there is none).
+struct Swap {
+    from: String,
+    to: Profile,
+    tunnel: Result<Tunnel, String>,
+}
+
+/// Clears the one-swap-at-a-time flag when dropped, so an early return cannot leave it set.
+struct SwapGuard<'a>(&'a AtomicBool);
+
+impl Drop for SwapGuard<'_> {
+    /// Lets the next swap start.
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
     }
 }
 
@@ -117,6 +166,10 @@ pub struct AppState {
     net: Mutex<Net>,
     /// The network lock's thresholds.
     timing: NetTiming,
+    /// Automatic rotation: the timer and a timer-started swap in progress.
+    rotation: Mutex<Rotation>,
+    /// A swap (manual or timer) is running; a second one never starts alongside it.
+    swapping: AtomicBool,
 }
 
 impl AppState {
@@ -175,6 +228,8 @@ impl AppState {
             warnings: Mutex::new(warnings),
             net: Mutex::new(net),
             timing,
+            rotation: Mutex::new(Rotation::default()),
+            swapping: AtomicBool::new(false),
         };
         state.apply_settings()?;
         state.probe_proxy();
@@ -223,11 +278,19 @@ impl AppState {
             let _writer = self.settings_write.lock().unwrap();
             let mut new = self.get_settings();
             change(&mut new);
-            validate_settings(&new)?;
-            new.save(&self.data_dir).map_err(|e| format!("could not save settings: {e}"))?;
-            *self.settings.lock().unwrap() = new;
+            self.store_settings(new)?;
         }
         self.apply_settings()
+    }
+
+    /// Validates, saves and stores `new` in memory, changing nothing if any step fails. The
+    /// caller holds `settings_write` (write_settings, and a rotation's commit, which also holds
+    /// the net lock so the saved active profile and the running tunnel change together).
+    fn store_settings(&self, new: Settings) -> Result<(), String> {
+        validate_settings(&new)?;
+        new.save(&self.data_dir).map_err(|e| format!("could not save settings: {e}"))?;
+        *self.settings.lock().unwrap() = new;
+        Ok(())
     }
 
     /// Pushes the current settings into the engine and queue: encryption, the tunnel or proxy,
@@ -235,6 +298,14 @@ impl AppState {
     fn apply_settings(&self) -> Result<(), String> {
         self.sync_net()?;
         let s = self.get_settings();
+        {
+            // Rotation turned on or off, or its pool or interval changed: start the timer afresh.
+            let mut rot = self.rotation.lock().unwrap();
+            if rot.cfg.as_ref() != Some(&s.network.rotation) {
+                rot.cfg = Some(s.network.rotation.clone());
+                rot.restart(Instant::now());
+            }
+        }
         // Saving settings already checked the file; at startup it may have vanished: warn, don't fail.
         let ranges = match &s.blocklist {
             Some(path) => load_blocklist(path).unwrap_or_else(|e| {
@@ -312,6 +383,8 @@ impl AppState {
     /// One poll tick: snapshot, apply the kill switch, queue and schedule, then diff against the last
     /// snapshot. Called about once a second by the poller thread.
     pub fn tick(&self, now: NaiveDateTime) -> Tick {
+        // Rotation first, so a swap committed now gets this tick's kill-switch decision.
+        self.rotation_tick(Instant::now());
         let snap = self.engine.snapshot();
         self.apply_limits(now);
         self.apply_kill_switch(&snap);
@@ -429,6 +502,9 @@ impl AppState {
     /// Without a profile the route reads `Down` and `profile` is `None`.
     pub fn network_status(&self) -> NetworkStatusDto {
         let s = self.get_settings();
+        // Read and released before the net lock is taken, so the two locks never nest here.
+        let next_rotation_secs =
+            self.rotation.lock().unwrap().timer.as_ref().map(|t| t.next_due().saturating_duration_since(Instant::now()).as_secs());
         let net = self.net.lock().unwrap();
         let stats = net.tunnel.as_ref().map(Tunnel::stats);
         NetworkStatusDto {
@@ -438,7 +514,151 @@ impl AppState {
             rx_bytes: stats.map_or(0, |t| t.rx_bytes),
             tx_bytes: stats.map_or(0, |t| t.tx_bytes),
             exit_ip: None,
+            next_rotation_secs,
         }
+    }
+
+    /// Test and leak-lab hook: rotate every `every` instead of the settings' random whole
+    /// minutes (`None` goes back to them), restarting the timer from now. The app never calls it;
+    /// the daemon does only for its lab-only NYX_LAB_ROTATE_SECS.
+    #[doc(hidden)]
+    pub fn set_rotation_interval(&self, every: Option<Duration>) {
+        let mut rot = self.rotation.lock().unwrap();
+        rot.every = every;
+        rot.restart(Instant::now());
+    }
+
+    /// Rotates to another profile from the rotation pool now (make-before-break, spec 4.3) and
+    /// returns its id. Blocks the caller up to 15 s while the new tunnel comes up; the net lock
+    /// and the settings writer are free all that time. Errors, changing nothing, when rotation
+    /// is off, no profile is active, the pool holds no other profile, or a swap is already
+    /// running. A target that does not answer errors too, but then the lock holds (see
+    /// `commit_swap`).
+    pub fn rotate_now(&self) -> Result<String, String> {
+        if self.swapping.swap(true, Ordering::SeqCst) {
+            return Err("a rotation is already running".into());
+        }
+        let _done = SwapGuard(&self.swapping);
+        let (from, to) = self.plan_swap()?;
+        let tunnel = connect_confirmed(&to, self.timing, ROTATE_WAIT.min(self.timing.start_grace));
+        self.commit_swap(&from, &to, tunnel, Instant::now())
+    }
+
+    /// The rotation timer, called by every `tick` (app and daemon). Never blocks on the network:
+    /// when the timer is due it starts the swap's slow half (new tunnel, wait for contact) on a
+    /// short-lived worker thread, and a later tick commits the result. One swap at a time.
+    pub fn rotation_tick(&self, now: Instant) {
+        let mut rot = self.rotation.lock().unwrap();
+        if rot.pending.as_ref().is_some_and(|h| h.is_finished()) {
+            let worker = rot.pending.take().expect("checked above");
+            drop(rot); // commit_swap takes the settings, net and rotation locks itself
+            let _done = SwapGuard(&self.swapping);
+            match worker.join() {
+                Ok(sw) => {
+                    let _ = self.commit_swap(&sw.from, &sw.to, sw.tunnel, now);
+                }
+                Err(_) => {
+                    // The worker panicked: nothing was installed; try again after the backoff.
+                    if let Some(t) = self.rotation.lock().unwrap().timer.as_mut() {
+                        t.backoff(now);
+                    }
+                }
+            }
+            return;
+        }
+        let due = rot.pending.is_none() && rot.timer.as_ref().is_some_and(|t| t.due(now));
+        if !due || self.swapping.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        match self.plan_swap() {
+            Ok((from, to)) => {
+                let (timing, wait) = (self.timing, ROTATE_WAIT.min(self.timing.start_grace));
+                rot.pending = Some(std::thread::spawn(move || Swap { tunnel: connect_confirmed(&to, timing, wait), from, to }));
+            }
+            Err(_) => {
+                // Nothing to rotate to right now (no active profile, say): look again after the backoff.
+                if let Some(t) = rot.timer.as_mut() {
+                    t.backoff(now);
+                }
+                self.swapping.store(false, Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// A swap's plan: the profile in use and a different existing one from the pool (never the
+    /// current one, so after a failed swap, which leaves the failed profile current, the next try
+    /// goes elsewhere). Errors, changing nothing, when rotation is off, no profile is in use, or
+    /// the pool has no other profile.
+    fn plan_swap(&self) -> Result<(String, Profile), String> {
+        let s = self.get_settings();
+        let r = &s.network.rotation;
+        if !r.enabled {
+            return Err("rotation is off".into());
+        }
+        let from = self.net.lock().unwrap().profile.clone().ok_or("rotation needs an active VPN profile")?;
+        let usable: Vec<String> = r.pool.iter().filter(|id| s.network.profiles.iter().any(|p| &p.id == *id)).cloned().collect();
+        let to = pick_next(&usable, &from, &mut rand::rng()).ok_or("rotation needs at least 2 profiles in its pool")?;
+        let p = s.network.profiles.iter().find(|p| p.id == to).cloned().ok_or("the profile does not exist")?;
+        Ok((from, p))
+    }
+
+    /// A swap's second half, quick and off the network. With a tunnel that has contact the engine
+    /// moves onto it and the old one closes last (make-before-break). Without one (`Err`) there is
+    /// no fallback to the old route or to direct: the old tunnel closes, the blocked stand-in
+    /// becomes the route (Down, torrents held), a warning names the profile and the timer backs
+    /// off; the failed profile stays current so the next try picks another. Either way the new
+    /// profile is saved as active. The timer restarts after a success (or a dropped swap).
+    fn commit_swap(&self, from: &str, to: &Profile, tunnel: Result<Tunnel, String>, now: Instant) -> Result<String, String> {
+        let failed = tunnel.as_ref().err().cloned();
+        let installed = tunnel
+            .or_else(|_| Tunnel::blocked().map_err(|e| format!("could not start the network lock: {e}")))
+            .and_then(|t| self.install_swap(from, to, t, failed.is_some()));
+        {
+            let mut rot = self.rotation.lock().unwrap();
+            match (&failed, rot.timer.as_mut()) {
+                (Some(_), Some(t)) => t.backoff(now),
+                (Some(_), None) => {}
+                (None, _) => rot.restart(now),
+            }
+        }
+        installed?;
+        match failed {
+            None => Ok(to.id.clone()),
+            Some(e) => {
+                let w = format!("VPN profile \"{}\" did not answer when rotating to it, so nothing can connect until the next rotation: {e}", to.name);
+                self.warn(w.clone());
+                Err(w)
+            }
+        }
+    }
+
+    /// Makes `to` (with `tunnel`, the blocked stand-in when `blocked`) the current profile, in
+    /// memory, on disk and in the engine, in one step under the settings writer and the net lock,
+    /// so no settings apply can see the two disagree and start a third tunnel. Race with a user's
+    /// save: the swap is dropped (Err, nothing changed) unless the net state and the saved
+    /// settings both still say `from` and rotation is still on with `to` in its pool. A save
+    /// that landed while the new tunnel came up is the later writer and wins; a save after this
+    /// commit sees `to` and wins in turn. The old tunnel closes after both locks are released.
+    fn install_swap(&self, from: &str, to: &Profile, tunnel: Tunnel, blocked: bool) -> Result<(), String> {
+        let (old, routed) = {
+            let _writer = self.settings_write.lock().unwrap();
+            let mut net = self.net.lock().unwrap();
+            let mut s = self.get_settings();
+            let r = &s.network.rotation;
+            let current = net.profile.as_deref() == Some(from) && s.network.active_profile.as_deref() == Some(from);
+            if !current || !r.enabled || !r.pool.contains(&to.id) {
+                return Err("the settings changed while rotating, so the rotation was dropped".into());
+            }
+            s.network.active_profile = Some(to.id.clone());
+            self.store_settings(s.clone())?;
+            let fresh = Net { profile: Some(to.id.clone()), tunnel: Some(tunnel), blocked, started: Instant::now() };
+            let old = std::mem::replace(&mut *net, fresh);
+            let (proxy, interface) = net.engine_route(&s);
+            let routed = self.engine.set_proxy(proxy).and_then(|_| self.engine.set_interface(interface.as_deref()));
+            (old, routed)
+        };
+        drop(old);
+        routed.map_err(|e| e.to_string())
     }
 
     /// The profile Test button (user-initiated only, never called automatically): brings up a
@@ -448,14 +668,7 @@ impl AppState {
     pub fn test_profile(&self, id: &str) -> Result<NetworkStatusDto, String> {
         let s = self.get_settings();
         let p = s.network.profiles.iter().find(|p| p.id == id).ok_or("no such profile")?;
-        let t = bring_up(p, self.timing)?;
-        let end = Instant::now() + TEST_WAIT;
-        while t.stats().handshake_age.is_none() {
-            if Instant::now() >= end {
-                return Err(format!("no answer from the VPN server {} within 15 seconds", p.endpoint));
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
+        let t = connect_confirmed(p, self.timing, TEST_WAIT)?;
         // The reply is untrusted: keep it only if it is an IP address.
         let exit_ip = http::agent(Some(&socks_of(&t)))
             .and_then(|a| http::get_bytes(&a, EXIT_IP_URL, 64))
@@ -470,6 +683,7 @@ impl AppState {
             rx_bytes: st.rx_bytes,
             tx_bytes: st.tx_bytes,
             exit_ip,
+            next_rotation_secs: None,
         })
     }
     /// The queue order, first to start first.
@@ -786,6 +1000,21 @@ fn bring_up(p: &Profile, timing: NetTiming) -> Result<Tunnel, String> {
     Tunnel::up_with_rekey(&cfg, endpoint, timing.rekey_age()).map_err(|e| e.to_string())
 }
 
+/// Brings up profile `p`'s tunnel and waits up to `wait` for confirmed contact (a handshake we
+/// started that completed). A tunnel that does not answer in time is closed again, and the error
+/// names the server. Used by the Test button and by rotation, never under a lock.
+fn connect_confirmed(p: &Profile, timing: NetTiming, wait: Duration) -> Result<Tunnel, String> {
+    let t = bring_up(p, timing)?;
+    let end = Instant::now() + wait;
+    while t.stats().handshake_age.is_none() {
+        if Instant::now() >= end {
+            return Err(format!("no answer from the VPN server {} within {} seconds", p.endpoint, wait.as_secs()));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Ok(t)
+}
+
 /// The network state for settings `s`: no tunnel without an active profile, else its tunnel, or
 /// `Tunnel::blocked()` when it cannot be started (never a direct route). A failure comes back as
 /// a warning naming the profile. Only failing to open even the blocked port is an error.
@@ -956,6 +1185,50 @@ mod tests {
         drop(net);
         writer.join().unwrap();
         assert_eq!(st.route(), Some(Route::Down), "the apply used its stale copy of the settings");
+    }
+
+    /// Regression for the rotation race: a user's save that lands while a rotation's new tunnel
+    /// comes up is the later writer and must win, whichever of the user's apply and the
+    /// rotation's commit takes the net lock first. Deterministic: the test holds the net lock
+    /// while the save (clearing the profile) runs up to its apply and the commit is started, then
+    /// lets both go. The commit must be dropped, and the saved settings, the net state and the
+    /// engine's route must all end on "no profile", never on the rotated-to profile.
+    #[test]
+    fn rotation_commit_loses_to_a_save_made_while_it_ran() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Settings::default();
+        // Unopenable profiles run the blocked tunnel: enough for routes without a real server.
+        for id in ["p1", "p2"] {
+            s.network.profiles.push(Profile { id: id.into(), name: id.into(), sealed_conf: secret::seal("bad"), endpoint_ip: "127.0.0.1:9".into(), ..Default::default() });
+        }
+        s.network.active_profile = Some("p1".into());
+        s.network.rotation = RotationSettings { enabled: true, pool: vec!["p1".into(), "p2".into()], min_minutes: 1, max_minutes: 1 };
+        s.save(dir.path()).unwrap();
+        let st = std::sync::Arc::new(AppState::new(dir.path(), nyx_engine::testkit::free_loopback_addr(), false).unwrap());
+        let (from, to) = st.plan_swap().unwrap();
+        assert_eq!((from.as_str(), to.id.as_str()), ("p1", "p2"));
+        let mut cleared = st.settings_for_ui();
+        cleared.network.active_profile = None;
+
+        let net = st.net.lock().unwrap();
+        let writer = {
+            let st = st.clone();
+            std::thread::spawn(move || st.set_settings(cleared).unwrap())
+        };
+        std::thread::sleep(Duration::from_millis(300)); // the save is stored; its apply waits on the net lock
+        let commit = {
+            let st = st.clone();
+            // The swap's slow half is done: a tunnel with contact (any tunnel will do here).
+            std::thread::spawn(move || st.commit_swap(&from, &to, Ok(Tunnel::blocked().unwrap()), Instant::now()))
+        };
+        std::thread::sleep(Duration::from_millis(300)); // the commit waits on the net lock too
+        drop(net);
+        writer.join().unwrap();
+        let committed = commit.join().unwrap();
+        assert!(committed.is_err(), "the rotation overwrote a later save: {committed:?}");
+        assert_eq!(st.get_settings().network.active_profile, None, "the user's save was lost");
+        assert_eq!(st.route(), None, "the net state does not match the saved settings");
+        assert_eq!(st.network_status().profile, None);
     }
 
     /// On Linux (the lab daemon) a plain absolute path is a valid save folder; `..` is still refused.

@@ -570,3 +570,185 @@ fn racing_settings_saves_end_on_the_last_saved_profile_state() {
     a.engine.add_peer(&id, "127.0.0.1:9".parse().unwrap()).unwrap();
     assert!(wait_until(Duration::from_secs(10), || stub.saw_port(9)), "engine is not on the manual proxy");
 }
+
+// ---------------------------------------------------------------------------------------------
+// Profile rotation (spec 4.3): make-before-break swaps between two TestPeers.
+// ---------------------------------------------------------------------------------------------
+
+use nyx_core::RotationSettings;
+
+/// Short lock timing for the rotation tests: a swap waits min(15 s, start grace) = 5 s for contact.
+const ROT_TIMING: NetTiming = NetTiming { stale_after: Duration::from_secs(10), start_grace: Duration::from_secs(5) };
+
+/// Settings with two profiles, "Test VPN" (p1, active, `a`) and "Test VPN 2" (p2, `b`, sealed
+/// from `b_conf`), and rotation on with both in the pool.
+fn rotation_settings(a: &TestPeer, b: &TestPeer, b_conf: &str) -> Settings {
+    let mut s = vpn_settings(a, &conf_text(&a.client_config()));
+    s.network.profiles.push(Profile {
+        id: "p2".into(),
+        name: "Test VPN 2".into(),
+        group: String::new(),
+        sealed_conf: nyx_app::secret::seal(b_conf),
+        endpoint: b.endpoint().to_string(),
+        endpoint_ip: b.endpoint().to_string(),
+    });
+    s.network.rotation = RotationSettings { enabled: true, pool: vec!["p1".into(), "p2".into()], min_minutes: 1, max_minutes: 1 };
+    s
+}
+
+/// An app on two reachable TestPeers with rotation on, already up on p1.
+fn rotation_app(dir: &Path, a: &TestPeer, b: &TestPeer) -> AppState {
+    let app = vpn_app(dir, &rotation_settings(a, b, &conf_text(&b.client_config())), ROT_TIMING);
+    assert!(wait_until(Duration::from_secs(10), || app.network_status().route == Route::Up), "{:?}", app.network_status());
+    app
+}
+
+/// The engine's peer traffic moves bytes through the current tunnel: adds the in-tunnel echo
+/// peer and waits for the current tunnel's tx counter to grow.
+fn engine_uses_current_tunnel(a: &AppState, id: &String) -> bool {
+    let before = a.network_status().tx_bytes;
+    a.engine.add_peer(id, ECHO.parse().unwrap()).unwrap();
+    wait_until(Duration::from_secs(15), || a.network_status().tx_bytes > before)
+}
+
+/// rotate_now brings up the other profile first, then moves the engine onto it and saves it as
+/// the active profile; the route never leaves Up. Rotating again goes back.
+#[test]
+fn rotate_now_switches_to_other_profile_and_engine_follows() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (pa, pb) = (TestPeer::start(), TestPeer::start());
+    let a = rotation_app(tmp.path(), &pa, &pb);
+    let id = a.add_magnet(&magnet(50), &tmp.path().join("dl").to_string_lossy(), None, false).unwrap();
+    a.tick(Local::now().naive_local());
+    assert!(engine_uses_current_tunnel(&a, &id), "not on tunnel A: {:?}", a.network_status());
+
+    assert_eq!(a.rotate_now().unwrap(), "p2");
+    let ns = a.network_status();
+    assert_eq!((ns.route, ns.profile.as_deref()), (Route::Up, Some("Test VPN 2")), "{ns:?}");
+    assert!(ns.next_rotation_secs.is_some(), "rotation is on, so a next rotation is scheduled");
+    assert_eq!(a.get_settings().network.active_profile.as_deref(), Some("p2"), "the swap is saved");
+    a.tick(Local::now().naive_local());
+    assert!(!a.status().killed, "a make-before-break swap never trips the lock");
+    assert!(engine_uses_current_tunnel(&a, &id), "the engine did not follow to tunnel B: {:?}", a.network_status());
+    // A later settings apply sees the swap as current and starts no third tunnel (whose counters
+    // would start again from zero).
+    let rx = a.network_status().rx_bytes;
+    a.set_settings(a.settings_for_ui()).unwrap();
+    assert!(a.network_status().rx_bytes >= rx, "the settings apply replaced the rotated tunnel");
+
+    assert_eq!(a.rotate_now().unwrap(), "p1");
+    assert_eq!(a.network_status().profile.as_deref(), Some("Test VPN"));
+    assert!(engine_uses_current_tunnel(&a, &id), "the engine did not follow back to tunnel A");
+}
+
+/// A target that never answers: after the wait the old tunnel is gone, the route reads Down, the
+/// torrents are held, HTTP is refused, the engine dials nothing directly and a warning names the
+/// profile. Rotating on to a profile that answers recovers.
+#[test]
+fn rotate_now_with_unreachable_target_holds_torrents_and_never_goes_direct() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (pa, pb) = (TestPeer::start(), TestPeer::start());
+    let a = rotation_app(tmp.path(), &pa, &pb);
+    let id = a.add_magnet(&magnet(51), &tmp.path().join("dl").to_string_lossy(), None, false).unwrap();
+    a.tick(Local::now().naive_local());
+    pb.set_paused(true);
+
+    let err = a.rotate_now().unwrap_err();
+    assert!(err.contains("Test VPN 2"), "{err}");
+    let target = TcpListener::bind("127.0.0.1:0").unwrap();
+    target.set_nonblocking(true).unwrap();
+    a.engine.add_peer(&id, target.local_addr().unwrap()).unwrap();
+    a.tick(Local::now().naive_local());
+    let st = a.status();
+    assert_eq!((st.route.as_str(), st.killed), ("down", true), "{st:?}");
+    assert!(st.warnings.iter().any(|w| w.contains("Test VPN 2")), "{:?}", st.warnings);
+    assert_eq!(a.list_torrents()[0].status, "queued");
+    assert_eq!(a.check_update().unwrap_err(), LOCK_ERR);
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(target.accept().is_err(), "the engine connected directly");
+
+    assert_eq!(a.rotate_now().unwrap(), "p1", "the failed profile is never retried first");
+    assert!(tick_until(&a, 10, |a| !a.status().killed), "{:?}", a.network_status());
+    assert_eq!(a.status().route, "up");
+    assert_eq!(a.list_torrents()[0].status, "metadata");
+}
+
+/// The timer: no rotation before it is due.
+#[test]
+fn rotation_tick_does_nothing_before_due() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (pa, pb) = (TestPeer::start(), TestPeer::start());
+    let a = rotation_app(tmp.path(), &pa, &pb);
+    a.set_rotation_interval(Some(Duration::from_secs(4)));
+    let secs = a.network_status().next_rotation_secs.expect("rotation is on");
+    assert!((3..=4).contains(&secs), "{secs}");
+    let end = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < end {
+        a.tick(Local::now().naive_local());
+        assert_eq!(a.network_status().profile.as_deref(), Some("Test VPN"), "rotated before it was due");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// The timer: once due the poller's tick rotates (the swap runs off the tick's thread, so no tick
+/// waits for the new tunnel) and the timer starts afresh.
+#[test]
+fn rotation_tick_rotates_after_interval_and_resets_timer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (pa, pb) = (TestPeer::start(), TestPeer::start());
+    let a = rotation_app(tmp.path(), &pa, &pb);
+    a.set_rotation_interval(Some(Duration::from_secs(3)));
+    let mut slowest = Duration::ZERO;
+    let rotated = wait_until(Duration::from_secs(15), || {
+        let t = std::time::Instant::now();
+        a.tick(Local::now().naive_local());
+        slowest = slowest.max(t.elapsed());
+        a.network_status().profile.as_deref() == Some("Test VPN 2")
+    });
+    assert!(rotated, "no timer rotation: {:?}", a.network_status());
+    assert!(slowest < Duration::from_millis(500), "a tick waited for the swap: {slowest:?}");
+    let secs = a.network_status().next_rotation_secs.expect("rotation is on");
+    assert!(secs >= 2, "the timer was not reset after the swap: {secs}");
+    assert_eq!(a.get_settings().network.active_profile.as_deref(), Some("p2"));
+    assert!(!a.status().killed);
+}
+
+/// rotate_now needs rotation on and another profile to go to; otherwise it errors and changes nothing.
+#[test]
+fn rotate_now_errors_with_one_profile() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peer = TestPeer::start();
+    let a = vpn_app(tmp.path(), &vpn_settings(&peer, &conf_text(&peer.client_config())), ROT_TIMING);
+    assert!(wait_until(Duration::from_secs(10), || a.network_status().route == Route::Up));
+    assert!(a.rotate_now().is_err(), "rotation is off");
+    assert_eq!(a.network_status().next_rotation_secs, None, "no timer while rotation is off");
+    let mut s = a.settings_for_ui();
+    s.network.rotation = RotationSettings { enabled: true, pool: vec!["p1".into(), "p1".into()], min_minutes: 1, max_minutes: 1 };
+    a.set_settings(s).unwrap();
+    let rx = a.network_status().rx_bytes;
+    assert!(a.rotate_now().is_err(), "only one distinct profile in the pool");
+    let ns = a.network_status();
+    assert_eq!((ns.route, ns.profile.as_deref()), (Route::Up, Some("Test VPN")));
+    assert!(ns.rx_bytes >= rx, "the tunnel was replaced");
+    assert_eq!(a.get_settings().network.active_profile.as_deref(), Some("p1"));
+}
+
+/// Every profile failing (one never answers, one cannot even be opened): each swap errors, nothing
+/// panics, and the lock stays on throughout.
+#[test]
+fn all_profiles_failing_does_not_panic_and_keeps_lock_on() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (pa, pb) = (TestPeer::start(), TestPeer::start());
+    let a = vpn_app(tmp.path(), &rotation_settings(&pa, &pb, "not a wireguard config"), ROT_TIMING);
+    a.add_magnet(&magnet(52), &tmp.path().join("dl").to_string_lossy(), None, false).unwrap();
+    assert!(wait_until(Duration::from_secs(10), || a.network_status().route == Route::Up));
+    pa.set_paused(true);
+    for round in 0..3 {
+        assert!(a.rotate_now().is_err(), "round {round}");
+        a.tick(Local::now().naive_local());
+        let st = a.status();
+        assert_eq!((st.route.as_str(), st.killed), ("down", true), "round {round}: {st:?}");
+        assert_eq!(a.list_torrents()[0].status, "queued");
+        assert_eq!(a.check_update().unwrap_err(), LOCK_ERR);
+    }
+}

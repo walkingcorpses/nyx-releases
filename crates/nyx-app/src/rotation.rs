@@ -47,6 +47,12 @@ impl Rotator {
         Rotator { next_due: now + next_interval(settings.min_minutes, settings.max_minutes, rng) }
     }
 
+    /// A timer due exactly `interval` after `now`. For the fixed test and leak-lab interval
+    /// (AppState::set_rotation_interval), which is shorter than the settings' whole minutes.
+    pub fn after(now: Instant, interval: Duration) -> Rotator {
+        Rotator { next_due: now + interval }
+    }
+
     /// True once `now` has reached the scheduled time.
     pub fn due(&self, now: Instant) -> bool {
         now >= self.next_due
