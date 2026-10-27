@@ -230,9 +230,8 @@ impl AppState {
     /// Pushes the current settings into the engine and queue: encryption, the tunnel or proxy,
     /// queue limits and the rate caps (schedule aware).
     fn apply_settings(&self) -> Result<(), String> {
+        self.sync_net()?;
         let s = self.get_settings();
-        self.engine.set_encryption(encryption_mode(&s)).map_err(|e| e.to_string())?;
-        self.sync_net(&s)?;
         // Saving settings already checked the file; at startup it may have vanished: warn, don't fail.
         let ranges = match &s.blocklist {
             Some(path) => load_blocklist(path).unwrap_or_else(|e| {
@@ -250,9 +249,14 @@ impl AppState {
     }
 
     /// Starts, swaps or stops the tunnel when the active profile changed, then points the engine
-    /// at the route in force. A replaced tunnel is dropped only after the engine uses the new one.
-    fn sync_net(&self, s: &Settings) -> Result<(), String> {
+    /// at the route in force (encryption, proxy, adapter). A replaced tunnel is dropped only after
+    /// the engine uses the new one. Settings are read under the net lock, so when writers race the
+    /// last saved settings win whatever order their applies run in (a stale copy could otherwise
+    /// put the engine on a route the saved settings no longer say, outside the lock).
+    fn sync_net(&self) -> Result<(), String> {
         let mut net = self.net.lock().unwrap();
+        let s = &self.get_settings();
+        self.engine.set_encryption(encryption_mode(s)).map_err(|e| e.to_string())?;
         let mut old = None;
         if net.profile != s.network.active_profile {
             let (fresh, warning) = start_net(s, self.timing)?;
@@ -914,6 +918,35 @@ pub fn checked_save_dir(raw: &str) -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: an apply that read settings before another writer saved must not put the
+    /// tunnel state back to its stale copy. Deterministic: the test holds the net lock so the
+    /// clearing write's apply waits, swaps the saved settings to "profile active" meanwhile, then
+    /// lets the apply run. It must act on what is saved now, not on what it read earlier.
+    #[test]
+    fn apply_uses_settings_saved_after_it_started() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Settings::default();
+        // Any profile will do: an unopenable one runs the blocked tunnel, which still has a route.
+        s.network.profiles.push(Profile { id: "p1".into(), name: "P".into(), sealed_conf: secret::seal("bad"), endpoint_ip: "127.0.0.1:9".into(), ..Default::default() });
+        s.save(dir.path()).unwrap();
+        let st = std::sync::Arc::new(AppState::new(dir.path(), nyx_engine::testkit::free_loopback_addr(), false).unwrap());
+        assert!(st.route().is_none());
+        let mut with_profile = st.get_settings();
+        with_profile.network.active_profile = Some("p1".into());
+
+        let net = st.net.lock().unwrap();
+        let writer = {
+            let st = st.clone();
+            // Saves "no profile" (already so), then its apply blocks on the net lock.
+            std::thread::spawn(move || st.set_settings(st.settings_for_ui()).unwrap())
+        };
+        std::thread::sleep(Duration::from_millis(300)); // let the writer save and reach the lock
+        *st.settings.lock().unwrap() = with_profile; // a later writer's save
+        drop(net);
+        writer.join().unwrap();
+        assert_eq!(st.route(), Some(Route::Down), "the apply used its stale copy of the settings");
+    }
 
     #[test]
     fn checked_save_dir_accepts_normal_paths() {

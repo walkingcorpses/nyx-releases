@@ -490,3 +490,51 @@ fn test_profile_reports_handshake_through_a_temporary_tunnel() {
     assert!(a.test_profile("nope").is_err());
     assert_eq!(a.status().route, "none", "testing does not activate the profile");
 }
+
+/// Two writers racing: one clears the active profile, one sets it. Whatever order their apply
+/// steps run in, the tunnel state must end on what was saved last (an apply working from a stale
+/// copy must never put the engine on a route the saved settings do not say). Ends with a final
+/// save of each kind and checks the engine really uses that route.
+#[test]
+fn racing_settings_saves_end_on_the_last_saved_profile_state() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peer = TestPeer::start();
+    let stub = Socks5Stub::start("127.0.0.1:0".parse().unwrap(), None);
+    let mut s = vpn_settings(&peer, &conf_text(&peer.client_config()));
+    s.proxy = Some(ProxySettings { host: "127.0.0.1".into(), port: stub.addr().port(), username: None, password: None });
+    let a = Arc::new(vpn_app(tmp.path(), &s, NetTiming::default()));
+    let set_profile = |a: &AppState, on: bool| {
+        let mut s = a.settings_for_ui();
+        s.network.active_profile = on.then(|| "p1".to_string());
+        a.set_settings(s).unwrap();
+    };
+    // The tunnel state matches what is saved: a route exactly when a profile is saved.
+    let consistent = |a: &AppState| (a.status().route != "none") == a.get_settings().network.active_profile.is_some();
+    for round in 0..5 {
+        let writers: Vec<_> = [false, true]
+            .into_iter()
+            .map(|on| {
+                let a = a.clone();
+                std::thread::spawn(move || (0..20).for_each(|_| set_profile(&a, on)))
+            })
+            .collect();
+        writers.into_iter().for_each(|w| w.join().unwrap());
+        assert!(consistent(&a), "round {round}: saved {:?} but route {}", a.get_settings().network.active_profile, a.status().route);
+    }
+
+    // Final save with the profile: the engine uses the tunnel and the lock is armed.
+    set_profile(&a, true);
+    assert_eq!(a.network_status().profile.as_deref(), Some("Test VPN"));
+    assert_ne!(a.status().route, "none");
+    assert!(wait_until(Duration::from_secs(10), || a.network_status().route == Route::Up));
+    let id = a.add_magnet(&magnet(15), &tmp.path().join("dl").to_string_lossy(), None, false).unwrap();
+    let before = a.network_status().tx_bytes;
+    a.engine.add_peer(&id, ECHO.parse().unwrap()).unwrap();
+    assert!(wait_until(Duration::from_secs(15), || a.network_status().tx_bytes > before), "engine is not on the tunnel");
+
+    // Final save without: back on the manual proxy, not on a stale tunnel.
+    set_profile(&a, false);
+    assert_eq!((a.status().route.as_str(), a.network_status().profile), ("none", None));
+    a.engine.add_peer(&id, "127.0.0.1:9".parse().unwrap()).unwrap();
+    assert!(wait_until(Duration::from_secs(10), || stub.saw_port(9)), "engine is not on the manual proxy");
+}
