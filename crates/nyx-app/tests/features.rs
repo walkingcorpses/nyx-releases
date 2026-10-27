@@ -603,11 +603,15 @@ fn rotation_app(dir: &Path, a: &TestPeer, b: &TestPeer) -> AppState {
     app
 }
 
-/// The engine's peer traffic moves bytes through the current tunnel: adds the in-tunnel echo
-/// peer and waits for the current tunnel's tx counter to grow.
-fn engine_uses_current_tunnel(a: &AppState, id: &String) -> bool {
+/// The engine's peer traffic moves bytes through the current tunnel: adds a fresh torrent
+/// (magnet `n`, saved under `dir`) with the in-tunnel echo peer and waits for the current
+/// tunnel's tx counter to grow. A fresh torrent each time, because libtorrent waits out a
+/// reconnect delay before dialling a peer of the same torrent again (a test flake otherwise).
+fn engine_uses_current_tunnel(a: &AppState, dir: &Path, n: u8) -> bool {
+    let id = a.add_magnet(&magnet(n), &dir.join("dl").to_string_lossy(), None, false).unwrap();
+    a.tick(Local::now().naive_local());
     let before = a.network_status().tx_bytes;
-    a.engine.add_peer(id, ECHO.parse().unwrap()).unwrap();
+    a.engine.add_peer(&id, ECHO.parse().unwrap()).unwrap();
     wait_until(Duration::from_secs(15), || a.network_status().tx_bytes > before)
 }
 
@@ -618,9 +622,7 @@ fn rotate_now_switches_to_other_profile_and_engine_follows() {
     let tmp = tempfile::tempdir().unwrap();
     let (pa, pb) = (TestPeer::start(), TestPeer::start());
     let a = rotation_app(tmp.path(), &pa, &pb);
-    let id = a.add_magnet(&magnet(50), &tmp.path().join("dl").to_string_lossy(), None, false).unwrap();
-    a.tick(Local::now().naive_local());
-    assert!(engine_uses_current_tunnel(&a, &id), "not on tunnel A: {:?}", a.network_status());
+    assert!(engine_uses_current_tunnel(&a, tmp.path(), 50), "not on tunnel A: {:?}", a.network_status());
 
     assert_eq!(a.rotate_now().unwrap(), "p2");
     let ns = a.network_status();
@@ -629,7 +631,7 @@ fn rotate_now_switches_to_other_profile_and_engine_follows() {
     assert_eq!(a.get_settings().network.active_profile.as_deref(), Some("p2"), "the swap is saved");
     a.tick(Local::now().naive_local());
     assert!(!a.status().killed, "a make-before-break swap never trips the lock");
-    assert!(engine_uses_current_tunnel(&a, &id), "the engine did not follow to tunnel B: {:?}", a.network_status());
+    assert!(engine_uses_current_tunnel(&a, tmp.path(), 53), "the engine did not follow to tunnel B: {:?}", a.network_status());
     // A later settings apply sees the swap as current and starts no third tunnel (whose counters
     // would start again from zero).
     let rx = a.network_status().rx_bytes;
@@ -638,7 +640,7 @@ fn rotate_now_switches_to_other_profile_and_engine_follows() {
 
     assert_eq!(a.rotate_now().unwrap(), "p1");
     assert_eq!(a.network_status().profile.as_deref(), Some("Test VPN"));
-    assert!(engine_uses_current_tunnel(&a, &id), "the engine did not follow back to tunnel A");
+    assert!(engine_uses_current_tunnel(&a, tmp.path(), 54), "the engine did not follow back to tunnel A");
 }
 
 /// A target that never answers: after the wait the old tunnel is gone, the route reads Down, the
