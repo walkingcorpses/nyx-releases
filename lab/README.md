@@ -22,6 +22,8 @@ scenario could not run, or the positive control was not fully detected. A full r
 
 Dev runs of a subset: set `LAB_ONLY=<scenario>[,<scenario>]` before the script (cold_start and
 the positive control always run), e.g. `$env:LAB_ONLY='tunnel_killed_midtransfer'; lab\run.ps1`.
+An unknown name fails the run at once (the error lists the valid names), and a subset run's
+verdict reads "PARTIAL RUN (LAB_ONLY=...)", never a clean lab.
 
 The lab runs detached (not `up --abort-on-container-exit`) because scenarios stop and restart
 the client daemon and stop the capture sidecar before the analysis.

@@ -335,7 +335,8 @@ def hostname_trackers(t0):
 
 def metadata_requests(t0):
     """Points the RSS feed, the search provider and (through the lab dns) the update check at the
-    canary by hostname, then runs each once. Every canary request must come from an exit."""
+    canary by hostname, then runs each once. Every canary request must come from an exit, and
+    each of the three must reach the canary at least once, or the scenario was not exercised."""
     feed = {"name": "lab canary", "url": "http://canary.lab/rss.xml", "filter": "", "category": None, "enabled": True}
     s = ctl(CLIENT, {"cmd": "get_settings"})
     s["rss"]["feeds"] = [feed]
@@ -356,8 +357,8 @@ def metadata_requests(t0):
     for e in hits:  # a lab server address passes the identity allowlist but is not a tunnel exit
         if e["src"] not in EXIT_IPS and e["src"] in analyzer.ALLOWED_SOURCES:
             LAB["findings"].append(analyzer.Finding("metadata", "metadata_requests", f"canary request from {e['src']}, not an exit: {e.get('path') or e.get('note')}"))
-    if not rss or not search:
-        raise RuntimeError(f"not exercised: canary saw rss={len(rss)} search={len(search)} ({results})")
+    if not rss or not search or not update:  # each request must have happened, or nothing was checked
+        raise RuntimeError(f"not exercised: canary saw rss={len(rss)} search={len(search)} update={len(update)} ({results})")
     return (f"canary saw rss {len(rss)}, search {len(search)}, update check (:443) {len(update)} requests, "
             f"from {sorted({e['src'] for e in hits})}")
 
@@ -626,9 +627,21 @@ def analyse():
     real, missing = analyzer.split_control(findings, CONTROL, analyzer.CONTROL_SIGNATURES)
     for m in missing:
         print(f"lab blind: expected finding {m!r} not detected", flush=True)
-    code = report.write(f"{OUT}/report.md", LAB["scenarios"], real, observations(entries), missing)
+    code = report.write(f"{OUT}/report.md", LAB["scenarios"], real, observations(entries), missing, partial=setup_state.get("only"))
     print(open(f"{OUT}/report.md", encoding="utf-8").read(), flush=True)
     return code
+
+
+# The scenarios between cold_start and the control, in run order: (name, function, window kind).
+# LAB_ONLY may name any of these (report.lab_only rejects other names).
+SCENARIOS = (("steady_download", steady_download, "normal"), ("hostname_trackers", hostname_trackers, "normal"),
+             ("metadata_requests", metadata_requests, "normal"), ("bait", bait, "normal"),
+             ("discovery_attempts", discovery_attempts, "normal"),
+             ("tunnel_killed_midtransfer", tunnel_killed_midtransfer, "custom"),
+             ("tunnel_cut_both_ways", tunnel_cut_both_ways, "custom"),
+             ("tunnel_cut_long", tunnel_cut_long, "custom"),
+             ("shutdown_and_crash", shutdown_and_crash, "normal"),
+             ("ipv6_icmp_broadcast", ipv6_icmp_broadcast, "normal"))
 
 
 def main():
@@ -636,6 +649,9 @@ def main():
     report to lab/out (also when something crashes); exits with the report's code."""
     code = 2
     try:
+        # Checked before any setup: an unknown name fails the run at once (report.lab_only).
+        only = report.lab_only(os.environ.get("LAB_ONLY", ""), [n for n, _, _ in SCENARIOS])
+        setup_state["only"] = ",".join(sorted(only)) or None
         setup_state["confs"] = setup_wireguard(CLIENT)
         setup_torrents()
         setup_state["stale_after"] = int(sh(CLIENT, "printenv NYX_LAB_STALE_AFTER_SECS").strip())
@@ -644,15 +660,7 @@ def main():
         wait_for("the client capture to start", lambda: os.path.getsize(PCAP) >= 24, 60)
         print("lab ready", flush=True)
         run("cold_start", cold_start)  # window from 0: the first captured packet, before the daemon runs
-        only = set(filter(None, os.environ.get("LAB_ONLY", "").split(",")))
-        for name, fn, kind in (("steady_download", steady_download, "normal"), ("hostname_trackers", hostname_trackers, "normal"),
-                               ("metadata_requests", metadata_requests, "normal"), ("bait", bait, "normal"),
-                               ("discovery_attempts", discovery_attempts, "normal"),
-                               ("tunnel_killed_midtransfer", tunnel_killed_midtransfer, "custom"),
-                               ("tunnel_cut_both_ways", tunnel_cut_both_ways, "custom"),
-                               ("tunnel_cut_long", tunnel_cut_long, "custom"),
-                               ("shutdown_and_crash", shutdown_and_crash, "normal"),
-                               ("ipv6_icmp_broadcast", ipv6_icmp_broadcast, "normal")):
+        for name, fn, kind in SCENARIOS:
             if only and name not in only:  # LAB_ONLY: dev runs of a subset (cold start and control always run)
                 LAB["notes"].append(f"{name}: skipped (LAB_ONLY)")
                 continue

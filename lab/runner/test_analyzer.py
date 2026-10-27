@@ -347,13 +347,34 @@ class Analyzer(unittest.TestCase):
 class Report(unittest.TestCase):
     """report.write: sections and exit code."""
 
-    def write(self, scenarios, findings, missing):
+    def write(self, scenarios, findings, missing, partial=None):
         """Writes a report to a temp file; returns (exit code, text)."""
         fd, path = tempfile.mkstemp(suffix=".md")
         os.close(fd)
         self.addCleanup(os.remove, path)
-        code = report.write(path, scenarios, findings, [], missing)
-        return code, open(path, encoding="utf-8").read()
+        code = report.write(path, scenarios, findings, [], missing, partial=partial)
+        with open(path, encoding="utf-8") as f:
+            return code, f.read()
+
+    def test_subset_run_verdict_says_partial(self):
+        """A LAB_ONLY subset run must not read as a clean lab: its verdict line names it a partial
+        run and which scenarios it was limited to."""
+        _, text = self.write([("s", True, "ok")], [], [], partial="steady_download,bait")
+        result = next(l for l in text.splitlines() if l.startswith("Result:"))
+        self.assertIn("PARTIAL RUN (LAB_ONLY=steady_download,bait)", result)
+        _, full = self.write([("s", True, "ok")], [], [])
+        self.assertNotIn("PARTIAL", full)
+
+    def test_lab_only_names_are_validated(self):
+        """LAB_ONLY: empty means every scenario; known names select a subset; any unknown name is
+        refused up front with the list of valid names (a typo must not silently skip everything)."""
+        valid = ["steady_download", "bait"]
+        self.assertEqual(report.lab_only("", valid), set())
+        self.assertEqual(report.lab_only("bait, steady_download", valid), {"bait", "steady_download"})
+        with self.assertRaises(ValueError) as e:
+            report.lab_only("bait,steady_downlaod", valid)
+        self.assertIn("steady_downlaod", str(e.exception))
+        self.assertIn("steady_download, bait", str(e.exception))
 
     def test_control_missing_fails_and_says_blind(self):
         """A blind lab fails the run even with every scenario run and no finding."""

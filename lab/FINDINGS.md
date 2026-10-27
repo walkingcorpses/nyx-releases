@@ -17,7 +17,7 @@ and does not touch app code.
 | metadata_requests | yes | canary saw rss 1, search 1, update check (:443) 1 requests, all from 10.88.0.10 |
 | bait | yes | bait served; the redirect to the canary by IP was followed 2x, from 10.88.0.10; no bait peer dialled outside the tunnel |
 | discovery_attempts | yes | 90 s dwell, discovery at its default (on) |
-| tunnel_killed_midtransfer | yes | killed at 4%; held after 14.9 s (stale 20 s + 10 s allowed); 78 WireGuard packets dropped; recovery not proven in this run (see below) |
+| tunnel_killed_midtransfer | yes | killed at 4%; held after 14.9 s (stale 20 s + 10 s allowed); 78 WireGuard packets dropped; recovery not proven in this run (baseline run, see F1 fix note) |
 | shutdown_and_crash | yes | clean shutdown: back up in 0.8 s, 5 torrents restored; SIGKILL at 3%: back up in 0.7 s, download finished, SHA-256 verified |
 | ipv6_icmp_broadcast | yes | client has fd77::a and an IPv6 default route; 8 MB downloaded, 20 s dwell |
 | positive_control | yes | all 6 deliberate leaks detected (TCP tracker, DNS, UDP exit A :9999, UDP over IPv6 to fd77::1, tracker and dns identity) |

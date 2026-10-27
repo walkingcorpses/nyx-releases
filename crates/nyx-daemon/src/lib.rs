@@ -17,10 +17,12 @@ pub fn listen_addr(var: Option<&str>) -> Result<SocketAddr, String> {
 /// The network lock's thresholds from `NYX_LAB_STALE_AFTER_SECS`. LAB-ONLY override: the leak
 /// lab sets it (20 s) so its kill-timing check does not wait the real 180 s. Unset keeps the
 /// production thresholds; only `stale_after` changes (start grace stays default). Zero or a
-/// non-number is an error, never a silent fallback. Only the daemon reads this variable.
-pub fn lab_timing(var: Option<&str>) -> Result<nyx_app::netlock::NetTiming, String> {
+/// non-number is an error, never a silent fallback. Only the daemon reads this variable. Takes
+/// the raw `var_os` value so a non-UTF-8 value is an error too, not read as unset.
+pub fn lab_timing(var: Option<&std::ffi::OsStr>) -> Result<nyx_app::netlock::NetTiming, String> {
     let mut t = nyx_app::netlock::NetTiming::default();
     if let Some(v) = var {
+        let v = v.to_str().ok_or_else(|| format!("NYX_LAB_STALE_AFTER_SECS={v:?} is not valid UTF-8"))?;
         let secs: u64 = v.parse().ok().filter(|s| *s > 0).ok_or_else(|| format!("NYX_LAB_STALE_AFTER_SECS={v:?} is not a positive number of seconds"))?;
         t.stale_after = std::time::Duration::from_secs(secs);
     }

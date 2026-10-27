@@ -44,7 +44,7 @@ fn run() -> Result<(), String> {
     let data = std::env::var_os("NYX_DATA_DIR").ok_or("NYX_DATA_DIR is not set")?;
     let listen = listen_addr(std::env::var("NYX_LISTEN").ok().as_deref())?;
     let discovery = std::env::var_os("NYX_NO_DISCOVERY").is_none();
-    let timing = lab_timing(std::env::var("NYX_LAB_STALE_AFTER_SECS").ok().as_deref())?;
+    let timing = lab_timing(std::env::var_os("NYX_LAB_STALE_AFTER_SECS").as_deref())?;
     // Bind the control port first: a taken port fails before the engine touches the network.
     let listener = TcpListener::bind(CTL_ADDR).map_err(|e| format!("cannot bind {CTL_ADDR}: {e}"))?;
     let state = Arc::new(AppState::new_with_timing(std::path::Path::new(&data), listen, discovery, timing)?);

@@ -140,11 +140,23 @@ fn network_status_without_profile_reports_down() {
 #[test]
 fn lab_timing_overrides_only_stale_after() {
     use nyx_app::netlock::NetTiming;
+    use std::ffi::OsStr;
     use std::time::Duration;
     assert_eq!(nyx_daemon::lab_timing(None).unwrap(), NetTiming::default());
-    let t = nyx_daemon::lab_timing(Some("20")).unwrap();
+    let t = nyx_daemon::lab_timing(Some(OsStr::new("20"))).unwrap();
     assert_eq!(t.stale_after, Duration::from_secs(20));
     assert_eq!(t.start_grace, NetTiming::default().start_grace);
-    assert!(nyx_daemon::lab_timing(Some("0")).is_err());
-    assert!(nyx_daemon::lab_timing(Some("soon")).is_err());
+    assert!(nyx_daemon::lab_timing(Some(OsStr::new("0"))).is_err());
+    assert!(nyx_daemon::lab_timing(Some(OsStr::new("soon"))).is_err());
+}
+
+/// A non-UTF-8 NYX_LAB_STALE_AFTER_SECS is a startup error, never read as unset (which would
+/// silently keep the 180 s threshold and make the lab's kill-timing check wait for nothing).
+#[test]
+fn lab_timing_rejects_non_utf8() {
+    #[cfg(windows)]
+    let bad = <std::ffi::OsString as std::os::windows::ffi::OsStringExt>::from_wide(&[0xd800]); // lone surrogate
+    #[cfg(unix)]
+    let bad = <std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(vec![0xff]);
+    assert!(nyx_daemon::lab_timing(Some(&bad)).is_err());
 }

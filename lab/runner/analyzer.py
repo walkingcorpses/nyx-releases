@@ -260,8 +260,9 @@ def recovered(at_restore, sample):
 
 
 def check_recovery(restore_time, recovered_at, within_s, scenario):
-    """After the drop is lifted (`restore_time`) the tunnel must be back, route up and torrents
-    released (`recovered_at`, None = never), within `within_s`."""
+    """After the drop is lifted (`restore_time`) the tunnel must be back within `within_s`.
+    `recovered_at` (None = never) is the first sample for which `recovered` held: route up, lock
+    off, torrent released AND rx bytes or the torrent's progress grown past the restore."""
     if recovered_at is None:
         return [Finding("recovery", scenario, f"not recovered within {within_s:.0f} s of lifting the drop")]
     if recovered_at - restore_time > within_s:
