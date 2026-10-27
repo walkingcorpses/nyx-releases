@@ -1,0 +1,2 @@
+# Shell scripts run inside Linux containers (leak lab): keep LF even with core.autocrlf on Windows.
+*.sh text eol=lf

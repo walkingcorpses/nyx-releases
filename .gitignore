@@ -4,3 +4,4 @@ node_modules/
 dist/
 *.bad
 .vite/
+lab/out/
