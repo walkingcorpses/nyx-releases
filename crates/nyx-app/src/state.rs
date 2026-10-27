@@ -887,9 +887,11 @@ fn read_torrent_file(path: &str) -> Result<Vec<u8>, String> {
     std::fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))
 }
 
-/// A user-chosen save folder must be a full drive path with no `..`, reserved names,
-/// trailing dots or over-long parts. The drive root is the base and the rest goes through
-/// nyx-core's `safe_join`, the same check used for torrent file paths.
+/// A user-chosen save folder must be a full path with no `..`, reserved names, trailing dots or
+/// over-long parts. On Windows it must start with a local drive (`D:\...`; network paths are
+/// refused) and the drive root is the base; on Unix (the Linux daemon in the leak lab) it must
+/// start at `/`, which is the base. The rest goes through nyx-core's `safe_join`, the same check
+/// used for torrent file paths.
 pub fn checked_save_dir(raw: &str) -> Result<PathBuf, String> {
     let p = Path::new(raw);
     if !p.is_absolute() {

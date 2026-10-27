@@ -2,11 +2,13 @@
 //!   nyx-daemon run            start the engine; serve the control port on 127.0.0.1:7777
 //!   nyx-daemon ctl '<json>'   send one request to a running daemon and print the reply
 //!   nyx-daemon --version      print "nyx-daemon <version>"
-//! Env for `run`: NYX_DATA_DIR (required), NYX_LISTEN (default 0.0.0.0:6881), NYX_NO_DISCOVERY (any value).
+//! Env for `run`: NYX_DATA_DIR (required), NYX_LISTEN (default 0.0.0.0:6881), NYX_NO_DISCOVERY (any value),
+//! NYX_LAB_STALE_AFTER_SECS (LAB-ONLY: shortens the network lock's 180 s stale threshold for the leak
+//! lab's kill-timing check; no other binary reads it, and unset keeps the production value).
 
 use nyx_app::state::AppState;
 use nyx_daemon::ctl::{handle, is_shutdown, request};
-use nyx_daemon::listen_addr;
+use nyx_daemon::{lab_timing, listen_addr};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
@@ -42,9 +44,10 @@ fn run() -> Result<(), String> {
     let data = std::env::var_os("NYX_DATA_DIR").ok_or("NYX_DATA_DIR is not set")?;
     let listen = listen_addr(std::env::var("NYX_LISTEN").ok().as_deref())?;
     let discovery = std::env::var_os("NYX_NO_DISCOVERY").is_none();
+    let timing = lab_timing(std::env::var("NYX_LAB_STALE_AFTER_SECS").ok().as_deref())?;
     // Bind the control port first: a taken port fails before the engine touches the network.
     let listener = TcpListener::bind(CTL_ADDR).map_err(|e| format!("cannot bind {CTL_ADDR}: {e}"))?;
-    let state = Arc::new(AppState::new(std::path::Path::new(&data), listen, discovery)?);
+    let state = Arc::new(AppState::new_with_timing(std::path::Path::new(&data), listen, discovery, timing)?);
     spawn_poller(state.clone());
     spawn_background(state.clone());
     for conn in listener.incoming().flatten() {

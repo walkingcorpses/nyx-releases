@@ -123,3 +123,28 @@ fn add_magnet_with_relative_save_path_returns_err() {
     );
     assert!(r["err"].as_str().unwrap().contains("full path"), "{r}");
 }
+
+/// network_status replies with the Network card's DTO: without a VPN profile the route reads
+/// "down", there is no profile name and the byte counters are zero.
+#[test]
+fn network_status_without_profile_reports_down() {
+    let tmp = tempfile::tempdir().unwrap();
+    let r = call(&app(tmp.path()), json!({"cmd": "network_status"}));
+    assert_eq!(r["ok"]["route"], json!("down"), "{r}");
+    assert!(r["ok"]["profile"].is_null(), "{r}");
+    assert_eq!(r["ok"]["rx_bytes"], json!(0), "{r}");
+}
+
+/// NYX_LAB_STALE_AFTER_SECS (lab-only): unset keeps the real thresholds; a number of seconds
+/// replaces only the stale threshold; zero or garbage is a startup error.
+#[test]
+fn lab_timing_overrides_only_stale_after() {
+    use nyx_app::netlock::NetTiming;
+    use std::time::Duration;
+    assert_eq!(nyx_daemon::lab_timing(None).unwrap(), NetTiming::default());
+    let t = nyx_daemon::lab_timing(Some("20")).unwrap();
+    assert_eq!(t.stale_after, Duration::from_secs(20));
+    assert_eq!(t.start_grace, NetTiming::default().start_grace);
+    assert!(nyx_daemon::lab_timing(Some("0")).is_err());
+    assert!(nyx_daemon::lab_timing(Some("soon")).is_err());
+}

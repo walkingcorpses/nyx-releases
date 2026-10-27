@@ -51,6 +51,8 @@ fn dispatch(state: &AppState, req: &Value) -> Result<Value, String> {
             ok(state.import_profile(arg_str(req, "path")?, arg_str(req, "name")?, group)?)
         }
         "list_profiles" => ok(state.list_profiles()),
+        // The Network card: route (up/starting/stale/down), profile, handshake age, byte counters.
+        "network_status" => ok(state.network_status()),
         "rss_run" => ok(state.rss_run()),
         "check_update" => ok(state.check_update()?),
         "search" => ok(state.search(arg_str(req, "query")?)?),
