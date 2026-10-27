@@ -361,7 +361,7 @@ mod tests {
             format!("[Interface]\nPrivateKey {PRIV}\n"),
             format!("PrivateKey = {PRIV}\n"),
             sample().replace("Address = 10.2.0.2/32, fc00::2/128", &format!("Address = {PRIV}")),
-            sample().replace("51820", &format!("{PRIV}")),
+            sample().replace("51820", PRIV),
         ];
         for text in cases {
             let e = parse_conf(&text).expect_err("case must fail");
