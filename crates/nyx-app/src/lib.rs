@@ -10,3 +10,4 @@ pub mod profiles;
 pub mod secret;
 pub mod state;
 pub mod update;
+pub mod rotation;
