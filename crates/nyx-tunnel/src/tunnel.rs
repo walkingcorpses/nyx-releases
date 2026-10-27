@@ -51,7 +51,17 @@ const EVENT_BATCH: usize = 256;
 /// Upper bound on stack/socket pump rounds per pass, so one pass cannot run forever.
 const PUMP_ROUNDS: usize = 32;
 /// smoltcp TCP socket buffer size per direction (sets the TCP window, hence throughput).
-const TCP_BUF: usize = 256 * 1024;
+// shortcut: smoltcp 0.14 zero-window ACK rejection. Buffers over 64 KiB use window scaling; the
+// right window edge can then shrink by rounding, and at zero window smoltcp rejects ACKs whose
+// seq is not exactly rcv_nxt, so two smoltcp ends at zero window can deadlock (seen with the
+// TestPeer, see testpeer.rs). Guarded by `slow_reader_does_not_stall_the_tunnel`; if it ever
+// stalls, fall back to buffers <= 64 KiB (no window scaling) and re-check the 10 MB/s throughput.
+const TCP_BUF: usize = 128 * 1024;
+/// Concurrent tunnel TCP connections; further CONNECTs are refused (ConnectionRefused, SOCKS
+/// reply 5). Bounds memory at about 512 x (2 x TCP_BUF + 2 x APP_BUF).
+const MAX_TCP_CONNS: usize = 512;
+/// Random picks `alloc_port` tries before giving up.
+const PORT_TRIES: usize = 64;
 /// Buffer between a SOCKS thread and the worker, per direction per connection.
 const APP_BUF: usize = 256 * 1024;
 /// smoltcp UDP socket: payload bytes and datagram slots per direction.
@@ -166,13 +176,31 @@ pub(crate) struct WireStats {
     contact_at: Mutex<Option<Instant>>,
     rx: AtomicU64,
     tx: AtomicU64,
+    /// The worker thread has ended (stopped or panicked): the tunnel is down for good.
+    dead: AtomicBool,
 }
 
 impl WireStats {
-    /// True once the first confirmed contact (always a completed handshake) happened; before that
-    /// the backend refuses everything.
+    /// True once the first confirmed contact (always a completed handshake) happened and the
+    /// worker is still running; otherwise the backend refuses everything.
     fn handshaked(&self) -> bool {
-        self.contact_at.lock().unwrap().is_some()
+        !self.dead.load(Ordering::SeqCst) && self.contact_at.lock().unwrap().is_some()
+    }
+}
+
+/// Runs when the worker thread ends, also by panic (it lives on the worker's stack): marks the
+/// tunnel dead so stats and the backend report it down, and stops the UDP reader thread, so a
+/// dead worker never leaves a tunnel that looks alive or a socket that stays open.
+struct WorkerExit {
+    stats: Arc<WireStats>,
+    reader_stop: Arc<AtomicBool>,
+}
+
+impl Drop for WorkerExit {
+    /// Sets the dead flag and the reader's stop flag (the reader exits within its read timeout).
+    fn drop(&mut self) {
+        self.stats.dead.store(true, Ordering::SeqCst);
+        self.reader_stop.store(true, Ordering::SeqCst);
     }
 }
 
@@ -314,6 +342,8 @@ impl Wire {
                 }
             }
             _ => {
+                // Re-key check only in this arm: when a timer packet or a restart was sent this
+                // tick, the check waits for the next tick (<= one 250 ms TICK of delay), harmless.
                 if rekey.is_some_and(|r| handshake_at.is_none_or(|t| t.elapsed() >= r)) {
                     if let TunnResult::WriteToNetwork(p) = tunn.format_handshake_initiation(buf, false) {
                         send_net(sock, *connected, *dest, paused, p);
@@ -431,10 +461,12 @@ pub(crate) fn spawn_engine<S: Service>(e: Engine<S>, name: &str) -> io::Result<R
         let (tx, stop) = (link.tx.clone(), stop.clone());
         move || reader_loop(rsock, tx, stop)
     })?;
-    let (wl, wstop) = (link.clone(), stop.clone());
+    let wl = link.clone();
+    let exit = WorkerExit { stats: e.stats.clone(), reader_stop: stop.clone() };
     let worker = thread::Builder::new().name(name.to_string()).spawn(move || {
+        let guard = exit; // dropped on return AND on panic: dead flag + reader stop
         run(e, rx, &wl);
-        wstop.store(true, Ordering::SeqCst);
+        drop(guard);
         let _ = reader.join();
     });
     if worker.is_err() {
@@ -542,6 +574,9 @@ enum Cmd {
     Resolve(String, SyncSender<io::Result<IpAddr>>),
     UdpOpen(Arc<UdpConn>),
     UdpSend(Arc<UdpConn>, Vec<u8>, SocketAddr),
+    /// Test hook: makes the worker panic, to prove a dead worker reports the tunnel down.
+    #[cfg(feature = "test-support")]
+    Panic,
 }
 
 /// Datagrams received for one UDP association, waiting for the SOCKS relay.
@@ -583,16 +618,15 @@ struct ClientSvc {
     pending_dns: Vec<(dns::QueryHandle, SyncSender<io::Result<IpAddr>>)>,
     /// Local ports in use by our TCP and UDP sockets.
     ports: HashSet<u16>,
+    /// Concurrent TCP connections allowed (`MAX_TCP_CONNS`; tests lower it).
+    max_tcp: usize,
 }
 
-/// Picks a free ephemeral port for a new smoltcp socket.
-fn alloc_port(ports: &mut HashSet<u16>) -> u16 {
-    loop {
-        let p = rand::random_range(49152..=65535u16);
-        if ports.insert(p) {
-            return p;
-        }
-    }
+/// Picks a free ephemeral port for a new smoltcp socket, or `None` after `PORT_TRIES` random
+/// picks all hit a used port (bounded, so a full port range can never hang the worker). With at
+/// most `MAX_TCP_CONNS` TCP sockets plus the UDP associations in 16384 ports, a miss is rare.
+fn alloc_port(ports: &mut HashSet<u16>) -> Option<u16> {
+    (0..PORT_TRIES).map(|_| rand::random_range(49152..=65535u16)).find(|p| ports.insert(*p))
 }
 
 /// Moves up to `dst.len()` bytes from the front of `q` into `dst`; returns how many.
@@ -694,6 +728,7 @@ impl ClientSvc {
             qtype: if v4 { DnsQueryType::A } else { DnsQueryType::Aaaa },
             pending_dns: Vec::new(),
             ports: HashSet::new(),
+            max_tcp: MAX_TCP_CONNS,
         }
     }
 }
@@ -705,7 +740,19 @@ impl Service for ClientSvc {
     fn command(&mut self, cmd: Cmd, iface: &mut Interface, sockets: &mut SocketSet<'static>) {
         match cmd {
             Cmd::Connect(to, conn) => {
-                let port = alloc_port(&mut self.ports);
+                // The cap bounds memory (two TCP_BUF + two APP_BUF per connection); a refused
+                // CONNECT is SOCKS reply 5, which libtorrent treats like any refused peer.
+                let port = if self.tcp.len() >= self.max_tcp { Err(io::ErrorKind::ConnectionRefused) } else {
+                    alloc_port(&mut self.ports).ok_or(io::ErrorKind::AddrNotAvailable)
+                };
+                let port = match port {
+                    Ok(p) => p,
+                    Err(k) => {
+                        conn.m.lock().unwrap().failed = Some(k);
+                        conn.cv.notify_all();
+                        return;
+                    }
+                };
                 let mut s = new_tcp();
                 s.set_timeout(Some(smoltcp::time::Duration::from_secs(TCP_TIMEOUT)));
                 if s.connect(iface.context(), to, port).is_err() {
@@ -734,7 +781,11 @@ impl Service for ClientSvc {
                 }
             }
             Cmd::UdpOpen(conn) => {
-                let port = alloc_port(&mut self.ports);
+                let Some(port) = alloc_port(&mut self.ports) else {
+                    conn.m.lock().unwrap().dead = true; // no free port: the association fails
+                    conn.cv.notify_all();
+                    return;
+                };
                 let buf = || udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; UDP_SLOTS], vec![0u8; UDP_BUF]);
                 let mut s = udp::Socket::new(buf(), buf());
                 if s.bind(port).is_err() {
@@ -752,6 +803,8 @@ impl Service for ClientSvc {
                     let _ = sockets.get_mut::<udp::Socket>(e.h).send_slice(&payload, to);
                 }
             }
+            #[cfg(feature = "test-support")]
+            Cmd::Panic => panic!("test-support: worker panic requested"),
         }
     }
 
@@ -968,9 +1021,12 @@ fn unreachable(msg: &'static str) -> io::Error {
 }
 
 impl TunnelBackend {
-    /// Refuses everything until the first WireGuard handshake has completed.
+    /// Refuses everything until the first WireGuard handshake has completed, and for good once
+    /// the worker has died.
     fn ready(&self) -> io::Result<()> {
-        if self.stats.handshaked() {
+        if self.stats.dead.load(Ordering::SeqCst) {
+            Err(unreachable("tunnel is down (worker stopped)"))
+        } else if self.stats.handshaked() {
             Ok(())
         } else {
             Err(unreachable("no WireGuard handshake yet"))
@@ -1114,7 +1170,8 @@ impl Tunnel {
         Tunnel::up_with_rekey(cfg, endpoint, REKEY_AGE)
     }
 
-    /// Like `up`, but re-keys once the handshake is `rekey_age` old instead of `REKEY_AGE`. The
+    /// Like `up`, but re-keys once OUR last completed handshake (the confirmed contact, see
+    /// `TunnelStats::handshake_age`) is `rekey_age` old instead of `REKEY_AGE`. The
     /// app keeps it below the lock's stale threshold (tests shorten both), so a healthy tunnel
     /// never looks stale and a dead one re-handshakes as soon as the server is back.
     pub fn up_with_rekey(cfg: &WgConfig, endpoint: SocketAddr, rekey_age: Duration) -> Result<Tunnel, TunnelError> {
@@ -1161,8 +1218,20 @@ impl Tunnel {
         self.socks.as_ref().map(|s| s.credentials()).expect("SOCKS server runs for the tunnel's lifetime")
     }
 
-    /// Contact age (see `TunnelStats::handshake_age`) and byte counters.
+    /// Test hook: makes the worker thread panic (see `worker_panic_reports_tunnel_down`).
+    #[cfg(feature = "test-support")]
+    pub fn panic_worker_for_test(&self) {
+        if let Some(l) = &self.link {
+            let _ = l.send(Cmd::Panic);
+        }
+    }
+
+    /// Contact age (see `TunnelStats::handshake_age`) and byte counters. Once the worker has died
+    /// the tunnel is down: no contact (`None`) and zeroed counters, so nothing reads it as alive.
     pub fn stats(&self) -> TunnelStats {
+        if self.stats.dead.load(Ordering::SeqCst) {
+            return TunnelStats { handshake_age: None, rx_bytes: 0, tx_bytes: 0 };
+        }
         TunnelStats {
             handshake_age: self.stats.contact_at.lock().unwrap().map(|t| t.elapsed()),
             rx_bytes: self.stats.rx.load(Ordering::Relaxed),
@@ -1181,5 +1250,48 @@ impl Drop for Tunnel {
         if let Some(w) = self.worker.take() {
             let _ = w.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::conf::Endpoint;
+
+    /// With every ephemeral port taken, `alloc_port` gives up instead of looping forever.
+    #[test]
+    fn alloc_port_fails_when_no_port_is_free() {
+        let mut ports: HashSet<u16> = (49152..=65535u16).collect();
+        assert_eq!(alloc_port(&mut ports), None);
+        let mut free = HashSet::new();
+        assert!(alloc_port(&mut free).is_some_and(|p| p >= 49152 && free.contains(&p)));
+    }
+
+    /// Past the connection cap a CONNECT is refused (ConnectionRefused, SOCKS reply 5) without
+    /// opening a smoltcp socket; the cap is lowered to 2 here so the test stays cheap.
+    #[test]
+    fn connect_past_the_cap_is_refused() {
+        let cfg = WgConfig {
+            private_key: [1; 32],
+            addresses: vec![(IpAddr::from([10, 0, 0, 2]), 32)],
+            dns: vec![],
+            peer_public_key: [2; 32],
+            preshared_key: None,
+            endpoint: Endpoint { host: "127.0.0.1".into(), port: 1 },
+            keepalive: None,
+        };
+        let mut dev = VirtDevice::default();
+        let mut iface = make_iface(&mut dev, &cfg.addresses, true);
+        let mut sockets = SocketSet::new(vec![]);
+        let mut svc = ClientSvc::new(&cfg, &mut sockets, true, false);
+        svc.max_tcp = 2;
+        let to: SocketAddr = "10.0.0.1:7".parse().unwrap();
+        let conns: Vec<Arc<Conn>> = (0..3).map(|_| Arc::new(Conn::default())).collect();
+        for c in &conns {
+            svc.command(Cmd::Connect(to, c.clone()), &mut iface, &mut sockets);
+        }
+        assert_eq!(svc.tcp.len(), 2);
+        assert_eq!(conns[0].m.lock().unwrap().failed, None);
+        assert_eq!(conns[2].m.lock().unwrap().failed, Some(io::ErrorKind::ConnectionRefused));
     }
 }

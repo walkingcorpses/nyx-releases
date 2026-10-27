@@ -153,7 +153,59 @@ fn ipv6_target_is_refused_on_v4_only_tunnel() {
     let (_peer, t) = up();
     let v6 = SocketAddr::new(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1).into(), 7);
     let (_s, code, _) = socks(&t, 1, &addr_bytes(v6));
-    assert_ne!(code, 0);
+    assert_eq!(code, 3, "an IPv6 target on a v4-only tunnel is network unreachable");
+}
+
+/// A worker thread that dies (here a test-only panic) must not leave a tunnel that looks alive:
+/// stats report it down (no contact, zero counters), and SOCKS refuses with network unreachable.
+#[test]
+fn worker_panic_reports_tunnel_down() {
+    let (_peer, t) = up();
+    t.panic_worker_for_test();
+    let end = Instant::now() + Duration::from_secs(3);
+    while t.stats().handshake_age.is_some() {
+        assert!(Instant::now() < end, "tunnel still reports contact 3 s after its worker died");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let st = t.stats();
+    assert_eq!((st.rx_bytes, st.tx_bytes), (0, 0), "a dead tunnel reports zeroed liveness");
+    let (_s, code, _) = socks(&t, 1, &addr_bytes(ECHO));
+    assert_eq!(code, 3);
+    let (_u, code, _) = socks(&t, 3, &addr_bytes("127.0.0.1:0".parse().unwrap()));
+    assert_eq!(code, 3);
+    let started = Instant::now();
+    drop(t);
+    assert!(started.elapsed() < Duration::from_secs(5), "drop after a worker panic took {:?}", started.elapsed());
+}
+
+/// The app stops reading for about a second while the peer keeps streaming (the client's window
+/// closes), then resumes: every byte must still arrive. Guards the smoltcp 0.14 zero-window issue
+/// noted at `TCP_BUF` in tunnel.rs.
+#[test]
+fn slow_reader_does_not_stall_the_tunnel() {
+    const TOTAL: usize = 8 * 1024 * 1024;
+    let (_peer, t) = up();
+    let (s, code, _) = socks(&t, 1, &addr_bytes(ECHO));
+    assert_eq!(code, 0);
+    s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+    let mut w = s.try_clone().unwrap();
+    let writer = thread::spawn(move || {
+        let chunk = vec![0x3cu8; 64 * 1024];
+        for _ in 0..TOTAL / chunk.len() {
+            w.write_all(&chunk).unwrap();
+        }
+    });
+    let mut r = s;
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut got = r.read(&mut buf).unwrap();
+    thread::sleep(Duration::from_millis(1200)); // stop reading while the echo keeps coming
+    while got < TOTAL {
+        let n = r.read(&mut buf).expect("tunnel stalled after the reader paused");
+        assert!(n > 0, "echo ended early after {got} bytes");
+        got += n;
+    }
+    writer.join().unwrap();
+    assert_eq!(got, TOTAL);
 }
 
 #[test]

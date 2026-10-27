@@ -5,3 +5,4 @@ dist/
 *.bad
 .vite/
 lab/out/
+lab/**/__pycache__/
