@@ -24,7 +24,12 @@ Scenarios (in run order):
   discovery_attempts         a long dwell with discovery at its default (LSD, UPnP, NAT-PMP, DHT on).
   tunnel_killed_midtransfer  WireGuard to exit A is dropped mid-download: after the kill nothing
                              but WireGuard may leave, torrents must be held within the stale
-                             threshold + 10 s, and after the drop is lifted the tunnel recovers.
+                             threshold + 10 s and stay held while cut (exit A keeps sending
+                             handshake initiations: finding F1), and after the drop is lifted the
+                             tunnel recovers.
+  tunnel_cut_both_ways       the same with exit A dropping WireGuard in both directions.
+  tunnel_cut_long            the one-way cut held for 130 s, past wireguard-go giving up its
+                             handshake attempts (~90 s): held all through, then recovery.
   shutdown_and_crash         a clean `shutdown`, then a SIGKILL of the daemon mid-transfer; each
                              restart must be a clean cold start again.
   ipv6_icmp_broadcast        IPv6 is on in the LAN: a download must produce no IPv6, ICMP,
@@ -66,6 +71,8 @@ TORRENTS = {
     "bait-redirect": (1 * MB, 10, [["http://10.88.0.20:8000/bait/redirect"]]),
     "bait-peers": (1 * MB, 11, [["http://10.88.0.20:8000/bait/peers"]]),
     "kill": (20 * MB, 8, IP_TRACKERS),
+    "kill2": (20 * MB, 14, IP_TRACKERS),
+    "kill3": (20 * MB, 15, IP_TRACKERS),
     "crash": (20 * MB, 12, IP_TRACKERS),
     "v6": (8 * MB, 13, IP_TRACKERS),
 }
@@ -76,11 +83,13 @@ DISCOVERY_DWELL = 90    # longest practical dwell; libtorrent's LSD interval (5 
 HELD_WITHIN = 10        # torrents must be held within the stale threshold + this
 RECOVER_WITHIN = 60     # tunnel up and torrents released within this after the drop is lifted
 DROP_RULE = ["INPUT", "-p", "udp", "--dport", str(WG_PORT), "-j", "DROP"]
+DROP_OUT_RULE = ["OUTPUT", "-p", "udp", "--sport", str(WG_PORT), "-j", "DROP"]  # with DROP_RULE: both ways
+LONG_CUT = 130          # tunnel_cut_long: > wireguard-go's 90 s of handshake attempts + the 20 s stale threshold
 CONTROL = "positive_control"
 
 # Run state shared by the scenarios: windows are (scenario, since, until, kind) with kind
 # "normal" or "kill" (the kill window's egress is checked by check_kill_timing).
-LAB = {"windows": [], "findings": [], "scenarios": [], "notes": [], "kill": None, "mark": 0.0}
+LAB = {"windows": [], "findings": [], "scenarios": [], "notes": [], "kills": [], "mark": 0.0}
 setup_state = {}
 
 
@@ -394,76 +403,105 @@ def drop_count():
     return 0
 
 
-def tunnel_killed_midtransfer(t0):
-    """Cuts WireGuard to exit A (exit A drops the client's UDP) in the middle of a slowed
-    download. Records the kill time and when every torrent read held (for check_kill_timing),
-    then lifts the drop and checks the tunnel recovers. Records its own windows: before the kill
+def cut_midtransfer(t0, name, torrent_name, rules, cut_for=0):
+    """Cuts WireGuard to exit A with iptables `rules` (each one inserted on exit A, removed again
+    afterwards) in the middle of a slowed download of `torrent_name`. Records the kill time and
+    when every torrent read held (for check_kill_timing), keeps the path cut and samples the lock
+    once a second for at least 10 s after the hold and at least `cut_for` s after the kill, then
+    lifts the cut and checks the tunnel recovers. Records its own windows: before the kill
     (normal), kill to restore (checked by check_kill_timing) and the recovery (normal)."""
-    name = "tunnel_killed_midtransfer"
     stale = setup_state["stale_after"]
     marks = {"kill": None, "restore": None, "held": None, "samples": []}
+
+    def lift(check=True):
+        """Removes every cut rule from exit A."""
+        for r in rules:
+            sh("wg-exit-a", "iptables -D " + " ".join(r), check=check)
+
     try:
         change_settings("seeder", up_limit=SLOW)
-        seed("kill")
-        add(CLIENT, "kill", "/data/dl")
-        p = wait_midway("kill")
+        seed(torrent_name)
+        add(CLIENT, torrent_name, "/data/dl")
+        p = wait_midway(torrent_name)
         age0 = ctl(CLIENT, {"cmd": "network_status"})["handshake_age_secs"]
-        sh("wg-exit-a", "iptables -I " + " ".join(DROP_RULE))
+        for r in rules:
+            sh("wg-exit-a", "iptables -I " + " ".join(r))
         marks["kill"] = time.time()
-        end = marks["kill"] + stale + HELD_WITHIN + 15
-        while time.time() < end:
-            st, rows = ctl(CLIENT, {"cmd": "status"}), ctl(CLIENT, {"cmd": "list"})
-            if st["killed"] and all(t["status"] == "queued" for t in rows if t["status"] not in ("error", "paused")):
-                marks["held"] = time.time()
+        # Sample the lock about once a second from the kill until the cut is lifted: the first
+        # sample with every torrent held sets `held`; from then on the lock must stay on (and the
+        # capture gets time to show stray traffic while held). The cut lasts at least `cut_for` s,
+        # 10 s past the hold, or (never held) until the hold deadline + 15 s has passed.
+        trace = []  # (time, killed, route, handshake age, rx bytes): every sample, for the notes
+        while True:
+            now = time.time()
+            if marks["held"]:
+                if now >= max(marks["held"] + 10, marks["kill"] + cut_for):
+                    break
+            elif now >= max(marks["kill"] + stale + HELD_WITHIN + 15, marks["kill"] + cut_for):
                 break
-            time.sleep(0.5)
+            ns, st, rows = ctl(CLIENT, {"cmd": "network_status"}), ctl(CLIENT, {"cmd": "status"}), ctl(CLIENT, {"cmd": "list"})
+            trace.append((now, st["killed"], ns["route"], ns["handshake_age_secs"], ns["rx_bytes"]))
+            if not marks["held"] and st["killed"] and all(t["status"] == "queued" for t in rows if t["status"] not in ("error", "paused")):
+                marks["held"] = now
+            if marks["held"]:
+                marks["samples"].append(trace[-1][:4])
+            time.sleep(1)
         net = ctl(CLIENT, {"cmd": "network_status"})
-        # Keep the path cut for 10 s more and sample the lock: it must stay on until the drop is
-        # lifted (and the capture gets time to show stray traffic while held).
-        if marks["held"]:
-            end = time.time() + 10
-            while time.time() < end:
-                ns, st = ctl(CLIENT, {"cmd": "network_status"}), ctl(CLIENT, {"cmd": "status"})
-                marks["samples"].append((time.time(), st["killed"], ns["route"], ns["handshake_age_secs"]))
-                time.sleep(1)
-            LAB["notes"].append("tunnel_killed_midtransfer samples while cut (s after kill, killed, route, handshake age): "
-                                + ", ".join(f"({t - marks['kill']:.0f}, {k}, {r}, {a})" for t, k, r, a in marks["samples"]))
-        else:
-            time.sleep(5)
+        LAB["notes"].append(f"{name} samples while cut (s after kill, killed, route, handshake age, rx bytes): "
+                            + ", ".join(f"({t - marks['kill']:.0f}, {k}, {r}, {a}, {x})" for t, k, r, a, x in trace))
         dropped = drop_count()
         if dropped == 0:
             raise RuntimeError("the DROP rule on exit A matched no packet: the tunnel was not cut")
-        # Snapshot before lifting the drop: recovery must show rx or progress growing past this.
-        before = {"rx": ctl(CLIENT, {"cmd": "network_status"})["rx_bytes"], "progress": torrent("kill")["progress"]}
-        sh("wg-exit-a", "iptables -D " + " ".join(DROP_RULE))
+        # Snapshot before lifting the cut: recovery must show rx or progress growing past this.
+        before = {"rx": ctl(CLIENT, {"cmd": "network_status"})["rx_bytes"], "progress": torrent(torrent_name)["progress"]}
+        lift()
         marks["restore"] = time.time()
         back_at, last = None, None
         end = marks["restore"] + RECOVER_WITHIN + 10
         while time.time() < end:
-            ns, st, t = ctl(CLIENT, {"cmd": "network_status"}), ctl(CLIENT, {"cmd": "status"}), torrent("kill")
+            ns, st, t = ctl(CLIENT, {"cmd": "network_status"}), ctl(CLIENT, {"cmd": "status"}), torrent(torrent_name)
             last = {"route": ns["route"], "killed": st["killed"], "status": t["status"], "rx": ns["rx_bytes"], "progress": t["progress"]}
             if analyzer.recovered(before, last):
                 back_at = time.time()
                 break
             time.sleep(1)
-        LAB["notes"].append(f"tunnel_killed_midtransfer recovery: at restore {before}; "
+        LAB["notes"].append(f"{name} recovery: at restore {before}; "
                             f"{'recovered' if back_at else 'last'} sample {last}")
         LAB["findings"].extend(analyzer.check_recovery(marks["restore"], back_at, RECOVER_WITHIN, name))
         held = f"{marks['held'] - marks['kill']:.1f} s" if marks["held"] else "never"
         back = (f"{back_at - marks['restore']:.1f} s (rx {before['rx']} -> {last['rx']}, "
                 f"progress {before['progress']:.0%} -> {last['progress']:.0%})") if back_at else "never"
         return (f"killed at {p:.0%} (handshake age {age0} s); held after {held} (stale {stale} s + {HELD_WITHIN} s allowed); route then "
-                f"{net['route']}; {dropped} WireGuard packets dropped; recovered after {back}")
+                f"{net['route']}; cut for {marks['restore'] - marks['kill']:.0f} s; {dropped} WireGuard packets dropped; "
+                f"recovered after {back}")
     finally:
         now = time.time()
         if marks["kill"] and not marks["restore"]:  # never leave exit A cut for the later scenarios
-            sh("wg-exit-a", "iptables -D " + " ".join(DROP_RULE), check=False)
+            lift(check=False)
             marks["restore"] = time.time()
         LAB["windows"].append((name, t0, marks["kill"] or now, "normal"))
         if marks["kill"]:
             LAB["windows"].append((f"{name} (killed)", marks["kill"], marks["restore"], "kill"))
-            LAB["kill"] = (marks["kill"], marks["restore"], marks["held"], stale, marks["samples"])
+            LAB["kills"].append((name, marks["kill"], marks["restore"], marks["held"], stale, marks["samples"]))
             LAB["windows"].append((f"{name} (recovery)", marks["restore"], now, "normal"))
+
+
+def tunnel_killed_midtransfer(t0):
+    """One-way cut: exit A drops the client's WireGuard but can still send to it, so exit A's
+    handshake initiations keep reaching the client (finding F1: they must not count as a live
+    tunnel)."""
+    return cut_midtransfer(t0, "tunnel_killed_midtransfer", "kill", [DROP_RULE])
+
+
+def tunnel_cut_both_ways(t0):
+    """Both-ways cut: exit A drops the client's WireGuard in and its own WireGuard out."""
+    return cut_midtransfer(t0, "tunnel_cut_both_ways", "kill2", [DROP_RULE, DROP_OUT_RULE])
+
+
+def tunnel_cut_long(t0):
+    """A one-way cut held for LONG_CUT s, longer than wireguard-go's ~90 s of handshake attempts
+    plus the stale threshold: the lock must hold all through, also once exit A gives up."""
+    return cut_midtransfer(t0, "tunnel_cut_long", "kill3", [DROP_RULE], cut_for=LONG_CUT)
 
 
 def restart_client():
@@ -581,10 +619,9 @@ def analyse():
             live, why = analyzer.capture_live(PCAP, EXIT_A, since, until)
             if not live:
                 failed_live.setdefault(base, f"capture not live in {name}: {why}")
-    if LAB["kill"]:
-        kill, restore, held, stale, samples = LAB["kill"]
+    for name, kill, restore, held, stale, samples in LAB["kills"]:
         findings += analyzer.check_kill_timing(PCAP, kill, allowed, stale, held, HELD_WITHIN, until=restore,
-                                               scenario="tunnel_killed_midtransfer (killed)", samples=samples)
+                                               scenario=f"{name} (killed)", samples=samples)
     LAB["scenarios"] = [(n, False, failed_live[n]) if ok and n in failed_live else (n, ok, d) for n, ok, d in LAB["scenarios"]]
     real, missing = analyzer.split_control(findings, CONTROL, analyzer.CONTROL_SIGNATURES)
     for m in missing:
@@ -612,6 +649,8 @@ def main():
                                ("metadata_requests", metadata_requests, "normal"), ("bait", bait, "normal"),
                                ("discovery_attempts", discovery_attempts, "normal"),
                                ("tunnel_killed_midtransfer", tunnel_killed_midtransfer, "custom"),
+                               ("tunnel_cut_both_ways", tunnel_cut_both_ways, "custom"),
+                               ("tunnel_cut_long", tunnel_cut_long, "custom"),
                                ("shutdown_and_crash", shutdown_and_crash, "normal"),
                                ("ipv6_icmp_broadcast", ipv6_icmp_broadcast, "normal")):
             if only and name not in only:  # LAB_ONLY: dev runs of a subset (cold start and control always run)

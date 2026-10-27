@@ -98,7 +98,14 @@ The report separates scenarios that could not run (infrastructure failures) from
   to exit A may leave; every torrent must read held (`queued`, `status.killed`) within the stale
   threshold + 10 s and stay held until the drop is lifted; after that the route must be up, the
   torrent released AND rx bytes or the torrent's progress must grow past their values at the
-  restore, within 60 s (state flags alone do not prove recovery).
+  restore, within 60 s (state flags alone do not prove recovery). The cut is one-way: exit A
+  still reaches the client with handshake initiations and with data on its old keypair (finding
+  F1: neither may count as a live tunnel). The lock is sampled once a second from the kill; the
+  notes list (s after kill, killed, route, handshake age, rx bytes).
+- `tunnel_cut_both_ways`: the same, with exit A also dropping its own WireGuard to the client
+  (`iptables -I OUTPUT -p udp --sport 51820 -j DROP`).
+- `tunnel_cut_long`: the one-way cut held for 130 s, longer than wireguard-go's ~90 s of
+  handshake attempts plus the stale threshold: held all through, then the same recovery check.
 - `shutdown_and_crash`: a clean `shutdown` and a restart; then SIGKILL of the daemon mid-download
   (a crash: the container and its capture stay up) and a restart. Each restart must be a clean
   cold start; the crashed download must finish.

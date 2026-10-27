@@ -201,6 +201,7 @@ pub(crate) struct Wire {
     ///   `time_since_last_handshake` resets on one;
     /// - received transport data or keepalives: the peer keeps sending on its old keypair (up to
     ///   180 s) while our packets are dropped, e.g. TCP retransmits from the far end.
+    ///
     /// Also drives the client's re-key.
     handshake_at: Option<Instant>,
     buf: Vec<u8>,
