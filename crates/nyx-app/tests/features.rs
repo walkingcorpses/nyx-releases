@@ -256,3 +256,237 @@ fn blocklist_loads_and_a_missing_one_warns() {
     assert!(a.status().warnings.iter().any(|w| w.contains("Blocklist")), "{:?}", a.status().warnings);
     let _: SocketAddr = free_loopback_addr();
 }
+
+// ---------------------------------------------------------------------------------------------
+// Network lock and the VPN tunnel (spec sections 4 and 5). TestPeer is an in-process WireGuard
+// server on loopback, so none of these touch the internet.
+// ---------------------------------------------------------------------------------------------
+
+use base64::Engine as _;
+use nyx_app::netlock::{NetTiming, Route};
+use nyx_core::Profile;
+use nyx_engine::testkit::wait_until;
+use nyx_tunnel::conf::WgConfig;
+use nyx_tunnel::testpeer::TestPeer;
+use std::time::Duration;
+
+/// What `http_agent` callers get while the lock holds.
+const LOCK_ERR: &str = "the network lock is holding: no VPN tunnel";
+/// Inside the TestPeer: its TCP echo service.
+const ECHO: &str = "10.0.0.1:7";
+
+/// Renders a parsed config back to `.conf` text, the form a profile stores (sealed).
+fn conf_text(c: &WgConfig) -> String {
+    let b64 = |k: &[u8]| base64::engine::general_purpose::STANDARD.encode(k);
+    let addrs: Vec<String> = c.addresses.iter().map(|(ip, p)| format!("{ip}/{p}")).collect();
+    let dns: Vec<String> = c.dns.iter().map(|ip| ip.to_string()).collect();
+    format!(
+        "[Interface]\nPrivateKey = {}\nAddress = {}\nDNS = {}\n\n[Peer]\nPublicKey = {}\nAllowedIPs = 0.0.0.0/0, ::/0\nEndpoint = {}:{}\n",
+        b64(&c.private_key),
+        addrs.join(", "),
+        dns.join(", "),
+        b64(&c.peer_public_key),
+        c.endpoint.host,
+        c.endpoint.port
+    )
+}
+
+/// The client private key as it appears in the .conf, to check it never reaches the UI.
+fn private_key_b64(peer: &TestPeer) -> String {
+    base64::engine::general_purpose::STANDARD.encode(peer.client_config().private_key)
+}
+
+/// Settings with one profile "Test VPN" (id "p1") for `peer`, sealed from `conf`, and active.
+fn vpn_settings(peer: &TestPeer, conf: &str) -> Settings {
+    let mut s = Settings::default();
+    s.network.profiles.push(Profile {
+        id: "p1".into(),
+        name: "Test VPN".into(),
+        group: String::new(),
+        sealed_conf: nyx_app::secret::seal(conf),
+        endpoint: peer.endpoint().to_string(),
+        endpoint_ip: peer.endpoint().to_string(),
+    });
+    s.network.active_profile = Some("p1".into());
+    s
+}
+
+/// Saves `s` into `dir` and starts an app on it with the given lock timing.
+fn vpn_app(dir: &Path, s: &Settings, timing: NetTiming) -> AppState {
+    s.save(dir).unwrap();
+    AppState::new_with_timing(dir, free_loopback_addr(), false, timing).unwrap()
+}
+
+/// Ticks until `cond` holds (or `secs` pass).
+fn tick_until(a: &AppState, secs: u64, mut cond: impl FnMut(&AppState) -> bool) -> bool {
+    wait_until(Duration::from_secs(secs), || {
+        a.tick(Local::now().naive_local());
+        cond(a)
+    })
+}
+
+/// With a profile active the engine's proxy is the tunnel's SOCKS port: a peer connection inside
+/// the tunnel moves bytes through WireGuard. The UI-facing JSON never carries key material.
+#[test]
+fn profile_active_points_engine_at_tunnel_socks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peer = TestPeer::start();
+    let a = vpn_app(tmp.path(), &vpn_settings(&peer, &conf_text(&peer.client_config())), NetTiming::default());
+    assert!(wait_until(Duration::from_secs(10), || a.network_status().route == Route::Up), "{:?}", a.network_status());
+    let id = a.add_magnet(&magnet(9), &tmp.path().join("dl").to_string_lossy(), None, false).unwrap();
+    a.tick(Local::now().naive_local());
+    let before = a.network_status().tx_bytes;
+    a.engine.add_peer(&id, ECHO.parse().unwrap()).unwrap();
+    assert!(
+        wait_until(Duration::from_secs(15), || a.network_status().tx_bytes > before),
+        "engine traffic should go through the tunnel: {:?}",
+        a.network_status()
+    );
+    let st = a.status();
+    assert_eq!((st.route.as_str(), st.profile_name.as_deref(), st.killed, st.proxy_down), ("up", Some("Test VPN"), false, false));
+    let ns = a.network_status();
+    assert_eq!(ns.profile.as_deref(), Some("Test VPN"));
+    assert!(ns.handshake_age_secs.is_some() && ns.rx_bytes > 0);
+    let json = serde_json::to_string(&st).unwrap() + &serde_json::to_string(&ns).unwrap();
+    assert!(!json.contains(&private_key_b64(&peer)) && !json.contains("PrivateKey"), "{json}");
+}
+
+/// Cold start with the lock on: nothing runs and no HTTP goes out until the first handshake.
+#[test]
+fn cold_start_holds_everything_until_first_handshake() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peer = TestPeer::start();
+    peer.set_paused(true);
+    let a = vpn_app(tmp.path(), &vpn_settings(&peer, &conf_text(&peer.client_config())), NetTiming::default());
+    a.add_magnet(&magnet(10), &tmp.path().join("dl").to_string_lossy(), None, false).unwrap();
+    a.tick(Local::now().naive_local());
+    let st = a.status();
+    assert!(st.killed, "the lock must hold before the first handshake");
+    assert_eq!(st.route, "starting");
+    assert_eq!(a.list_torrents()[0].status, "queued");
+    assert_eq!(a.check_update().unwrap_err(), LOCK_ERR);
+    assert_eq!(a.fetch_torrent_url("http://127.0.0.1:9/x.torrent").unwrap_err(), LOCK_ERR);
+
+    peer.set_paused(false);
+    assert!(tick_until(&a, 10, |a| !a.status().killed), "released after the first handshake: {:?}", a.network_status());
+    assert_eq!(a.list_torrents()[0].status, "metadata");
+    assert_eq!(a.status().route, "up");
+}
+
+/// The VPN server going quiet for longer than the stale threshold (a dead server, or the machine
+/// sleeping) holds every torrent and HTTP; a fresh handshake releases them.
+#[test]
+fn peer_dying_holds_torrents_then_recovers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peer = TestPeer::start();
+    let timing = NetTiming { stale_after: Duration::from_secs(3), start_grace: Duration::from_secs(5) };
+    let a = vpn_app(tmp.path(), &vpn_settings(&peer, &conf_text(&peer.client_config())), timing);
+    a.add_magnet(&magnet(11), &tmp.path().join("dl").to_string_lossy(), None, false).unwrap();
+    assert!(tick_until(&a, 10, |a| a.status().route == "up"));
+    // A healthy tunnel re-keys before it goes stale, so it stays up past the threshold.
+    std::thread::sleep(Duration::from_secs(4));
+    a.tick(Local::now().naive_local());
+    assert!(!a.status().killed && a.status().route == "up", "{:?}", a.network_status());
+    assert_eq!(a.list_torrents()[0].status, "metadata");
+
+    peer.set_paused(true);
+    assert!(tick_until(&a, 10, |a| a.status().killed), "{:?}", a.network_status());
+    assert_eq!(a.status().route, "stale");
+    assert_eq!(a.list_torrents()[0].status, "queued");
+    assert_eq!(a.check_update().unwrap_err(), LOCK_ERR);
+    std::thread::sleep(Duration::from_secs(2)); // well past the threshold, like a short sleep
+
+    peer.set_paused(false);
+    assert!(tick_until(&a, 15, |a| !a.status().killed), "recovers on a fresh handshake: {:?}", a.network_status());
+    assert_eq!(a.status().route, "up");
+    assert_eq!(a.list_torrents()[0].status, "metadata");
+}
+
+/// An active profile that cannot be opened starts behind a blocked SOCKS port: the route is not
+/// up, the lock holds, and the engine never connects anywhere directly.
+#[test]
+fn invalid_active_profile_starts_blocked_not_direct() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peer = TestPeer::start();
+    let a = vpn_app(tmp.path(), &vpn_settings(&peer, "this is not a wireguard config"), NetTiming::default());
+    let target = TcpListener::bind("127.0.0.1:0").unwrap();
+    target.set_nonblocking(true).unwrap();
+    let id = a.add_magnet(&magnet(12), &tmp.path().join("dl").to_string_lossy(), None, false).unwrap();
+    a.engine.add_peer(&id, target.local_addr().unwrap()).unwrap();
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(target.accept().is_err(), "the engine connected directly");
+    a.tick(Local::now().naive_local());
+    let st = a.status();
+    assert_eq!(st.route, "down");
+    assert!(st.killed);
+    assert!(st.warnings.iter().any(|w| w.contains("Test VPN")), "{:?}", st.warnings);
+    assert_eq!(a.check_update().unwrap_err(), LOCK_ERR);
+    assert_eq!(a.network_status().route, Route::Down);
+}
+
+/// Without a profile the manual SOCKS5 proxy is used as before.
+#[test]
+fn manual_proxy_still_works_without_a_profile() {
+    let tmp = tempfile::tempdir().unwrap();
+    let stub = Socks5Stub::start("127.0.0.1:0".parse().unwrap(), None);
+    let proxy = Some(ProxySettings { host: "127.0.0.1".into(), port: stub.addr().port(), username: None, password: None });
+    Settings { proxy, ..Default::default() }.save(tmp.path()).unwrap();
+    let a = app(tmp.path());
+    let id = a.add_magnet(&magnet(13), &tmp.path().join("dl").to_string_lossy(), None, false).unwrap();
+    a.engine.add_peer(&id, "127.0.0.1:9".parse().unwrap()).unwrap();
+    assert!(wait_until(Duration::from_secs(10), || stub.saw_port(9)), "peer connection should use the manual proxy");
+    a.tick(Local::now().naive_local());
+    let st = a.status();
+    assert_eq!((st.route.as_str(), st.profile_name.as_deref(), st.killed), ("none", None, false));
+}
+
+/// A profile wins over the manual proxy; clearing the profile goes back to the manual proxy.
+#[test]
+fn profile_wins_over_manual_proxy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peer = TestPeer::start();
+    let stub = Socks5Stub::start("127.0.0.1:0".parse().unwrap(), None);
+    let mut s = vpn_settings(&peer, &conf_text(&peer.client_config()));
+    s.proxy = Some(ProxySettings { host: "127.0.0.1".into(), port: stub.addr().port(), username: None, password: None });
+    let a = vpn_app(tmp.path(), &s, NetTiming::default());
+    assert!(wait_until(Duration::from_secs(10), || a.network_status().route == Route::Up));
+    let id = a.add_magnet(&magnet(14), &tmp.path().join("dl").to_string_lossy(), None, false).unwrap();
+    let before = a.network_status().tx_bytes;
+    a.engine.add_peer(&id, ECHO.parse().unwrap()).unwrap();
+    assert!(wait_until(Duration::from_secs(15), || a.network_status().tx_bytes > before));
+    assert_eq!(stub.connect_count(), 0, "the manual proxy must not be used while a profile is active");
+    // The manual proxy being down does not matter while the profile is active.
+    stub.stop();
+    a.probe_proxy();
+    a.tick(Local::now().naive_local());
+    assert!(!a.status().killed && !a.status().proxy_down);
+
+    // Profile off: back to the manual proxy (a fresh one on another port).
+    let stub2 = Socks5Stub::start("127.0.0.1:0".parse().unwrap(), None);
+    let mut s = a.settings_for_ui();
+    s.network.active_profile = None;
+    s.proxy = Some(ProxySettings { host: "127.0.0.1".into(), port: stub2.addr().port(), username: None, password: None });
+    a.set_settings(s).unwrap();
+    a.probe_proxy();
+    assert_eq!(a.status().route, "none");
+    a.engine.add_peer(&id, "127.0.0.1:9".parse().unwrap()).unwrap();
+    assert!(wait_until(Duration::from_secs(10), || stub2.saw_port(9)), "back on the manual proxy");
+}
+
+/// The Test button: a temporary tunnel for a saved (not active) profile reports the handshake.
+/// The exit-IP lookup goes through that tunnel (the TestPeer's DNS sees it) and, with no real
+/// internet behind the TestPeer, comes back empty instead of failing the test.
+#[test]
+fn test_profile_reports_handshake_through_a_temporary_tunnel() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peer = TestPeer::start();
+    let mut s = vpn_settings(&peer, &conf_text(&peer.client_config()));
+    s.network.active_profile = None;
+    let a = vpn_app(tmp.path(), &s, NetTiming::default());
+    let r = a.test_profile("p1").unwrap();
+    assert_eq!((r.route, r.profile.as_deref(), r.exit_ip.as_deref()), (Route::Up, Some("Test VPN"), None));
+    assert!(r.handshake_age_secs.is_some());
+    assert!(peer.dns_queries().iter().any(|q| q.contains("api.ipify.org")), "{:?}", peer.dns_queries());
+    assert!(a.test_profile("nope").is_err());
+    assert_eq!(a.status().route, "none", "testing does not activate the profile");
+}

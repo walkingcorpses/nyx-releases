@@ -7,25 +7,69 @@ use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf, Prefix};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::NaiveDateTime;
 use nyx_core::{
-    build_magnet, parse_blocklist, safe_join, Categories, EncryptionPref, IpRange, Queue, QueueEntry, Settings,
-    TorrentId,
+    build_magnet, parse_blocklist, safe_join, Categories, EncryptionPref, IpRange, Profile, ProxySettings, Queue,
+    QueueEntry, Settings, TorrentId,
 };
 use nyx_engine::{
     AddOptions, Engine, EngineConfig, EncryptionMode, ProxyConfig, TorrentState, TorrentStatus,
 };
 
-use crate::dto::{AppUpdateDto, DetailDto, MetaDto, RssReportDto, SearchResultDto, StatusDto, TorrentDto};
+use nyx_tunnel::conf::parse_conf;
+use nyx_tunnel::tunnel::Tunnel;
+
+use crate::dto::{AppUpdateDto, DetailDto, MetaDto, NetworkStatusDto, RssReportDto, SearchResultDto, StatusDto, TorrentDto};
 use crate::feeds::{self, Item, Seen};
 use crate::http;
+use crate::netlock::{NetTiming, Route};
+use crate::secret;
 use crate::poller::{completions, diff, Update};
 use crate::update::{self, UpdateInfo};
 
 /// Largest .torrent file the app will even open (matches nyx-core's limit).
 const MAX_TORRENT_FILE: u64 = 10 * 1024 * 1024;
+/// What HTTP callers get while the network lock holds a profile's traffic.
+const LOCK_HOLDING: &str = "the network lock is holding: no VPN tunnel";
+/// How long the profile Test button waits for a handshake.
+const TEST_WAIT: Duration = Duration::from_secs(15);
+/// Answers with the caller's public IP as plain text (Test button only, through the tunnel).
+const EXIT_IP_URL: &str = "https://api.ipify.org";
+
+/// The VPN side of the network: the tunnel for the active profile, or a blocked stand-in.
+struct Net {
+    /// The active profile this state was built for; `None` = no profile (manual proxy or direct).
+    profile: Option<String>,
+    /// Running tunnel (or `Tunnel::blocked()`); `None` exactly when `profile` is `None`.
+    tunnel: Option<Tunnel>,
+    /// The profile could not be started and `tunnel` is the blocked stand-in: the route is down.
+    blocked: bool,
+    /// When the tunnel started, for the start grace.
+    started: Instant,
+}
+
+impl Net {
+    /// The route for this tunnel, or `None` without a profile. Reads the live handshake age, so a
+    /// dead worker shows as an ever older handshake, never as up.
+    fn route(&self, timing: NetTiming) -> Option<Route> {
+        let t = self.tunnel.as_ref()?;
+        Some(if self.blocked { Route::Down } else { timing.evaluate(t.stats().handshake_age, self.started.elapsed()) })
+    }
+
+    /// The engine's proxy and adapter binding: with a profile the tunnel's SOCKS port and
+    /// 127.0.0.1 (a profile wins over the manual proxy), otherwise the manual settings.
+    fn engine_route(&self, s: &Settings) -> (Option<ProxyConfig>, Option<String>) {
+        match &self.tunnel {
+            Some(t) => (engine_proxy(Some(&socks_of(t))), Some("127.0.0.1".into())),
+            None => (
+                engine_proxy(s.proxy.as_ref()),
+                s.bind_interface.as_deref().map(str::trim).filter(|i| !i.is_empty()).map(String::from),
+            ),
+        }
+    }
+}
 
 /// What one poll tick produced: the UI delta, and names of downloads that just finished.
 pub struct Tick {
@@ -66,15 +110,29 @@ pub struct AppState {
     pending_update: Mutex<Option<UpdateInfo>>,
     /// Startup problems worth showing (for example an unreadable blocklist).
     warnings: Mutex<Vec<String>>,
+    /// The tunnel for the active VPN profile.
+    net: Mutex<Net>,
+    /// The network lock's thresholds.
+    timing: NetTiming,
 }
 
 impl AppState {
     /// Loads settings from `data_dir`, starts the engine on `listen` and applies the settings.
     /// `discovery` switches DHT/LSD/UPnP/NAT-PMP (off in tests).
     pub fn new(data_dir: &Path, listen: SocketAddr, discovery: bool) -> Result<AppState, String> {
+        AppState::new_with_timing(data_dir, listen, discovery, NetTiming::default())
+    }
+
+    /// `new` with a timing override for tests (shorter stale threshold and start grace). With an
+    /// active profile the tunnel starts first, so the engine's very first connection goes through
+    /// it (or through the blocked stand-in if the profile cannot be started; never direct).
+    pub fn new_with_timing(data_dir: &Path, listen: SocketAddr, discovery: bool, timing: NetTiming) -> Result<AppState, String> {
         std::fs::create_dir_all(data_dir).map_err(|e| e.to_string())?;
         let settings = Settings::load(data_dir);
         let mut warnings = Vec::new();
+        let (net, warning) = start_net(&settings, timing)?;
+        warnings.extend(warning);
+        let (proxy, interface) = net.engine_route(&settings);
         // The whole privacy policy goes into the engine config, so it is in force before the
         // session opens a socket or restores a torrent.
         let blocklist = match &settings.blocklist {
@@ -89,8 +147,8 @@ impl AppState {
             state_dir: data_dir.join("engine"),
             discovery,
             encryption: encryption_mode(&settings),
-            proxy: engine_proxy(&settings),
-            interface: settings.bind_interface.clone().filter(|i| !i.trim().is_empty()),
+            proxy,
+            interface,
             blocklist,
         };
         let engine = Engine::new(cfg).map_err(|e| e.to_string())?;
@@ -112,6 +170,8 @@ impl AppState {
             kill_held: Mutex::new(HashSet::new()),
             pending_update: Mutex::new(None),
             warnings: Mutex::new(warnings),
+            net: Mutex::new(net),
+            timing,
         };
         state.apply_settings()?;
         state.probe_proxy();
@@ -167,22 +227,16 @@ impl AppState {
         self.apply_settings()
     }
 
-    /// Pushes the current settings into the engine and queue: encryption, proxy, queue limits
-    /// and the rate caps (schedule aware).
+    /// Pushes the current settings into the engine and queue: encryption, the tunnel or proxy,
+    /// queue limits and the rate caps (schedule aware).
     fn apply_settings(&self) -> Result<(), String> {
         let s = self.get_settings();
         self.engine.set_encryption(encryption_mode(&s)).map_err(|e| e.to_string())?;
-        self.engine.set_proxy(engine_proxy(&s)).map_err(|e| e.to_string())?;
-        self.engine
-            .set_interface(s.bind_interface.as_deref().map(str::trim).filter(|i| !i.is_empty()))
-            .map_err(|e| e.to_string())?;
+        self.sync_net(&s)?;
         // Saving settings already checked the file; at startup it may have vanished: warn, don't fail.
         let ranges = match &s.blocklist {
             Some(path) => load_blocklist(path).unwrap_or_else(|e| {
-                let mut w = self.warnings.lock().unwrap();
-                if !w.iter().any(|x| x.contains(&e)) {
-                    w.push(format!("Blocklist not loaded: {e}"));
-                }
+                self.warn(format!("Blocklist not loaded: {e}"));
                 Vec::new()
             }),
             None => Vec::new(),
@@ -193,6 +247,46 @@ impl AppState {
         self.apply_limits(chrono::Local::now().naive_local());
         self.probe_proxy();
         Ok(())
+    }
+
+    /// Starts, swaps or stops the tunnel when the active profile changed, then points the engine
+    /// at the route in force. A replaced tunnel is dropped only after the engine uses the new one.
+    fn sync_net(&self, s: &Settings) -> Result<(), String> {
+        let mut net = self.net.lock().unwrap();
+        let mut old = None;
+        if net.profile != s.network.active_profile {
+            let (fresh, warning) = start_net(s, self.timing)?;
+            warning.into_iter().for_each(|w| self.warn(w));
+            old = Some(std::mem::replace(&mut *net, fresh));
+        }
+        let (proxy, interface) = net.engine_route(s);
+        self.engine.set_proxy(proxy).map_err(|e| e.to_string())?;
+        self.engine.set_interface(interface.as_deref()).map_err(|e| e.to_string())?;
+        drop(net);
+        drop(old);
+        Ok(())
+    }
+
+    /// Adds a warning for the UI unless the same one is already there.
+    fn warn(&self, w: String) {
+        let mut ws = self.warnings.lock().unwrap();
+        if !ws.contains(&w) {
+            ws.push(w);
+        }
+    }
+
+    /// The VPN route, or `None` without an active profile.
+    fn route(&self) -> Option<Route> {
+        self.net.lock().unwrap().route(self.timing)
+    }
+
+    /// Whether traffic has its route: the tunnel is up (profile) or the manual proxy answers (or
+    /// there is neither, so there is nothing to lose).
+    fn route_ok(&self, s: &Settings) -> bool {
+        match self.route() {
+            Some(r) => r == Route::Up,
+            None => s.proxy.is_none() || self.proxy_ok.load(Ordering::SeqCst),
+        }
     }
 
     /// Hands the engine the rate caps in force at `now` (global caps, or a schedule block).
@@ -261,11 +355,14 @@ impl AppState {
         }
     }
 
-    /// Checks whether the configured proxy accepts a TCP connection (nothing to check without one).
+    /// Checks whether the configured proxy accepts a TCP connection (nothing to check without one,
+    /// or while a VPN profile is active: then the manual proxy is unused and must not be contacted).
     /// The poller thread calls this every few seconds; the result feeds the kill switch.
     pub fn probe_proxy(&self) {
         use std::net::ToSocketAddrs;
+        let profile = self.route().is_some();
         let ok = match self.get_settings().proxy {
+            _ if profile => true,
             None => true,
             Some(p) => (p.host.as_str(), p.port)
                 .to_socket_addrs()
@@ -277,12 +374,14 @@ impl AppState {
         self.proxy_ok.store(ok, Ordering::SeqCst);
     }
 
-    /// Kill switch: with a proxy set and unreachable, pause every running torrent (as "queued",
-    /// so it reads as held, not user-paused) and keep new ones paused; when the proxy is back,
-    /// release exactly the ones it paused.
+    /// Kill switch (the network lock): with a VPN profile whose tunnel is not up, or a manual proxy
+    /// that is unreachable, pause every running torrent (as "queued", so it reads as held, not
+    /// user-paused) and keep new ones paused; when the route is back, release exactly the ones it
+    /// paused. Before a tunnel's first handshake the route is not up, so restored torrents are
+    /// held on the first tick.
     fn apply_kill_switch(&self, snap: &[TorrentState]) {
         let s = self.get_settings();
-        let want = s.kill_switch && s.proxy.is_some() && !self.proxy_ok.load(Ordering::SeqCst);
+        let want = s.kill_switch && !self.route_ok(&s);
         let mut held = self.kill_held.lock().unwrap();
         if want {
             self.killed.store(true, Ordering::SeqCst);
@@ -305,15 +404,65 @@ impl AppState {
     /// What the UI banners need.
     pub fn status(&self) -> StatusDto {
         let s = self.get_settings();
+        let route = self.route();
         StatusDto {
             version: env!("CARGO_PKG_VERSION").to_string(),
-            proxy_down: s.proxy.is_some() && !self.proxy_ok.load(Ordering::SeqCst),
+            proxy_down: route.is_none() && s.proxy.is_some() && !self.proxy_ok.load(Ordering::SeqCst),
             killed: self.killed.load(Ordering::SeqCst),
             update: self.pending_update.lock().unwrap().as_ref().map(|u| AppUpdateDto { version: u.version.clone(), notes: u.notes.clone() }),
             warnings: self.warnings.lock().unwrap().clone(),
+            route: route.map_or("none", Route::as_str).into(),
+            profile_name: s.network.active_profile.as_deref().and_then(|id| profile_name(&s, id)),
         }
     }
 
+    /// The Network page's status card: route, active profile, handshake age and byte counters.
+    /// Without a profile the route reads `Down` and `profile` is `None`.
+    pub fn network_status(&self) -> NetworkStatusDto {
+        let s = self.get_settings();
+        let net = self.net.lock().unwrap();
+        let stats = net.tunnel.as_ref().map(Tunnel::stats);
+        NetworkStatusDto {
+            route: net.route(self.timing).unwrap_or(Route::Down),
+            profile: net.profile.as_deref().and_then(|id| profile_name(&s, id)),
+            handshake_age_secs: stats.and_then(|t| t.handshake_age).map(|d| d.as_secs()),
+            rx_bytes: stats.map_or(0, |t| t.rx_bytes),
+            tx_bytes: stats.map_or(0, |t| t.tx_bytes),
+            exit_ip: None,
+        }
+    }
+
+    /// The profile Test button (user-initiated only, never called automatically): brings up a
+    /// temporary tunnel for profile `id`, waits up to 15 s for a handshake, then asks
+    /// api.ipify.org through it for the exit IP (best effort: `None` if that fails). The active
+    /// tunnel is not touched; the temporary one is closed on return.
+    pub fn test_profile(&self, id: &str) -> Result<NetworkStatusDto, String> {
+        let s = self.get_settings();
+        let p = s.network.profiles.iter().find(|p| p.id == id).ok_or("no such profile")?;
+        let t = bring_up(p, self.timing)?;
+        let end = Instant::now() + TEST_WAIT;
+        while t.stats().handshake_age.is_none() {
+            if Instant::now() >= end {
+                return Err(format!("no answer from the VPN server {} within 15 seconds", p.endpoint));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        // The reply is untrusted: keep it only if it is an IP address.
+        let exit_ip = http::agent(Some(&socks_of(&t)))
+            .and_then(|a| http::get_bytes(&a, EXIT_IP_URL, 64))
+            .ok()
+            .map(|b| String::from_utf8_lossy(&b).trim().to_string())
+            .filter(|ip| ip.parse::<std::net::IpAddr>().is_ok());
+        let st = t.stats();
+        Ok(NetworkStatusDto {
+            route: Route::Up,
+            profile: Some(p.name.clone()),
+            handshake_age_secs: st.handshake_age.map(|d| d.as_secs()),
+            rx_bytes: st.rx_bytes,
+            tx_bytes: st.tx_bytes,
+            exit_ip,
+        })
+    }
     /// The queue order, first to start first.
     pub fn queue_order(&self) -> Vec<TorrentId> {
         self.queue.lock().unwrap().order().to_vec()
@@ -324,10 +473,19 @@ impl AppState {
         self.queue.lock().unwrap().move_to(id, index as usize);
     }
 
-    /// An HTTP agent that follows the proxy setting. Fails when a proxy is set but known to be
-    /// down, rather than letting a request go out some other way.
+    /// An HTTP agent that follows the route: the tunnel's SOCKS port with a VPN profile (refused
+    /// while the lock is on and the tunnel is not up), else the manual proxy. Fails when that
+    /// route is known to be down, rather than letting a request go out some other way.
     fn http_agent(&self) -> Result<ureq::Agent, String> {
         let s = self.get_settings();
+        let net = self.net.lock().unwrap();
+        if let Some(t) = &net.tunnel {
+            if s.kill_switch && net.route(self.timing) != Some(Route::Up) {
+                return Err(LOCK_HOLDING.into());
+            }
+            return http::agent(Some(&socks_of(t)));
+        }
+        drop(net);
         if s.proxy.is_some() && !self.proxy_ok.load(Ordering::SeqCst) {
             return Err("the proxy is not reachable".into());
         }
@@ -589,14 +747,55 @@ fn encryption_mode(s: &Settings) -> EncryptionMode {
     }
 }
 
-/// The proxy section of the settings in the form the engine takes.
-fn engine_proxy(s: &Settings) -> Option<ProxyConfig> {
-    s.proxy.as_ref().map(|p| ProxyConfig {
+/// A proxy setting (manual, or the tunnel's) in the form the engine takes.
+fn engine_proxy(p: Option<&ProxySettings>) -> Option<ProxyConfig> {
+    p.map(|p| ProxyConfig {
         host: p.host.clone(),
         port: p.port,
         username: p.username.clone().filter(|u| !u.is_empty()),
         password: p.password.clone(),
     })
+}
+
+/// The tunnel's local SOCKS5 port and credentials as proxy settings (for the engine and HTTP).
+fn socks_of(t: &Tunnel) -> ProxySettings {
+    let (addr, c) = (t.socks_addr(), t.credentials());
+    ProxySettings { host: addr.ip().to_string(), port: addr.port(), username: Some(c.username), password: Some(c.password) }
+}
+
+/// The name of profile `id`, if it exists.
+fn profile_name(s: &Settings, id: &str) -> Option<String> {
+    s.network.profiles.iter().find(|p| p.id == id).map(|p| p.name.clone())
+}
+
+/// Brings up the tunnel for one profile: opens the sealed config, parses it and connects to the
+/// endpoint resolved at import (so no DNS lookup happens here). Errors never contain key material.
+fn bring_up(p: &Profile, timing: NetTiming) -> Result<Tunnel, String> {
+    let text = secret::open(&p.sealed_conf)?;
+    let cfg = parse_conf(&text).map_err(|e| e.to_string())?;
+    let endpoint: SocketAddr = p.endpoint_ip.parse().map_err(|_| "the saved endpoint address is damaged".to_string())?;
+    Tunnel::up_with_rekey(&cfg, endpoint, timing.rekey_age()).map_err(|e| e.to_string())
+}
+
+/// The network state for settings `s`: no tunnel without an active profile, else its tunnel, or
+/// `Tunnel::blocked()` when it cannot be started (never a direct route). A failure comes back as
+/// a warning naming the profile. Only failing to open even the blocked port is an error.
+fn start_net(s: &Settings, timing: NetTiming) -> Result<(Net, Option<String>), String> {
+    let mut net = Net { profile: s.network.active_profile.clone(), tunnel: None, blocked: false, started: Instant::now() };
+    let Some(id) = net.profile.clone() else { return Ok((net, None)) };
+    let p = s.network.profiles.iter().find(|p| p.id == id);
+    match p.ok_or_else(|| "the profile does not exist".to_string()).and_then(|p| bring_up(p, timing)) {
+        Ok(t) => {
+            net.tunnel = Some(t);
+            Ok((net, None))
+        }
+        Err(e) => {
+            net.tunnel = Some(Tunnel::blocked().map_err(|e| format!("could not start the network lock: {e}"))?);
+            net.blocked = true;
+            let name = p.map_or(id.as_str(), |p| p.name.as_str());
+            Ok((net, Some(format!("VPN profile \"{name}\" could not be started, so nothing can connect: {e}"))))
+        }
+    }
 }
 
 /// Reads and parses a blocklist file, refusing one that is too big.
