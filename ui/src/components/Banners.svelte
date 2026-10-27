@@ -2,6 +2,7 @@
      switch, a newer Nyx, and startup warnings. State comes from the backend status (polled by App). -->
 <script lang="ts">
   import { api } from '../lib/api';
+  import { routeText } from '../lib/network';
   import { appStatus } from '../lib/store';
 
   let installing = $state(false);
@@ -28,7 +29,11 @@
 </script>
 
 {#if $appStatus}
-  {#if $appStatus.killed}
+  {#if $appStatus.killed && $appStatus.route !== 'none'}
+    <div class="banner bad" role="alert">
+      <b>VPN {routeText($appStatus.route).toLowerCase()}.</b> Every torrent is paused and web requests are blocked until it is back, so nothing can connect around it.
+    </div>
+  {:else if $appStatus.killed}
     <div class="banner bad" role="alert">
       <b>Proxy unreachable.</b> Every torrent is paused until it is back, so nothing can connect around it.
     </div>

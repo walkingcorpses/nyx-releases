@@ -32,6 +32,7 @@ function base(): Settings {
     default_save_dir: 'D:\\Downloads', start_minimized: false, minimize_to_tray: true,
     kill_switch: true, bind_interface: null, blocklist: null, check_updates: false,
     rss: { feeds: [], interval_minutes: 30 }, search_url: '',
+    network: { active_profile: null, rotation: { enabled: false, pool: [], min_minutes: 5, max_minutes: 10 } },
   };
 }
 

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-rotate-now"
+description = "Enables the rotate_now command without any pre-configured scope."
+commands.allow = ["rotate_now"]
+
+[[permission]]
+identifier = "deny-rotate-now"
+description = "Denies the rotate_now command without any pre-configured scope."
+commands.deny = ["rotate_now"]

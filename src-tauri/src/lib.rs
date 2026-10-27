@@ -126,6 +126,13 @@ pub fn run() {
             commands::rss_run_now,
             commands::search,
             commands::fetch_torrent_url,
+            commands::list_profiles,
+            commands::import_profile,
+            commands::rename_profile,
+            commands::delete_profile,
+            commands::test_profile,
+            commands::get_network_status,
+            commands::rotate_now,
         ])
         .on_window_event(|window, event| {
             // Close button: hide to the tray when that setting is on, otherwise let the app exit.
