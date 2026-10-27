@@ -38,6 +38,8 @@ COPY . .
 RUN cargo build --release -p nyx-daemon
 # The daemon's tests run as a build step: a failing test fails the image build.
 RUN cargo test -p nyx-daemon
+# Linux-only path rules the daemon relies on (the Windows dev machine never runs these).
+RUN cargo test -p nyx-app --lib checked_save_dir
 
 # ---- runtime stage -----------------------------------------------------------------------------
 # Only the binary. libtorrent/boost/openssl are linked in statically; libstdc++ and glibc come

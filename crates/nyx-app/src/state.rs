@@ -4,7 +4,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::path::{Component, Path, PathBuf, Prefix};
+use std::path::{Component, Path, PathBuf};
+#[cfg(windows)]
+use std::path::Prefix;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -895,6 +897,9 @@ pub fn checked_save_dir(raw: &str) -> Result<PathBuf, String> {
     }
     let mut comps = p.components();
     let mut base = PathBuf::new();
+    // Windows paths start with a drive prefix; Unix paths (the Linux daemon in the leak lab) have
+    // none and start at the root directory checked below.
+    #[cfg(windows)]
     match comps.next() {
         Some(Component::Prefix(pre)) if matches!(pre.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_)) => {
             base.push(pre.as_os_str());
@@ -948,12 +953,23 @@ mod tests {
         assert_eq!(st.route(), Some(Route::Down), "the apply used its stale copy of the settings");
     }
 
+    /// On Linux (the lab daemon) a plain absolute path is a valid save folder; `..` is still refused.
+    #[cfg(not(windows))]
+    #[test]
+    fn checked_save_dir_accepts_unix_paths() {
+        assert_eq!(checked_save_dir("/data/dl").unwrap(), PathBuf::from("/data/dl"));
+        assert!(checked_save_dir("/data/../etc").is_err());
+        assert!(checked_save_dir("data/dl").is_err());
+    }
+
+    #[cfg(windows)]
     #[test]
     fn checked_save_dir_accepts_normal_paths() {
         assert_eq!(checked_save_dir("D:\\Downloads\\Films").unwrap(), PathBuf::from("D:\\Downloads\\Films"));
         assert_eq!(checked_save_dir("D:\\").unwrap(), PathBuf::from("D:\\"));
     }
 
+    #[cfg(windows)]
     #[test]
     fn checked_save_dir_rejects_unsafe_paths() {
         for bad in ["downloads", "D:downloads", "D:\\a\\..\\..\\Windows", "D:\\CON", "\\\\srv\\share\\x", "D:\\x.", "/abs"] {
