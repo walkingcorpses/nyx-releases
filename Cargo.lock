@@ -2457,6 +2457,7 @@ name = "nyx-tunnel"
 version = "1.0.0"
 dependencies = [
  "base64 0.22.1",
+ "rand 0.9.5",
 ]
 
 [[package]]
