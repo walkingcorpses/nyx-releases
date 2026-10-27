@@ -75,6 +75,17 @@ Nyx is built so that "private" is the default, and where it can only go so far, 
 
 **What was tested.** Nyx is tested against the real protocol, not just mocked: sessions seeding to each other on loopback, a plaintext-only peer that forced mode must refuse, a SOCKS5 test server that proves peer connections, UDP tracker announces and inbound connections behave as promised (and that nothing leaks when the proxy is down), plus a real download through the proxy from a public swarm. One thing is *not* covered by an automated test: the adapter binding was only tested against an adapter that does not exist, not a live VPN.
 
+## Built-in VPN (WireGuard)
+
+Settings > Network lets you use a VPN without installing anything else and without admin rights.
+
+- **Import a WireGuard config** (the `.conf` file your provider gives you). Nyx runs the tunnel inside the app, so **only Nyx's traffic** goes through it. Your private key is stored encrypted for your Windows account and is never shown again.
+- **Network lock.** If the VPN is not really connected, every torrent is paused and web requests (RSS, search, update check) are blocked. Nyx judges "connected" by a handshake that *it* started and the server completed, not by packets merely arriving, so a half-working connection does not count. On start the lock holds until the first handshake.
+- **Rotation (off by default).** Pick two or more profiles and Nyx switches between them every 5 to 10 minutes (you choose the range). The new tunnel is brought up first, and only then does Nyx move over. If it cannot connect, the lock holds; Nyx never falls back to the old route or to a direct connection. Each switch also gives the torrent engine a new peer ID and tracker key, so sessions cannot be linked across servers. Switching resets your peer connections, and some private trackers ban for changing IP, so leave rotation off for those.
+- **What this does not do.** Other peers in a swarm still see your VPN exit address, and your VPN provider can still see your traffic. Tor is not included yet. The tunnel carries no inbound connections, so you only connect out.
+
+**Proof, not promises.** The repo has a leak lab (`lab/`): Docker containers with Nyx clients, VPN exits, a tracker, seeders and a packet capture on each client. It checks that the only thing leaving the client is WireGuard to the active server, that no server ever sees the real address, that the lock holds when the tunnel is cut (one way, both ways, for minutes), during rotation and across crashes, and that nothing identifies the client between rotations. A deliberate-leak control proves the lab can see leaks. Run it with `labun.ps1` (about 15 minutes, needs Docker). It does not cover your VPN provider's logging, timing correlation by peers, or Windows-only behaviour such as adapter binding.
+
 ## Automation (all optional)
 
 <p align="center">

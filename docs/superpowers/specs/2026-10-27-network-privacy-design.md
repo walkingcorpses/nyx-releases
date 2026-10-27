@@ -1,7 +1,7 @@
 # Nyx: Network Privacy (VPN, Rotation, Tor, Leak Lab) Design Spec
 
 Date: 2026-10-27
-Status: Draft, awaiting owner review.
+Status: Approved. Plan 1 implemented (VPN tunnel, network lock, rotation, identity rotation, UI, leak lab). Tor metadata routing and the `pktmon` smoke test are still to do.
 
 ## 1. Purpose
 
