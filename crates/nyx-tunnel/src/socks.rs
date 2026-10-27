@@ -26,11 +26,10 @@ pub enum Target {
 pub trait Stream: Read + Write + Send {
     /// Second handle to the same stream so each relay direction owns one.
     fn try_clone_box(&self) -> io::Result<Box<dyn Stream>>;
-    /// Unblock readers on every handle and close the stream. Default does nothing, which would
-    /// leave a relay thread parked until the far end closes, so real backends should override it.
-    fn shutdown(&self) -> io::Result<()> {
-        Ok(())
-    }
+    /// Unblock readers on every handle and close the stream. Required (no default): the relay
+    /// relies on it to wake the backend-read thread when the client goes away, otherwise that
+    /// thread and its connection slot would leak until the far end closes.
+    fn shutdown(&self) -> io::Result<()>;
 }
 
 /// One UDP association's channel through the backend.
@@ -38,6 +37,8 @@ pub trait UdpPort: Send {
     /// Send a payload to `to` through the tunnel.
     fn send_to(&self, payload: &[u8], to: &Target) -> io::Result<()>;
     /// Wait up to `timeout` for a datagram; `None` means nothing arrived in time.
+    /// `Duration::ZERO` must NOT block: it returns `Ok(None)` at once if nothing is ready. The
+    /// relay uses that to drain a burst without sleeping between datagrams.
     fn recv(&self, buf: &mut [u8], timeout: Duration) -> io::Result<Option<(usize, SocketAddr)>>;
 }
 
@@ -59,6 +60,8 @@ pub struct SocksServer {
     addr: SocketAddr,
     creds: Credentials,
     shutdown: Arc<AtomicBool>,
+    /// Live connection count, exposed through `active_connections`.
+    active: Arc<AtomicUsize>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -79,7 +82,7 @@ impl SocksServer {
         let creds = Credentials { username: random_token(), password: random_token() };
         let shutdown = Arc::new(AtomicBool::new(false));
         let active = Arc::new(AtomicUsize::new(0));
-        let (flag, c) = (shutdown.clone(), creds.clone());
+        let (flag, c, counter) = (shutdown.clone(), creds.clone(), active.clone());
         let thread = thread::Builder::new().name("socks-accept".into()).spawn(move || {
             for conn in listener.incoming() {
                 if flag.load(Ordering::SeqCst) {
@@ -90,11 +93,11 @@ impl SocksServer {
                     thread::sleep(Duration::from_millis(50));
                     continue;
                 };
-                if active.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
-                    active.fetch_sub(1, Ordering::SeqCst);
+                if counter.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
+                    counter.fetch_sub(1, Ordering::SeqCst);
                     continue; // dropping `conn` closes it
                 }
-                let guard = ConnGuard(active.clone());
+                let guard = ConnGuard(counter.clone());
                 let (backend, c) = (backend.clone(), c.clone());
                 // If spawn fails the closure (and its guard) is dropped, releasing the slot.
                 let _ = thread::Builder::new().name("socks-conn".into()).spawn(move || {
@@ -103,12 +106,17 @@ impl SocksServer {
                 });
             }
         })?;
-        Ok(SocksServer { addr, creds, shutdown, thread: Some(thread) })
+        Ok(SocksServer { addr, creds, shutdown, active, thread: Some(thread) })
     }
 
     /// Address clients connect to.
     pub fn addr(&self) -> SocketAddr {
         self.addr
+    }
+
+    /// Number of client connections currently being served (handshake or relaying).
+    pub fn active_connections(&self) -> usize {
+        self.active.load(Ordering::SeqCst)
     }
 
     /// The credentials clients must use.
@@ -333,39 +341,70 @@ fn udp_associate(mut ctl: TcpStream, backend: &dyn Backend, announced_port: u16)
     Ok(())
 }
 
+/// Most datagrams drained per direction per pass, so a flood on one side cannot starve the other
+/// side or delay noticing the stop flag.
+const DRAIN_CAP: usize = 256;
+
+/// Forwards one datagram that arrived on the relay socket to the backend, if it came from the
+/// associated client (control peer's IP, announced or first-used port); anything else is dropped.
+fn client_datagram(d: &[u8], from: SocketAddr, peer_ip: IpAddr, client_port: &mut Option<u16>, port: &dyn UdpPort) {
+    if from.ip() == peer_ip && client_port.is_none_or(|p| p == from.port()) {
+        *client_port = Some(from.port());
+        if let Some((target, payload)) = parse_udp(d) {
+            let _ = port.send_to(payload, &target);
+        }
+    }
+}
+
 /// Shuttles datagrams between the client's UDP socket and the backend until `stop` is set.
-/// Only the control peer's IP, and the announced (or first-used) source port, is accepted.
-/// Single loop with short polls because `UdpPort` is only `Send`, so it cannot be shared by threads.
+/// Each pass drains both sides without blocking (up to `DRAIN_CAP` each) and only sleeps, on the
+/// client socket for `UDP_POLL`, when both were empty, so bursts are not rate-limited by the poll.
+/// Single loop because `UdpPort` is only `Send`, so it cannot be shared by two threads.
 fn udp_loop(sock: UdpSocket, port: Box<dyn UdpPort>, peer_ip: IpAddr, announced: u16, stop: Arc<AtomicBool>) {
     let mut client_port = (announced != 0).then_some(announced);
     let mut buf = vec![0u8; 65536];
     let mut inbuf = vec![0u8; 65536];
-    if sock.set_read_timeout(Some(UDP_POLL)).is_err() {
-        return;
-    }
     while !stop.load(Ordering::SeqCst) {
-        // Client -> backend.
-        match sock.recv_from(&mut buf) {
-            Ok((n, from)) => {
-                if from.ip() == peer_ip && client_port.is_none_or(|p| p == from.port()) {
-                    client_port = Some(from.port());
-                    if let Some((target, payload)) = parse_udp(&buf[..n]) {
-                        let _ = port.send_to(payload, &target);
+        let mut busy = false;
+        // Client -> backend, non-blocking drain.
+        if sock.set_nonblocking(true).is_err() {
+            return;
+        }
+        for _ in 0..DRAIN_CAP {
+            match sock.recv_from(&mut buf) {
+                Ok((n, from)) => {
+                    busy = true;
+                    client_datagram(&buf[..n], from, peer_ip, &mut client_port, port.as_ref());
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                // Windows reports an ICMP port-unreachable as a reset on the next recv; ignore it.
+                Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {}
+                Err(_) => return,
+            }
+        }
+        // Backend -> client, non-blocking drain (ZERO timeout must not block).
+        for _ in 0..DRAIN_CAP {
+            match port.recv(&mut inbuf, Duration::ZERO) {
+                Ok(Some((n, src))) => {
+                    busy = true;
+                    if let Some(p) = client_port {
+                        let _ = sock.send_to(&wrap_udp(src, &inbuf[..n]), (peer_ip, p));
                     }
                 }
+                Ok(None) => break,
+                Err(_) => return,
             }
-            // Timeout is the normal idle case; Windows also reports ICMP port-unreachable as a reset.
-            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::ConnectionReset) => {}
-            Err(_) => return,
         }
-        // Backend -> client.
-        match port.recv(&mut inbuf, UDP_POLL) {
-            Ok(Some((n, src))) => {
-                if let Some(p) = client_port {
-                    let _ = sock.send_to(&wrap_udp(src, &inbuf[..n]), (peer_ip, p));
-                }
-            }
-            Ok(None) => {}
+        if busy {
+            continue;
+        }
+        // Both sides idle: wait briefly for a client datagram instead of spinning.
+        if sock.set_nonblocking(false).is_err() || sock.set_read_timeout(Some(UDP_POLL)).is_err() {
+            return;
+        }
+        match sock.recv_from(&mut buf) {
+            Ok((n, from)) => client_datagram(&buf[..n], from, peer_ip, &mut client_port, port.as_ref()),
+            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::ConnectionReset) => {}
             Err(_) => return,
         }
     }
@@ -426,12 +465,53 @@ mod tests {
             }
         }
         fn recv(&self, buf: &mut [u8], timeout: Duration) -> io::Result<Option<(usize, SocketAddr)>> {
-            self.0.set_read_timeout(Some(timeout))?;
-            match self.0.recv_from(buf) {
+            // ZERO must not block (trait rule): peek non-blocking; otherwise wait with a timeout.
+            let r = if timeout.is_zero() {
+                self.0.set_nonblocking(true)?;
+                self.0.recv_from(buf)
+            } else {
+                self.0.set_nonblocking(false)?;
+                self.0.set_read_timeout(Some(timeout))?;
+                self.0.recv_from(buf)
+            };
+            match r {
                 Ok((n, a)) => Ok(Some((n, a))),
                 Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => Ok(None),
                 Err(e) => Err(e),
             }
+        }
+    }
+
+    /// A backend TCP stream whose far end never closes by itself: reads block until `shutdown`
+    /// is called on any handle. Proves the relay releases its thread via `shutdown`, not via EOF.
+    #[derive(Clone, Default)]
+    struct HangStream(Arc<(Mutex<bool>, std::sync::Condvar)>);
+    impl Read for HangStream {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            let (m, cv) = &*self.0;
+            let mut closed = m.lock().unwrap();
+            while !*closed {
+                closed = cv.wait(closed).unwrap();
+            }
+            Ok(0)
+        }
+    }
+    impl Write for HangStream {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    impl Stream for HangStream {
+        fn try_clone_box(&self) -> io::Result<Box<dyn Stream>> {
+            Ok(Box::new(self.clone()))
+        }
+        fn shutdown(&self) -> io::Result<()> {
+            *self.0 .0.lock().unwrap() = true;
+            self.0 .1.notify_all();
+            Ok(())
         }
     }
 
@@ -442,10 +522,15 @@ mod tests {
         seen: Mutex<Vec<Target>>,
         domain_to: Option<SocketAddr>,
         fail_with: Option<io::ErrorKind>,
+        /// Hand out a `HangStream` (far end never closes) instead of a real connection.
+        hang: bool,
     }
     impl Backend for TestBackend {
         fn connect_tcp(&self, t: &Target) -> io::Result<Box<dyn Stream>> {
             self.seen.lock().unwrap().push(t.clone());
+            if self.hang {
+                return Ok(Box::new(HangStream::default()));
+            }
             if let Some(k) = self.fail_with {
                 return Err(io::Error::from(k));
             }
@@ -733,6 +818,68 @@ mod tests {
         assert!(ca.username.len() >= 24 && ca.password.len() >= 24);
         assert_ne!(ca.password, cb.password);
         assert!(a.addr().ip().is_loopback());
+    }
+
+    #[test]
+    fn relay_releases_its_slot_when_client_closes_but_backend_stays_open() {
+        let (srv, _b) = start(TestBackend { hang: true, ..Default::default() });
+        let mut c = client(&srv);
+        let (code, _) = request(&mut c, &srv, 1, &v4("127.0.0.1:9".parse().unwrap()));
+        assert_eq!(code, 0);
+        assert_eq!(srv.active_connections(), 1);
+        drop(c);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while srv.active_connections() != 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(srv.active_connections(), 0, "slot leaked: backend read thread never woke");
+    }
+
+    #[test]
+    fn udp_burst_is_not_rate_capped() {
+        const N: usize = 500;
+        let (srv, _b) = start(TestBackend::default());
+        let cu = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let (_ctl, relay) = associate(&srv, &cu);
+        let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let remote_addr = remote.local_addr().unwrap();
+
+        // Client -> backend: a receiver thread counts datagrams (and learns the backend's socket
+        // address from the sender) while the main thread blasts N datagrams with no pacing.
+        remote.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let rx = thread::spawn(move || {
+            let (mut got, mut from, mut buf) = (0, None, [0u8; 64]);
+            let end = Instant::now() + Duration::from_secs(2);
+            while got < N && Instant::now() < end {
+                if let Ok((_, f)) = remote.recv_from(&mut buf) {
+                    got += 1;
+                    from = Some(f);
+                }
+            }
+            (got, from, remote)
+        });
+        for i in 0..N {
+            cu.send_to(&udp_wrap(remote_addr, &(i as u16).to_be_bytes()), relay).unwrap();
+        }
+        let (got, from, remote) = rx.join().unwrap();
+        assert_eq!(got, N, "client->backend lost or delayed datagrams");
+
+        // Backend -> client: the remote injects N datagrams towards the backend's socket.
+        cu.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let crx = thread::spawn(move || {
+            let (mut got, mut buf) = (0, [0u8; 64]);
+            let end = Instant::now() + Duration::from_secs(2);
+            while got < N && Instant::now() < end {
+                if cu.recv_from(&mut buf).is_ok() {
+                    got += 1;
+                }
+            }
+            got
+        });
+        for i in 0..N {
+            remote.send_to(&(i as u16).to_be_bytes(), from.unwrap()).unwrap();
+        }
+        assert_eq!(crx.join().unwrap(), N, "backend->client lost or delayed datagrams");
     }
 
     #[test]
