@@ -127,8 +127,6 @@ private:
     std::string listen_;  // configured listen_interfaces, restored when a proxy is removed
     mutable std::string iface_;   // adapter binding, empty = none
     mutable bool proxied_ = false;
-    // No earlier session of this process had this session's address (see first_use in shim.cpp).
-    bool new_address_ = false;
     std::string listen_value() const;
     void schedule_reannounce() const;
     mutable std::vector<std::chrono::steady_clock::time_point> reannounce_;  // guarded by mu_  // listen_interfaces for the current proxy/adapter state

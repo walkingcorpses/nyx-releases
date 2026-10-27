@@ -67,6 +67,13 @@ pub struct Engine {
     state_dir: PathBuf,
 }
 
+/// A session swapped out by `rotate_identity`, on its way to the thread that destroys it.
+struct Retired(UniquePtr<ffi::Session>);
+
+// SAFETY: nothing else references a retired session (it left the RwLock), and its destructor only
+// stops its own alert thread and lt::session, which may be destroyed from any thread.
+unsafe impl Send for Retired {}
+
 // SAFETY: lt::session is documented thread-safe, every Session method is const and goes
 // through its API, and our own state sits behind a Mutex.
 unsafe impl Send for Engine {}
@@ -110,16 +117,20 @@ impl Engine {
     /// adapter, encryption and limits from its first socket) and its torrents' resume data
     /// (progress, paused flags, limits, priorities); categories and queue holds live here and stay.
     /// The old session is silenced before anything is saved (its stopped announces cannot reach
-    /// a tracker) and torn down after the swap, outside the lock. Blocks other engine calls for
-    /// the save and the rebuild (normally well under a second, at most the 5 s resume wait). On
+    /// a tracker) and torn down after the swap on a short-lived thread: libtorrent's teardown
+    /// takes 0.1 to 1 s and the rotation timer runs on the poller's tick. Blocks other engine
+    /// calls for the save and the rebuild (about 0.1 s in tests, at most the 5 s resume wait). On
     /// error nothing changes: the old session is restored as it was, still on its proxy.
     pub fn rotate_identity(&self) -> Result<(), EngineError> {
         let old = {
             let mut ses = self.inner.write().unwrap();
             let fresh = ses.respawn(5000)?;
-            std::mem::replace(&mut *ses, fresh)
+            Retired(std::mem::replace(&mut *ses, fresh))
         };
-        drop(old);
+        std::thread::spawn(move || {
+            let r = old;
+            drop(r.0);
+        });
         Ok(())
     }
 
