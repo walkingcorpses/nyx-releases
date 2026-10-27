@@ -20,6 +20,9 @@ then tears the lab down. The exit code is the runner's: non-zero if any check fo
 scenario could not run, or the positive control was not fully detected. A full run takes about
 12 minutes.
 
+Dev runs of a subset: set `LAB_ONLY=<scenario>[,<scenario>]` before the script (cold_start and
+the positive control always run), e.g. `$env:LAB_ONLY='tunnel_killed_midtransfer'; lab\run.ps1`.
+
 The lab runs detached (not `up --abort-on-container-exit`) because scenarios stop and restart
 the client daemon and stop the capture sidecar before the analysis.
 
@@ -93,8 +96,9 @@ The report separates scenarios that could not run (infrastructure failures) from
 - `tunnel_killed_midtransfer`: exit A drops the client's WireGuard (`iptables -I INPUT -p udp
   --dport 51820 -j DROP`) mid-download (seeder capped at 256 KiB/s). After the kill only WireGuard
   to exit A may leave; every torrent must read held (`queued`, `status.killed`) within the stale
-  threshold + 10 s; after the drop is lifted the route must be up and the torrent released within
-  60 s.
+  threshold + 10 s and stay held until the drop is lifted; after that the route must be up, the
+  torrent released AND rx bytes or the torrent's progress must grow past their values at the
+  restore, within 60 s (state flags alone do not prove recovery).
 - `shutdown_and_crash`: a clean `shutdown` and a restart; then SIGKILL of the daemon mid-download
   (a crash: the container and its capture stay up) and a restart. Each restart must be a clean
   cold start; the crashed download must finish.

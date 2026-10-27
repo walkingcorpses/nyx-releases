@@ -220,6 +220,16 @@ def check_kill_timing(pcap, kill_time, allowed_endpoints, stale_after_s, held_at
     return out
 
 
+def recovered(at_restore, sample):
+    """True when `sample` (route, killed, status, rx, progress after the drop was lifted) shows the
+    tunnel really back: route up, lock off, torrent not held, AND positive evidence: rx bytes or
+    the torrent's progress grew past `at_restore` ({rx, progress}). The state flags alone can be
+    true without any recovery (the lock may have released while still cut, finding F1)."""
+    state_ok = sample["route"] == "up" and not sample["killed"] and sample["status"] != "queued"
+    grew = sample["rx"] > at_restore["rx"] or sample["progress"] > at_restore["progress"]
+    return state_ok and grew
+
+
 def check_recovery(restore_time, recovered_at, within_s, scenario):
     """After the drop is lifted (`restore_time`) the tunnel must be back, route up and torrents
     released (`recovered_at`, None = never), within `within_s`."""

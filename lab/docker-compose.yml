@@ -123,6 +123,8 @@ services:
     image: nyx-lab/runner
     build: { context: ., dockerfile: images/runner/Dockerfile }
     network_mode: none
+    # LAB_ONLY=<scenario>[,<scenario>]: dev runs of a subset (cold_start and the control always run).
+    environment: { LAB_ONLY: "${LAB_ONLY:-}" }
     volumes:
       - "/var/run/docker.sock:/var/run/docker.sock"
       - "labout:/out"

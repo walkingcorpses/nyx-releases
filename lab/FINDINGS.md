@@ -17,36 +17,58 @@ and does not touch app code.
 | metadata_requests | yes | canary saw rss 1, search 1, update check (:443) 1 requests, all from 10.88.0.10 |
 | bait | yes | bait served; the redirect to the canary by IP was followed 2x, from 10.88.0.10; no bait peer dialled outside the tunnel |
 | discovery_attempts | yes | 90 s dwell, discovery at its default (on) |
-| tunnel_killed_midtransfer | yes | killed at 4%; held after 14.9 s (stale 20 s + 10 s allowed); 78 WireGuard packets dropped; recovered 0.2 s after the drop was lifted |
+| tunnel_killed_midtransfer | yes | killed at 4%; held after 14.9 s (stale 20 s + 10 s allowed); 78 WireGuard packets dropped; recovery not proven in this run (see below) |
 | shutdown_and_crash | yes | clean shutdown: back up in 0.8 s, 5 torrents restored; SIGKILL at 3%: back up in 0.7 s, download finished, SHA-256 verified |
 | ipv6_icmp_broadcast | yes | client has fd77::a and an IPv6 default route; 8 MB downloaded, 20 s dwell |
 | positive_control | yes | all 6 deliberate leaks detected (TCP tracker, DNS, UDP exit A :9999, UDP over IPv6 to fd77::1, tracker and dns identity) |
 
 ## Findings (leaks) for Task 12
 
-### F1. The network lock releases while the tunnel is still cut (kill_timing)
+### F1. A half-finished handshake counts as a live tunnel: the lock releases while still cut (kill_timing)
 
-- Scenario: `tunnel_killed_midtransfer`, window "killed" (exit A drops every WireGuard packet
-  from the client: `iptables -I INPUT -p udp --dport 51820 -j DROP`).
+- Scenario: `tunnel_killed_midtransfer`, window "killed". The lab cut is ONE-WAY: exit A drops
+  the client's WireGuard packets (`iptables -I INPUT -p udp --dport 51820 -j DROP` on wg-exit-a),
+  but exit A can still send to the client.
 - Evidence (run 3), samples taken once a second after the torrents were held, as (seconds after
   the kill, `status.killed`, `network_status.route`, `handshake_age_secs`):
   `(15, True, up, 0), (16, False, up, 1), (17, False, up, 2), (18, False, up, 3), (20, False, up, 4),
   (21, False, up, 0), (22, False, up, 1), (23, False, up, 2), (24, False, up, 3)`.
   Report line: `kill_timing | tunnel_killed_midtransfer (killed) | lock released while the tunnel was
   still cut: 8 of 9 samples, first 16.3 s after the kill (route up, handshake age 1 s)`.
-  Run 2 showed the same ("route then up" right after the hold).
-- Meaning: the lock holds once (at 14.9 s, inside the 30 s deadline), then the route reads `up`
-  again with a handshake age that restarts at 0 about every 5 s, although no packet reaches the
-  exit and no handshake can complete. The kill switch releases the torrents into a dead tunnel.
-  Nothing leaked on the wire (the capture holds only WireGuard to exit A in this window), but the
-  lock and the UI status are wrong, and any route that depends on "up" is trusted while dead.
-- Suspected cause: `nyx-tunnel/src/tunnel.rs` `Wire::publish` copies boringtun's
-  `tunn.stats()` handshake age into `handshake_at`. That age appears to follow handshake
-  *initiations* (boringtun retries every 5 s, REKEY_TIMEOUT; `Wire::tick` also sends
-  initiations at the rekey age), not completed handshakes. `NetTiming::evaluate`
-  (`nyx-app/src/netlock.rs`) then sees a fresh handshake. Fix in Task 12: record the time of the
-  last *completed* handshake (a response received / session established) and evaluate staleness
-  against that.
+  The kill-only rerun after the review gave the same picture: `(15, True, stale, 20), (16, False, up, 0),
+  ... (21, False, up, 0), ...`. Run 2 showed it too ("route then up" right after the hold).
+- Meaning: the lock holds once, inside the 30 s deadline. Then the route reads `up` again, with a
+  handshake age that restarts at 0 about every 5 s, although no packet from the client reaches
+  exit A. The kill switch releases the torrents into a dead tunnel. Nothing leaked on the wire
+  (only WireGuard to exit A in this window), but the lock and the UI status are wrong.
+- Mechanism (from boringtun 0.7.1's source, checked in the Task 11 review):
+  - `noise/timers.rs:314` `time_since_last_handshake` is now minus `TimeSessionEstablished`
+    whenever the current session slot is filled.
+  - `noise/mod.rs:318-336` `handle_handshake_init`: when the client RECEIVES an initiation,
+    boringtun stores a new responder session and calls `timer_tick_session_established` before
+    any confirmation from the peer. The client's own initiations do not reset the age.
+  - In the lab, exit A (wireguard-go) still has data queued for the client. After about 15 s
+    without hearing from it, exit A starts initiating and retries every ~5 s (RekeyTimeout).
+  - Each inbound initiation resets the client's handshake age to 0, while the client's response
+    is dropped by the cut. This matches the evidence: age 0 first at ~15 s, then a reset every
+    ~5 s, and only WireGuard on the wire.
+  - So a half-handshake (initiation received, never confirmed) is treated as a live tunnel. A
+    real asymmetric path failure would trigger it for as long as wireguard-go keeps trying to
+    reach the client (up to its ~90 s handshake attempt window).
+- Why the hold fired at 14.9 s, before the 20 s threshold: the threshold counts from the last
+  handshake, not from the kill. The rerun recorded a handshake age of 5 s at the kill and a hold
+  14.8 s after it, which is 20 s - 5 s plus at most the 1 s poll tick.
+- Suggested fix for Task 12:
+  - Judge liveness on authenticated inbound traffic after a CONFIRMED session: the rx counter
+    growing, or data or a keepalive received on the current session, or a completed handshake
+    that the client initiated.
+  - Do NOT rely on "session established" alone (boringtun's `time_since_last_handshake` /
+    `stats()` age, which `nyx-tunnel/src/tunnel.rs` `Wire::publish` copies into
+    `handshake_at` for `NetTiming::evaluate`).
+- Lab follow-ups for Task 12:
+  - Add a both-directions cut variant (drop the client's packets in and out on exit A).
+  - Add a cut that lasts longer than 90 s plus the stale threshold, so the lock is checked
+    after wireguard-go has stopped initiating.
 
 ### F2. ICMP port-unreachable to the VPN endpoint while the daemon is down (egress)
 
@@ -89,8 +111,14 @@ complete. Every window of 30 s or more had WireGuard to exit A and a packet in i
   announces at torrent start fall in the earlier windows (7 torrents were added) and none showed.
   A periodic LSD announce is covered only if one falls inside the run.
 - *Kill timing*: held within the deadline (14.9 s; stale threshold 20 s via the lab-only
-  `NYX_LAB_STALE_AFTER_SECS`), recovered in 0.2 s. Apart from F1, no packet left outside the
-  allowlist while the tunnel was cut.
+  `NYX_LAB_STALE_AFTER_SECS`). Apart from F1, no packet left outside the allowlist while the
+  tunnel was cut.
+- *Recovery*: the baseline's "recovered after 0.2 s" proved nothing. Because of F1 the lock had
+  already released before the drop was lifted, so "route up, not killed, not queued" was true at
+  once. Since the review, recovery needs positive evidence: `rx_bytes` (ctl `network_status`) or
+  the torrent's progress must grow past its value at the restore, within 60 s.
+  Kill-only rerun: recovered 2.5 s after the drop was lifted, with rx 836060 -> 1313557 and
+  progress 4% -> 6%.
 - *Restarts*: both restarts were clean cold starts (only WireGuard to exit A before the route was
   up); restored torrents were held until then.
 - *IPv6/ICMP/broadcast*: with IPv6 on, the client sends only kernel link housekeeping (MLD

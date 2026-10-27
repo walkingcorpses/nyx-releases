@@ -9,7 +9,7 @@ import dpkt
 
 import report
 from analyzer import (CONTROL_SIGNATURES, Finding, capture_live, check_egress, check_identity,
-                      check_kill_timing, check_recovery, count_udp_to, load_logs, split_control)
+                      check_kill_timing, check_recovery, count_udp_to, load_logs, recovered, split_control)
 
 CLIENT_MAC = b"\x02\x42\x0a\x4d\x00\x0a"
 GW_MAC = b"\x02\x42\x0a\x4d\x00\x01"
@@ -230,6 +230,19 @@ class Analyzer(unittest.TestCase):
         self.assertIn("2 of 3", f[0].detail)
         ok = [(1015.0, True, "stale", 21), (1016.0, True, "stale", 22)]
         self.assertEqual(check_kill_timing(p, 1000.0, {EXIT_A}, stale_after_s=20, held_at=1015.0, samples=ok), [])
+
+    def test_recovered_needs_positive_evidence(self):
+        """After the drop is lifted, "route up, not killed, not queued" alone proves nothing (the
+        lock may never have held): recovery needs rx bytes or the torrent's progress to grow past
+        their values at the restore."""
+        at_restore = {"rx": 1000, "progress": 0.30}
+        vacuous = {"route": "up", "killed": False, "status": "downloading", "rx": 1000, "progress": 0.30}
+        self.assertFalse(recovered(at_restore, vacuous))
+        self.assertTrue(recovered(at_restore, dict(vacuous, rx=5000)))
+        self.assertTrue(recovered(at_restore, dict(vacuous, progress=0.31)))
+        self.assertFalse(recovered(at_restore, dict(vacuous, rx=5000, route="stale")))
+        self.assertFalse(recovered(at_restore, dict(vacuous, rx=5000, killed=True)))
+        self.assertFalse(recovered(at_restore, dict(vacuous, rx=5000, status="queued")))
 
     def test_check_recovery(self):
         """After the drop is lifted the tunnel must be back (route up, torrents released) in time."""

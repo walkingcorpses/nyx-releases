@@ -407,6 +407,7 @@ def tunnel_killed_midtransfer(t0):
         seed("kill")
         add(CLIENT, "kill", "/data/dl")
         p = wait_midway("kill")
+        age0 = ctl(CLIENT, {"cmd": "network_status"})["handshake_age_secs"]
         sh("wg-exit-a", "iptables -I " + " ".join(DROP_RULE))
         marks["kill"] = time.time()
         end = marks["kill"] + stale + HELD_WITHIN + 15
@@ -432,20 +433,26 @@ def tunnel_killed_midtransfer(t0):
         dropped = drop_count()
         if dropped == 0:
             raise RuntimeError("the DROP rule on exit A matched no packet: the tunnel was not cut")
+        # Snapshot before lifting the drop: recovery must show rx or progress growing past this.
+        before = {"rx": ctl(CLIENT, {"cmd": "network_status"})["rx_bytes"], "progress": torrent("kill")["progress"]}
         sh("wg-exit-a", "iptables -D " + " ".join(DROP_RULE))
         marks["restore"] = time.time()
-        recovered = None
+        back_at, last = None, None
         end = marks["restore"] + RECOVER_WITHIN + 10
         while time.time() < end:
             ns, st, t = ctl(CLIENT, {"cmd": "network_status"}), ctl(CLIENT, {"cmd": "status"}), torrent("kill")
-            if ns["route"] == "up" and not st["killed"] and t["status"] != "queued":
-                recovered = time.time()
+            last = {"route": ns["route"], "killed": st["killed"], "status": t["status"], "rx": ns["rx_bytes"], "progress": t["progress"]}
+            if analyzer.recovered(before, last):
+                back_at = time.time()
                 break
             time.sleep(1)
-        LAB["findings"].extend(analyzer.check_recovery(marks["restore"], recovered, RECOVER_WITHIN, name))
+        LAB["notes"].append(f"tunnel_killed_midtransfer recovery: at restore {before}; "
+                            f"{'recovered' if back_at else 'last'} sample {last}")
+        LAB["findings"].extend(analyzer.check_recovery(marks["restore"], back_at, RECOVER_WITHIN, name))
         held = f"{marks['held'] - marks['kill']:.1f} s" if marks["held"] else "never"
-        back = f"{recovered - marks['restore']:.1f} s" if recovered else "never"
-        return (f"killed at {p:.0%}; held after {held} (stale {stale} s + {HELD_WITHIN} s allowed); route then "
+        back = (f"{back_at - marks['restore']:.1f} s (rx {before['rx']} -> {last['rx']}, "
+                f"progress {before['progress']:.0%} -> {last['progress']:.0%})") if back_at else "never"
+        return (f"killed at {p:.0%} (handshake age {age0} s); held after {held} (stale {stale} s + {HELD_WITHIN} s allowed); route then "
                 f"{net['route']}; {dropped} WireGuard packets dropped; recovered after {back}")
     finally:
         now = time.time()
@@ -600,12 +607,16 @@ def main():
         wait_for("the client capture to start", lambda: os.path.getsize(PCAP) >= 24, 60)
         print("lab ready", flush=True)
         run("cold_start", cold_start)  # window from 0: the first captured packet, before the daemon runs
+        only = set(filter(None, os.environ.get("LAB_ONLY", "").split(",")))
         for name, fn, kind in (("steady_download", steady_download, "normal"), ("hostname_trackers", hostname_trackers, "normal"),
                                ("metadata_requests", metadata_requests, "normal"), ("bait", bait, "normal"),
                                ("discovery_attempts", discovery_attempts, "normal"),
                                ("tunnel_killed_midtransfer", tunnel_killed_midtransfer, "custom"),
                                ("shutdown_and_crash", shutdown_and_crash, "normal"),
                                ("ipv6_icmp_broadcast", ipv6_icmp_broadcast, "normal")):
+            if only and name not in only:  # LAB_ONLY: dev runs of a subset (cold start and control always run)
+                LAB["notes"].append(f"{name}: skipped (LAB_ONLY)")
+                continue
             run(name, fn, kind)
         t_ctl = LAB["mark"]
         run(CONTROL, positive_control, kind="custom")
