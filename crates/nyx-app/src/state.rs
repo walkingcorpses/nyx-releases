@@ -625,6 +625,9 @@ impl AppState {
         match failed {
             None => Ok(to.id.clone()),
             Some(e) => {
+                // Hold the torrents now, not on the next poller tick: the route reads Down already
+                // (lab finding: one sample showed the lock off right after the failed swap).
+                self.apply_kill_switch(&self.engine.snapshot());
                 let w = format!("VPN profile \"{}\" did not answer when rotating to it, so nothing can connect until the next rotation: {e}", to.name);
                 self.warn(w.clone());
                 Err(w)

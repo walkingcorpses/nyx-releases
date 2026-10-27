@@ -655,6 +655,9 @@ fn rotate_now_with_unreachable_target_holds_torrents_and_never_goes_direct() {
 
     let err = a.rotate_now().unwrap_err();
     assert!(err.contains("Test VPN 2"), "{err}");
+    // Held at once by the failed swap itself, not only on the next poller tick (lab finding).
+    assert!(a.status().killed, "the lock did not hold right after the failed swap");
+    assert_eq!(a.list_torrents()[0].status, "queued");
     let target = TcpListener::bind("127.0.0.1:0").unwrap();
     target.set_nonblocking(true).unwrap();
     a.engine.add_peer(&id, target.local_addr().unwrap()).unwrap();
