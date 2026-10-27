@@ -105,7 +105,9 @@ services:
     cap_add: [NET_ADMIN]  # only for the default routes set in entry.sh, which then drops it
     # NYX_LAB_STALE_AFTER_SECS (lab-only override, read by nyx-daemon only): the network lock calls
     # the tunnel stale after 20 s without a handshake instead of 180 s, for the kill-timing check.
-    environment: { CLIENT_NAME: client-a, NYX_DATA_DIR: /data, NYX_LAB_DEBUG: "1", NYX_LAB_STALE_AFTER_SECS: "20" }
+    # NYX_LAB_ROTATE_SECS (lab-only, nyx-daemon only): a fixed 60 s rotation interval instead of the
+    # settings' minutes, so rotation_swap sees one timer-driven swap; it only matters while rotation is on.
+    environment: { CLIENT_NAME: client-a, NYX_DATA_DIR: /data, NYX_LAB_DEBUG: "1", NYX_LAB_STALE_AFTER_SECS: "20", NYX_LAB_ROTATE_SECS: "60" }
     volumes: ["conf:/conf:ro"]
     networks: { real: { ipv4_address: 10.77.0.10, ipv6_address: "fd77::a" } }
     depends_on: [gateway]

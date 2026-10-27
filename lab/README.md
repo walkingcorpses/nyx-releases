@@ -63,6 +63,10 @@ can stop or kill it and start it again on the same data dir.
 network lock calls the tunnel stale after 20 s without a handshake instead of the production
 180 s, so the kill-timing check does not wait three minutes.
 
+`NYX_LAB_ROTATE_SECS=60` (client only) is a LAB-ONLY override read by `nyx-daemon` alone: while
+rotation is on (only in the rotation scenarios) it rotates every 60 s instead of the settings'
+whole minutes, so `rotation_swap` sees one timer-driven swap.
+
 ## Checks
 
 Every scenario has a time window; the windows are contiguous, so each packet and log line is
@@ -78,6 +82,10 @@ checked once. The capture sidecar is stopped before the analysis, so the pcap is
 - **capture live**: a window of 30 s or more only counts if the capture holds WireGuard to exit A
   in it and a packet in its last 30 s; otherwise the scenario fails (infrastructure).
 - **kill timing**: see `tunnel_killed_midtransfer`.
+- **swap gap**: inside each profile swap (from the `rotate_now` call, or the last reading on the
+  old exit for a timer swap, to 2 s past the swap) only WireGuard to the old or the new exit may
+  leave, plus the housekeeping above. In the rotation scenarios' windows the egress check allows
+  both exits; the port-unreachable allowance stays pinned to each exit's own WireGuard flow.
 
 The report separates scenarios that could not run (infrastructure failures) from findings (leaks).
 
@@ -113,6 +121,14 @@ The report separates scenarios that could not run (infrastructure failures) from
   cold start; the crashed download must finish.
 - `ipv6_icmp_broadcast`: IPv6 is on in the LAN (the client has fd77::a and an IPv6 default
   route). A download must produce no IPv6, ICMP, broadcast or mDNS.
+- `rotation_swap`: rotation on with exits A and B in the pool; during a 40 MB download (seeder
+  capped at 128 KiB/s) `rotate_now` three times (A, B, A, B), then one timer-driven swap. Each
+  swap must reach the other exit and the download's progress must grow again within 45 s; then
+  back to A with rotation off, the download finished and SHA-256 verified.
+- `rotation_failure_holds`: exit B drops the client's WireGuard, so `rotate_now` from A to B must
+  fail (no contact in 15 s). For 15 s after it the lock must hold (route down, torrents `queued`;
+  a `rotation_lock` finding otherwise) with nothing direct; then the drop is lifted and
+  `rotate_now` back to A must get the download moving within 60 s.
 - `positive_control` (last): deliberate leaks from client-a's namespace: TCP to the tracker
   (`/positive-control`), a DNS query for `control.lab` to the lab dns, UDP to exit A on port 9999,
   UDP over IPv6 to fd77::1. All four egress findings and the tracker/dns identity findings

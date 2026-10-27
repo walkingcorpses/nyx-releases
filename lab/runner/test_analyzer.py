@@ -9,12 +9,14 @@ import dpkt
 
 import report
 from analyzer import (CONTROL_SIGNATURES, Finding, capture_live, check_egress, check_identity,
-                      check_kill_timing, check_recovery, count_udp_to, load_logs, recovered, split_control)
+                      check_kill_timing, check_recovery, check_swap_gap, count_udp_to, load_logs, recovered,
+                      split_control)
 
 CLIENT_MAC = b"\x02\x42\x0a\x4d\x00\x0a"
 GW_MAC = b"\x02\x42\x0a\x4d\x00\x01"
 CLIENT_IP = "10.77.0.10"
 EXIT_A = ("10.88.0.10", 51820)
+EXIT_B = ("10.88.0.11", 51820)
 
 
 def ip4(src, dst, proto, payload):
@@ -342,6 +344,44 @@ class Analyzer(unittest.TestCase):
                 f = check_egress(self.pcap(frame), {EXIT_A})
                 self.assertEqual(len(f), 1, f)
                 self.assertIn("ICMP", f[0].detail)
+
+    # ---- Task 14: the swap-gap check (rotation between exits A and B) ----
+
+    def test_swap_packets_to_old_and_new_endpoint_are_clean(self):
+        """During a swap WireGuard to the old (A) and the new (B) endpoint may both leave, and the
+        F2 port unreachable to either endpoint about its own WireGuard datagram stays allowed."""
+        p = self.pcap(udp("10.88.0.10", 45000, 51820), udp("10.88.0.11", 45001, 51820),
+                      self.unreach(dst="10.88.0.11", qsrc="10.88.0.11"), self.unreach())
+        self.assertEqual(check_swap_gap(p, (1000.0, 1003.0), [EXIT_A, EXIT_B]), [])
+
+    def test_swap_packets_to_third_ip_is_a_finding(self):
+        """Anything to a third address inside the swap window is a swap_gap finding."""
+        p = self.pcap(udp("10.88.0.10", 45000, 51820), udp("10.88.0.12", 45000, 51820), udp("10.88.0.11", 45000, 51820))
+        f = check_swap_gap(p, (1000.0, 1002.0), [EXIT_A, EXIT_B], "rotation_swap")
+        self.assertEqual(len(f), 1, f)
+        self.assertEqual((f[0].check, f[0].scenario), ("swap_gap", "rotation_swap"))
+        self.assertIn("10.88.0.12:51820", f[0].detail)
+
+    def test_swap_gap_only_looks_inside_the_window(self):
+        """A packet outside the swap window is for the other checks, not this one."""
+        p = self.pcap(udp("10.88.0.20", 45000, 6969), udp("10.88.0.10", 45000, 51820))
+        self.assertEqual(check_swap_gap(p, (1001.0, 1001.0), [EXIT_A, EXIT_B]), [])
+
+    def test_closed_endpoint_allows_only_its_port_unreachable(self):
+        """After rotating away from exit B its tunnel is closed: B's datagrams still in flight get
+        the F2 port unreachable (allowed via `closed`), but UDP to B stays a finding."""
+        p = self.pcap(self.unreach(dst="10.88.0.11", qsrc="10.88.0.11"))
+        self.assertEqual(check_egress(p, {EXIT_A}, closed={EXIT_B}), [])
+        self.assertEqual(len(check_egress(p, {EXIT_A})), 1)
+        f = check_egress(self.pcap(udp("10.88.0.11", 45000, 51820)), {EXIT_A}, closed={EXIT_B})
+        self.assertEqual(len(f), 1, f)
+
+    def test_swap_gap_port_unreachable_stays_pinned_to_one_endpoint(self):
+        """With both endpoints allowed, an unreachable to A quoting B's datagram is still a finding:
+        each endpoint may only hear about its own WireGuard flow."""
+        f = check_swap_gap(self.pcap(self.unreach(qsrc="10.88.0.11")), (1000.0, 1000.0), [EXIT_A, EXIT_B])
+        self.assertEqual(len(f), 1, f)
+        self.assertIn("ICMP", f[0].detail)
 
 
 class Report(unittest.TestCase):

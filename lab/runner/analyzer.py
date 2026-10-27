@@ -12,7 +12,10 @@ servers themselves. 10.88.0.1 is the NAT gateway's internet-side address, i.e. t
 ISP identity; it, the raw client address or anything else is a finding.
 
 check_kill_timing / check_recovery: the tunnel_killed_midtransfer scenario's checks (nothing but
-WireGuard to the endpoint after the kill, torrents held in time, tunnel back after the drop)."""
+WireGuard to the endpoint after the kill, torrents held in time, tunnel back after the drop).
+
+check_swap_gap: the rotation scenarios' check (inside each profile swap only WireGuard to the old or
+the new endpoint may leave)."""
 import ipaddress
 import json
 import os
@@ -91,8 +94,9 @@ def _reader(f):
     return r
 
 
-def _flow(frame, allowed):
-    """Classifies one Ethernet frame: None if allowed, else a flow key string for the finding."""
+def _flow(frame, allowed, closed=frozenset()):
+    """Classifies one Ethernet frame: None if allowed, else a flow key string for the finding.
+    `closed` endpoints get only the F2 port unreachable, never UDP."""
     eth = dpkt.ethernet.Ethernet(frame)
     pkt = eth.data
     if eth.type == dpkt.ethernet.ETH_TYPE_ARP:
@@ -107,7 +111,7 @@ def _flow(frame, allowed):
         if isinstance(l4, dpkt.tcp.TCP):
             return f"TCP -> {dst}:{l4.dport}{_label(l4.dport)}"
         if isinstance(l4, dpkt.icmp.ICMP):
-            if _wireguard_port_unreachable(frame, allowed):
+            if _wireguard_port_unreachable(frame, set(allowed) | set(closed)):
                 return None
             return f"ICMP type {l4.type} -> {dst}"
         return f"IPv4 proto {pkt.p} -> {dst}"
@@ -122,23 +126,35 @@ def _flow(frame, allowed):
     return f"ethertype 0x{eth.type:04x}"
 
 
-def check_egress(pcap, allowed_endpoints, scenario="", since=0.0, until=float("inf")):
+def check_egress(pcap, allowed_endpoints, scenario="", since=0.0, until=float("inf"), closed=frozenset()):
     """Findings for every packet in `pcap` (path) whose time is in [since, until] and that is not
     UDP to one of `allowed_endpoints` ({(ip, port)}) or housekeeping. One finding per flow, with
-    the packet count and the first time seen."""
+    the packet count and the first time seen. `closed` are endpoints whose tunnel the client
+    closed (rotated away from): only the F2 port unreachable answering that endpoint's own
+    WireGuard datagram may go to them, never UDP."""
     flows = {}
     with open(pcap, "rb") as f:
         for ts, frame in _reader(f):
             if not since <= ts <= until:
                 continue
             try:
-                key = _flow(frame, allowed_endpoints)
+                key = _flow(frame, allowed_endpoints, closed)
             except (dpkt.UnpackError, ValueError) as e:
                 key = f"unparseable frame ({e})"
             if key is not None:
                 first, n = flows.get(key, (ts, 0))
                 flows[key] = (first, n + 1)
     return [Finding("egress", scenario, f"{key}: {n} packets, first at {first:.3f}") for key, (first, n) in flows.items()]
+
+
+def check_swap_gap(pcap, swap_window, endpoints, scenario=""):
+    """The rotation check (Task 14): inside one profile swap, `swap_window` = (since, until), the
+    client may send only WireGuard to the OLD or the NEW endpoint (`endpoints` = [old, new], each
+    (ip, port)) plus check_egress's housekeeping; the F2 port unreachable stays pinned to each
+    endpoint's own WireGuard flow. Anything else (a third address, a direct connection while the
+    tunnels change hands) is a "swap_gap" finding, one per flow."""
+    since, until = swap_window
+    return [f._replace(check="swap_gap") for f in check_egress(pcap, set(endpoints), scenario, since, until)]
 
 
 def count_udp_to(pcap, endpoint, since=0.0, until=float("inf")):

@@ -34,6 +34,12 @@ Scenarios (in run order):
                              restart must be a clean cold start again.
   ipv6_icmp_broadcast        IPv6 is on in the LAN: a download must produce no IPv6, ICMP,
                              broadcast or mDNS traffic.
+  rotation_swap              rotation on (exits A and B in the pool): three rotate_now calls during
+                             a slowed download, then one timer-driven swap (NYX_LAB_ROTATE_SECS);
+                             inside each swap only WireGuard to the old or new exit may leave
+                             (check_swap_gap) and the download must move again after every swap.
+  rotation_failure_holds     exit B drops WireGuard: the swap to B fails, the lock must hold (route
+                             down, torrents held, nothing direct), then rotating to A recovers.
   positive_control (last)    deliberate leaks that the lab must detect, or the run fails "blind"."""
 import base64
 import glob
@@ -60,6 +66,9 @@ EXITS = {"wg-exit-a": "10.88.0.10", "wg-exit-b": "10.88.0.11"}
 EXIT_IPS = set(EXITS.values())
 WG_PORT = 51820
 EXIT_A = (EXITS["wg-exit-a"], WG_PORT)
+EXIT_B = (EXITS["wg-exit-b"], WG_PORT)
+# Profile name (the client's profiles are named after their exits) -> its WireGuard endpoint.
+ENDPOINTS = {name: (ip, WG_PORT) for name, ip in EXITS.items()}
 LAB_DNS = "10.88.0.23"
 MB = 1024 * 1024
 IP_TRACKERS = [["udp://10.88.0.20:6969/announce"], ["http://10.88.0.20:8000/announce"]]
@@ -75,6 +84,8 @@ TORRENTS = {
     "kill3": (20 * MB, 15, IP_TRACKERS),
     "crash": (20 * MB, 12, IP_TRACKERS),
     "v6": (8 * MB, 13, IP_TRACKERS),
+    "rot": (40 * MB, 16, IP_TRACKERS),
+    "rot2": (40 * MB, 17, IP_TRACKERS),
 }
 SLOW = 256 * 1024       # seeder upload cap (B/s) for the mid-transfer scenarios: 20 MB takes ~80 s
 DOWNLOAD_TIMEOUT = 600
@@ -86,10 +97,17 @@ DROP_RULE = ["INPUT", "-p", "udp", "--dport", str(WG_PORT), "-j", "DROP"]
 DROP_OUT_RULE = ["OUTPUT", "-p", "udp", "--sport", str(WG_PORT), "-j", "DROP"]  # with DROP_RULE: both ways
 LONG_CUT = 130          # tunnel_cut_long: > wireguard-go's 90 s of handshake attempts + the 20 s stale threshold
 CONTROL = "positive_control"
+# Rotation scenarios: their windows allow WireGuard to both exits (the client moves between them).
+ROTATION_SCENARIOS = ("rotation_swap", "rotation_failure_holds")
+ROT_SLOW = 128 * 1024   # seeder cap for the rotation scenarios: 40 MB takes ~5 min, longer than every swap
+FLOW_WITHIN = 45        # after a swap the download must make progress again within this
+SWAP_TAIL = 2           # a swap window runs this long past rotate_now's reply (the old tunnel closing)
+LOCK_SAMPLES = 15       # rotation_failure_holds: lock samples (one a second) after the failed swap
 
 # Run state shared by the scenarios: windows are (scenario, since, until, kind) with kind
-# "normal" or "kill" (the kill window's egress is checked by check_kill_timing).
-LAB = {"windows": [], "findings": [], "scenarios": [], "notes": [], "kills": [], "mark": 0.0}
+# "normal" or "kill" (the kill window's egress is checked by check_kill_timing); swaps are
+# (scenario, since, until, [old endpoint, new endpoint]) for check_swap_gap.
+LAB = {"windows": [], "findings": [], "scenarios": [], "notes": [], "kills": [], "swaps": [], "mark": 0.0}
 setup_state = {}
 
 
@@ -394,9 +412,9 @@ def discovery_attempts(_t0):
     return f"{DISCOVERY_DWELL} s dwell, discovery at its default (on); LSD's 5 min interval is longer than the dwell"
 
 
-def drop_count():
-    """Packets the DROP rule on exit A has dropped (proof the kill really cut the path)."""
-    out = sh("wg-exit-a", "iptables -L INPUT -v -n -x")
+def drop_count(service="wg-exit-a"):
+    """Packets the DROP rule on an exit (default A) has dropped (proof the cut really happened)."""
+    out = sh(service, "iptables -L INPUT -v -n -x")
     for line in out.splitlines():
         parts = line.split()
         if "DROP" in parts and f"dpt:{WG_PORT}" in line:
@@ -562,6 +580,148 @@ def ipv6_icmp_broadcast(_t0):
     return f"client has fd77::a; 8 MB in {secs:.0f}s, SHA-256 verified, 20 s dwell"
 
 
+def current_exit():
+    """Name of the profile the client's tunnel runs (profile names are exit names)."""
+    return ctl(CLIENT, {"cmd": "network_status"})["profile"]
+
+
+def set_rotation(enabled, active=None):
+    """Turns rotation on or off with both exits' profiles in the pool (1 minute in the settings;
+    the daemon's NYX_LAB_ROTATE_SECS overrides the interval) and, with `active`, switches to that
+    exit's profile."""
+    ids = {p["name"]: p["id"] for p in ctl(CLIENT, {"cmd": "list_profiles"})}
+    s = ctl(CLIENT, {"cmd": "get_settings"})
+    s["network"]["rotation"] = {"enabled": enabled, "pool": [ids["wg-exit-a"], ids["wg-exit-b"]], "min_minutes": 1, "max_minutes": 1}
+    if active:
+        s["network"]["active_profile"] = ids[active]
+    ctl(CLIENT, {"cmd": "set_settings", "settings": s})
+
+
+def rotate(scenario):
+    """Calls rotate_now (retrying while a timer-driven swap is already running) and records the
+    swap window, from the call to SWAP_TAIL s past the reply, with the old and the new endpoint
+    for check_swap_gap. Returns (exit before, exit after, error text or None, seconds taken)."""
+    end = time.time() + 30
+    while True:
+        old, t = current_exit(), time.time()
+        try:
+            ctl(CLIENT, {"cmd": "rotate_now"}, timeout=60)
+            err = None
+        except RuntimeError as e:
+            err = str(e)
+        if err and "already running" in err and time.time() < end:
+            time.sleep(1)
+            continue
+        took, new = time.time() - t, current_exit()
+        LAB["swaps"].append((scenario, t, time.time() + SWAP_TAIL, [ENDPOINTS[old], ENDPOINTS[new]]))
+        return old, new, err, took
+
+
+def flowing(name):
+    """Waits until the download of torrent `name` moves on the current tunnel: route up, lock off,
+    torrent not held and its progress past the value read now (rx alone is not enough: keepalives
+    grow it too). Returns a short description; raises if it does not move within FLOW_WITHIN s."""
+    before = {"rx": float("inf"), "progress": torrent(name)["progress"]}
+    t0 = time.time()
+
+    def moved():
+        """True once analyzer.recovered holds for a fresh sample."""
+        ns, st, t = ctl(CLIENT, {"cmd": "network_status"}), ctl(CLIENT, {"cmd": "status"}), torrent(name)
+        return analyzer.recovered(before, {"route": ns["route"], "killed": st["killed"], "status": t["status"],
+                                           "rx": ns["rx_bytes"], "progress": t["progress"]}) and t["progress"]
+    p = wait_for(f"{name} to make progress after the swap", moved, FLOW_WITHIN, 1)
+    return f"progress {before['progress']:.0%} -> {p:.0%} after {time.time() - t0:.0f} s"
+
+
+def rotation_swap(_t0):
+    """Rotation on, exits A and B in the pool: three rotate_now calls during a slowed download,
+    then one timer-driven swap. Each must reach the other exit and the download must move again
+    after each; the swaps' windows go to check_swap_gap. Ends back on exit A with rotation off,
+    the download finished and its SHA-256 verified."""
+    rotate_secs = setup_state["rotate_secs"]
+    try:
+        change_settings("seeder", up_limit=ROT_SLOW)
+        seed("rot")
+        add(CLIENT, "rot", "/data/dl")
+        wait_midway("rot")
+        set_rotation(True)
+        done = []
+        for i in range(3):
+            old, new, err, took = rotate("rotation_swap")
+            if err or new == old:
+                raise RuntimeError(f"rotate_now {i + 1} did not swap ({old} -> {new}): {err}")
+            done.append(f"{old} -> {new} in {took:.1f} s, {flowing('rot')}")
+        old, t = current_exit(), time.time()
+        new = wait_for("a timer-driven rotation", lambda: (n := current_exit()) != old and n, rotate_secs + 30, 0.5)
+        LAB["swaps"].append(("rotation_swap", t, time.time() + SWAP_TAIL, [ENDPOINTS[old], ENDPOINTS[new]]))
+        done.append(f"timer: {old} -> {new} after {time.time() - t:.0f} s (interval {rotate_secs} s), {flowing('rot')}")
+    finally:
+        set_rotation(False, active="wg-exit-a")
+    change_settings("seeder", up_limit=0)
+    secs = wait_done("rot")
+    return "; ".join(done) + f"; back on wg-exit-a, rotation off, download done {secs:.0f} s later, SHA-256 verified"
+
+
+def rotation_failure_holds(_t0):
+    """Exit B drops the client's WireGuard, so a swap from A to B never gets contact: rotate_now
+    must fail, and for LOCK_SAMPLES s the lock must hold (route down, torrents held; the window's
+    egress check sees nothing direct). Then the drop is lifted and a rotate_now to A must bring
+    the download back (route up, progress growing) within RECOVER_WITHIN s."""
+    name, rule = "rotation_failure_holds", " ".join(DROP_RULE)
+    try:
+        change_settings("seeder", up_limit=ROT_SLOW)
+        seed("rot2")
+        add(CLIENT, "rot2", "/data/dl")
+        wait_midway("rot2")
+        if current_exit() != "wg-exit-a":
+            raise RuntimeError(f"expected to start on wg-exit-a, on {current_exit()}")
+        set_rotation(True)
+        sh("wg-exit-b", f"iptables -I {rule}")
+        try:
+            old, new, err, took = rotate(name)
+            if not err:
+                raise RuntimeError(f"the swap to the cut exit B succeeded ({old} -> {new}): the cut did not work")
+            bad, trace = [], []
+            for _ in range(LOCK_SAMPLES):
+                ns, st, t = ctl(CLIENT, {"cmd": "network_status"}), ctl(CLIENT, {"cmd": "status"}), torrent("rot2")
+                sample = (ns["route"], st["killed"], t["status"])
+                trace.append(sample)
+                if sample != ("down", True, "queued"):
+                    bad.append(sample)
+                time.sleep(1)
+            LAB["notes"].append(f"{name} samples after the failed swap (route, killed, status): {trace}")
+            if bad:
+                LAB["findings"].append(analyzer.Finding("rotation_lock", name, f"lock not holding after the failed swap to {new}: "
+                                                                                f"{len(bad)} of {len(trace)} samples, first {bad[0]}"))
+            dropped = drop_count("wg-exit-b")
+            if dropped == 0:
+                raise RuntimeError("the DROP rule on exit B matched no packet: the swap target was not cut")
+        finally:
+            sh("wg-exit-b", f"iptables -D {rule}", check=False)
+        before = {"rx": float("inf"), "progress": torrent("rot2")["progress"]}
+        restore = time.time()
+        old2, new2, err2, _ = rotate(name)
+        if err2 or new2 != "wg-exit-a":
+            raise RuntimeError(f"rotating back did not reach wg-exit-a ({old2} -> {new2}): {err2}")
+        back_at = None
+        try:
+            wait_for("the download to move on wg-exit-a", lambda: analyzer.recovered(before, {
+                "route": ctl(CLIENT, {"cmd": "network_status"})["route"], "killed": ctl(CLIENT, {"cmd": "status"})["killed"],
+                "status": torrent("rot2")["status"], "rx": 0, "progress": torrent("rot2")["progress"]}), RECOVER_WITHIN + 10, 1)
+            back_at = time.time()
+        except TimeoutError:
+            pass
+        LAB["findings"].extend(analyzer.check_recovery(restore, back_at, RECOVER_WITHIN, name))
+    finally:
+        set_rotation(False, active="wg-exit-a")
+    change_settings("seeder", up_limit=0)
+    secs = wait_done("rot2")
+    back = f"{back_at - restore:.1f} s" if back_at else "never"
+    return (f"swap {old} -> {new} failed after {took:.1f} s ({err[:120]}); lock held in {LOCK_SAMPLES - len(bad)}/{LOCK_SAMPLES} "
+            f"samples; {dropped} WireGuard packets dropped at exit B; {old2} -> {new2}: download moving after {back}; "
+            f"done {secs:.0f} s later, SHA-256 verified")
+
+
 def positive_control(_t0):
     """Deliberately leaks from the client's network namespace (bash /dev/tcp and /dev/udp, so the
     client image needs no extra tools): TCP to the tracker, a DNS query to the lab dns, UDP to
@@ -613,13 +773,18 @@ def analyse():
     failed_live = {}
     for name, since, until, kind in LAB["windows"]:
         if kind == "normal":
-            findings += analyzer.check_egress(PCAP, allowed, name, since, until)
+            both = name.split(" ")[0] in ROTATION_SCENARIOS  # the client moves between exits A and B
+            # Exit B may still send to the client after a rotation left it: its F2 unreachable is
+            # allowed everywhere (it only answers B's own datagram), UDP to B only in rotation windows.
+            findings += analyzer.check_egress(PCAP, {EXIT_A, EXIT_B} if both else allowed, name, since, until, closed={EXIT_B})
         findings += analyzer.check_identity([e for e in entries if since <= e.get("ts", 0) <= until], name)
         base = name.split(" ")[0]
         if base not in ("cold_start", CONTROL) and until - since >= 30:
             live, why = analyzer.capture_live(PCAP, EXIT_A, since, until)
             if not live:
                 failed_live.setdefault(base, f"capture not live in {name}: {why}")
+    for name, since, until, endpoints in LAB["swaps"]:
+        findings += analyzer.check_swap_gap(PCAP, (since, until), endpoints, name)
     for name, kill, restore, held, stale, samples in LAB["kills"]:
         findings += analyzer.check_kill_timing(PCAP, kill, allowed, stale, held, HELD_WITHIN, until=restore,
                                                scenario=f"{name} (killed)", samples=samples)
@@ -641,7 +806,9 @@ SCENARIOS = (("steady_download", steady_download, "normal"), ("hostname_trackers
              ("tunnel_cut_both_ways", tunnel_cut_both_ways, "custom"),
              ("tunnel_cut_long", tunnel_cut_long, "custom"),
              ("shutdown_and_crash", shutdown_and_crash, "normal"),
-             ("ipv6_icmp_broadcast", ipv6_icmp_broadcast, "normal"))
+             ("ipv6_icmp_broadcast", ipv6_icmp_broadcast, "normal"),
+             ("rotation_swap", rotation_swap, "normal"),
+             ("rotation_failure_holds", rotation_failure_holds, "normal"))
 
 
 def main():
@@ -655,6 +822,7 @@ def main():
         setup_state["confs"] = setup_wireguard(CLIENT)
         setup_torrents()
         setup_state["stale_after"] = int(sh(CLIENT, "printenv NYX_LAB_STALE_AFTER_SECS").strip())
+        setup_state["rotate_secs"] = int(sh(CLIENT, "printenv NYX_LAB_ROTATE_SECS").strip())
         for name in EXITS:
             wait_for(f"{name} to be up", lambda n=name: os.path.exists(f"{CONF}/{n}.ready"), 120)
         wait_for("the client capture to start", lambda: os.path.getsize(PCAP) >= 24, 60)
