@@ -1,0 +1,9 @@
+# nyx-tunnel: built-in userspace WireGuard for Nyx (conf parser now; tunnel + SOCKS5 server in later tasks).
+[package]
+name = "nyx-tunnel"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+base64 = "0.22"

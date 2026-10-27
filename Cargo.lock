@@ -2453,6 +2453,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "nyx-tunnel"
+version = "1.0.0"
+dependencies = [
+ "base64 0.22.1",
+]
+
+[[package]]
 name = "objc2"
 version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
