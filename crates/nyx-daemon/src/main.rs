@@ -5,7 +5,8 @@
 //! Env for `run`: NYX_DATA_DIR (required), NYX_LISTEN (default 0.0.0.0:6881), NYX_NO_DISCOVERY (any value).
 
 use nyx_app::state::AppState;
-use nyx_daemon::ctl::{handle, is_shutdown};
+use nyx_daemon::ctl::{handle, is_shutdown, request};
+use nyx_daemon::listen_addr;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
@@ -15,6 +16,8 @@ use std::time::Duration;
 const CTL_ADDR: &str = "127.0.0.1:7777";
 /// Save resume data this often (ticks of one second), same as the desktop app.
 const SAVE_EVERY_TICKS: u32 = 60;
+/// How long `ctl` waits for a reply (an add_torrent or update check can take a while).
+const CTL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Dispatches the subcommand; any failure prints to stderr and exits 1.
 fn main() {
@@ -37,12 +40,13 @@ fn main() {
 /// Builds the app from env, starts the background threads and blocks serving the control port.
 fn run() -> Result<(), String> {
     let data = std::env::var_os("NYX_DATA_DIR").ok_or("NYX_DATA_DIR is not set")?;
-    let listen = std::env::var("NYX_LISTEN").ok().and_then(|v| v.parse().ok()).unwrap_or_else(|| "0.0.0.0:6881".parse().unwrap());
+    let listen = listen_addr(std::env::var("NYX_LISTEN").ok().as_deref())?;
     let discovery = std::env::var_os("NYX_NO_DISCOVERY").is_none();
+    // Bind the control port first: a taken port fails before the engine touches the network.
+    let listener = TcpListener::bind(CTL_ADDR).map_err(|e| format!("cannot bind {CTL_ADDR}: {e}"))?;
     let state = Arc::new(AppState::new(std::path::Path::new(&data), listen, discovery)?);
     spawn_poller(state.clone());
     spawn_background(state.clone());
-    let listener = TcpListener::bind(CTL_ADDR).map_err(|e| format!("cannot bind {CTL_ADDR}: {e}"))?;
     for conn in listener.incoming().flatten() {
         let s = state.clone();
         std::thread::spawn(move || serve(&s, conn));
@@ -64,12 +68,10 @@ fn serve(state: &AppState, conn: TcpStream) {
     }
 }
 
-/// The `ctl` client: one request line out, one reply line printed. Exit 1 if the reply is an error.
+/// The `ctl` client: one request line out, one reply line printed. Exit 1 if the reply is an error,
+/// empty, or does not arrive within CTL_TIMEOUT.
 fn ctl_client(json: &str) -> Result<(), String> {
-    let mut conn = TcpStream::connect(CTL_ADDR).map_err(|e| format!("cannot reach daemon on {CTL_ADDR}: {e}"))?;
-    writeln!(conn, "{}", json.replace('\n', " ")).map_err(|e| e.to_string())?;
-    let mut reply = String::new();
-    BufReader::new(conn).read_line(&mut reply).map_err(|e| e.to_string())?;
+    let reply = request(CTL_ADDR, json, CTL_TIMEOUT)?;
     print!("{reply}");
     if reply.starts_with("{\"err\"") {
         std::process::exit(1);

@@ -1,11 +1,15 @@
 //! The daemon's control protocol: one JSON object per line in, one JSON object per line out.
 //! Request `{"cmd": "...", ...args}`; reply `{"ok": <value>}` or `{"err": "<message>"}`.
-//! Kept free of sockets so tests (and the TCP loop in main.rs) call the same `handle`.
+//! `handle` is kept free of sockets so tests (and the TCP loop in main.rs) call the same code;
+//! `request` is the client half used by `nyx-daemon ctl`.
 
 use nyx_app::state::AppState;
 use nyx_core::Settings;
 use serde::Serialize;
 use serde_json::{json, Value};
+use std::io::{BufRead, BufReader, Write};
+use std::net::TcpStream;
+use std::time::Duration;
 
 /// A string argument that must be present, or an error naming it.
 fn arg_str<'a>(req: &'a Value, key: &str) -> Result<&'a str, String> {
@@ -40,6 +44,13 @@ fn dispatch(state: &AppState, req: &Value) -> Result<Value, String> {
             let category = req.get("category").and_then(Value::as_str).map(str::to_owned);
             ok(state.add_torrent(arg_str(req, "path")?, arg_str(req, "save_path")?, category, paused)?)
         }
+        // Profiles: import seals the .conf at once; list never returns key material (get_settings
+        // is redacted for the UI, so these are the lab's way to see and add profiles).
+        "import_profile" => {
+            let group = req.get("group").and_then(Value::as_str).unwrap_or("");
+            ok(state.import_profile(arg_str(req, "path")?, arg_str(req, "name")?, group)?)
+        }
+        "list_profiles" => ok(state.list_profiles()),
         "rss_run" => ok(state.rss_run()),
         "check_update" => ok(state.check_update()?),
         "search" => ok(state.search(arg_str(req, "query")?)?),
@@ -60,6 +71,21 @@ pub fn handle(state: &AppState, line: &str) -> String {
         Err(e) => Err(format!("bad json: {e}")),
     };
     reply.unwrap_or_else(|e| json!({ "err": e })).to_string()
+}
+
+/// The `ctl` client side: sends one request line to `addr` and returns the reply line. An empty
+/// reply (the daemon closed or died) is an error, and a daemon that never answers times out after
+/// `timeout`, so a script driving the lab never hangs or mistakes silence for success.
+pub fn request(addr: &str, json: &str, timeout: Duration) -> Result<String, String> {
+    let mut conn = TcpStream::connect(addr).map_err(|e| format!("cannot reach daemon on {addr}: {e}"))?;
+    conn.set_read_timeout(Some(timeout)).map_err(|e| e.to_string())?;
+    writeln!(conn, "{}", json.replace('\n', " ")).map_err(|e| e.to_string())?;
+    let mut reply = String::new();
+    BufReader::new(conn).read_line(&mut reply).map_err(|e| format!("no reply from daemon: {e}"))?;
+    if reply.trim().is_empty() {
+        return Err("the daemon closed the connection without a reply".into());
+    }
+    Ok(reply)
 }
 
 /// True when this request line is the `shutdown` command, so the server loop knows to exit after replying.

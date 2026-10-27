@@ -50,6 +50,69 @@ fn malformed_json_returns_err_not_panic() {
     }
 }
 
+/// A throwaway WireGuard config with an IP-literal endpoint (no DNS lookup at import).
+const CONF: &str = "[Interface]\nPrivateKey = yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk=\nAddress = 10.100.0.2/32\nDNS = 10.88.0.23\n\n[Peer]\nPublicKey = xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=\nAllowedIPs = 0.0.0.0/0, ::/0\nEndpoint = 10.88.0.11:51820\n";
+
+/// import_profile stores a profile from a .conf path; list_profiles shows it (inactive, no keys).
+#[test]
+fn import_profile_then_list_profiles_shows_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = app(tmp.path());
+    let path = tmp.path().join("b.conf");
+    std::fs::write(&path, CONF).unwrap();
+    let r = call(&state, json!({"cmd": "import_profile", "path": path.to_str().unwrap(), "name": "Exit B", "group": "lab"}));
+    assert_eq!(r["ok"]["name"], json!("Exit B"), "{r}");
+    let list = call(&state, json!({"cmd": "list_profiles"}));
+    let profiles = list["ok"].as_array().expect("list_profiles replies a list");
+    assert_eq!(profiles.len(), 1, "{list}");
+    assert_eq!(profiles[0]["endpoint"], json!("10.88.0.11:51820"));
+    assert_eq!(profiles[0]["active"], json!(false));
+    assert!(!list.to_string().contains("PrivateKey"), "{list}");
+}
+
+/// import_profile without a path is an error naming the argument; a missing group is fine.
+#[test]
+fn import_profile_without_path_returns_err() {
+    let tmp = tempfile::tempdir().unwrap();
+    let r = call(&app(tmp.path()), json!({"cmd": "import_profile", "name": "x"}));
+    assert!(r["err"].as_str().unwrap().contains("path"), "{r}");
+}
+
+/// The ctl client treats a connection closed without a reply as an error (it used to print
+/// nothing and exit 0).
+#[test]
+fn ctl_request_errors_on_empty_reply() {
+    let srv = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = srv.local_addr().unwrap().to_string();
+    let t = std::thread::spawn(move || drop(srv.accept().unwrap()));
+    let r = nyx_daemon::ctl::request(&addr, "{\"cmd\":\"status\"}", std::time::Duration::from_secs(5));
+    t.join().unwrap();
+    assert!(r.is_err(), "{r:?}");
+}
+
+/// The ctl client gives up after its timeout when the daemon accepts but never answers.
+#[test]
+fn ctl_request_times_out_on_silent_daemon() {
+    let srv = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = srv.local_addr().unwrap().to_string();
+    let t = std::thread::spawn(move || {
+        let (_conn, _) = srv.accept().unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    });
+    let r = nyx_daemon::ctl::request(&addr, "{\"cmd\":\"status\"}", std::time::Duration::from_millis(300));
+    assert!(r.is_err(), "{r:?}");
+    t.join().unwrap();
+}
+
+/// NYX_LISTEN: unset gives the default, a valid address is used, garbage is an error.
+#[test]
+fn listen_addr_rejects_garbage() {
+    assert_eq!(nyx_daemon::listen_addr(None).unwrap().to_string(), "0.0.0.0:6881");
+    assert_eq!(nyx_daemon::listen_addr(Some("10.0.0.1:7000")).unwrap().to_string(), "10.0.0.1:7000");
+    assert!(nyx_daemon::listen_addr(Some("not-an-addr")).is_err());
+    assert!(nyx_daemon::listen_addr(Some("0.0.0.0")).is_err());
+}
+
 /// A relative save folder is refused with the app's "full path" message.
 #[test]
 fn add_magnet_with_relative_save_path_returns_err() {
