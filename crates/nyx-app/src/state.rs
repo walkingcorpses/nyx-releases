@@ -603,7 +603,8 @@ impl AppState {
     }
 
     /// A swap's second half, quick and off the network. With a tunnel that has contact the engine
-    /// moves onto it and the old one closes last (make-before-break). Without one (`Err`) there is
+    /// moves onto it, the engine renews its identity (new tracker peer_id and key) and the old one
+    /// closes last (make-before-break). Without one (`Err`) there is
     /// no fallback to the old route or to direct: the old tunnel closes, the blocked stand-in
     /// becomes the route (Down, torrents held), a warning names the profile and the timer backs
     /// off; the failed profile stays current so the next try picks another. Either way the new
@@ -621,10 +622,24 @@ impl AppState {
                 (None, _) => rot.restart(now),
             }
         }
-        installed?;
+        let old = installed?;
         match failed {
-            None => Ok(to.id.clone()),
+            None => {
+                // A new tracker peer_id and key on the new tunnel (lab F5, F6), or the tracker could
+                // tell the new exit is the old client. Runs with no app lock held: the rebuild holds
+                // the engine's own lock (other engine calls wait, sub-second), and callers that
+                // reach the engine under the net lock just wait for it; it never takes an app lock,
+                // so no cycle. The old tunnel closes only after it, so the old session's peers stay
+                // on their own exit until the old session is silenced. A failure keeps the swap and
+                // the old session, which is still on the new tunnel: warn only.
+                if let Err(e) = self.engine.rotate_identity() {
+                    self.warn(format!("Rotated to \"{}\", but the torrent identity could not be renewed: {e}", to.name));
+                }
+                drop(old);
+                Ok(to.id.clone())
+            }
             Some(e) => {
+                drop(old);
                 // Hold the torrents now, not on the next poller tick: the route reads Down already
                 // (lab finding: one sample showed the lock off right after the failed swap).
                 self.apply_kill_switch(&self.engine.snapshot());
@@ -641,8 +656,10 @@ impl AppState {
     /// save: the swap is dropped (Err, nothing changed) unless the net state and the saved
     /// settings both still say `from` and rotation is still on with `to` in its pool. A save
     /// that landed while the new tunnel came up is the later writer and wins; a save after this
-    /// commit sees `to` and wins in turn. The old tunnel closes after both locks are released.
-    fn install_swap(&self, from: &str, to: &Profile, tunnel: Tunnel, blocked: bool) -> Result<(), String> {
+    /// commit sees `to` and wins in turn. Returns the old net state, still open, for the caller to
+    /// close after both locks are released (and after the identity rotation); on an engine error
+    /// it is closed here.
+    fn install_swap(&self, from: &str, to: &Profile, tunnel: Tunnel, blocked: bool) -> Result<Net, String> {
         let (old, routed) = {
             let _writer = self.settings_write.lock().unwrap();
             let mut net = self.net.lock().unwrap();
@@ -660,8 +677,7 @@ impl AppState {
             let routed = self.engine.set_proxy(proxy).and_then(|_| self.engine.set_interface(interface.as_deref()));
             (old, routed)
         };
-        drop(old);
-        routed.map_err(|e| e.to_string())
+        routed.map(|_| old).map_err(|e| e.to_string())
     }
 
     /// The profile Test button (user-initiated only, never called automatically): brings up a
