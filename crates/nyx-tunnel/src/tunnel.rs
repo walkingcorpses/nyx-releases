@@ -182,8 +182,9 @@ pub(crate) struct Wire {
     /// destination is learned from the last valid datagram.
     connected: bool,
     dest: Option<SocketAddr>,
-    /// The client initiates (and re-initiates) handshakes; the test peer only responds.
-    initiator: bool,
+    /// The client initiates (and re-initiates) handshakes, re-keying once the handshake is this
+    /// old; `None` for the test peer, which only responds.
+    rekey: Option<Duration>,
     /// Test hook: drop every packet in both directions while set.
     paused: Arc<AtomicBool>,
     buf: Vec<u8>,
@@ -216,9 +217,9 @@ pub(crate) fn make_tunn(private: [u8; 32], peer_public: [u8; 32], psk: Option<[u
 }
 
 impl Wire {
-    /// Wraps a `Tunn` and its socket; see the field docs for `connected` and `initiator`.
-    pub(crate) fn new(tunn: Tunn, sock: UdpSocket, connected: bool, initiator: bool, paused: Arc<AtomicBool>) -> Wire {
-        Wire { tunn, sock, connected, dest: None, initiator, paused, buf: vec![0u8; 65536] }
+    /// Wraps a `Tunn` and its socket; see the field docs for `connected` and `rekey`.
+    pub(crate) fn new(tunn: Tunn, sock: UdpSocket, connected: bool, rekey: Option<Duration>, paused: Arc<AtomicBool>) -> Wire {
+        Wire { tunn, sock, connected, dest: None, rekey, paused, buf: vec![0u8; 65536] }
     }
 
     /// Sends a handshake initiation now (the client calls this at start so the tunnel is up within
@@ -270,18 +271,18 @@ impl Wire {
     }
 
     /// Runs boringtun's timers. The client also restarts handshakes after boringtun gives up
-    /// (so a VPN that was down comes back by itself) and re-keys at `REKEY_AGE` even when idle.
+    /// (so a VPN that was down comes back by itself) and re-keys at its `rekey` age even when idle.
     fn tick(&mut self) {
-        let Wire { tunn, sock, connected, dest, paused, buf, initiator } = self;
+        let Wire { tunn, sock, connected, dest, paused, buf, rekey } = self;
         match tunn.update_timers(buf) {
             TunnResult::WriteToNetwork(p) => send_net(sock, *connected, *dest, paused, p),
-            TunnResult::Err(WireGuardError::ConnectionExpired) if *initiator => {
+            TunnResult::Err(WireGuardError::ConnectionExpired) if rekey.is_some() => {
                 if let TunnResult::WriteToNetwork(p) = tunn.format_handshake_initiation(buf, false) {
                     send_net(sock, *connected, *dest, paused, p);
                 }
             }
             _ => {
-                if *initiator && tunn.time_since_last_handshake().is_some_and(|a| a >= REKEY_AGE) {
+                if rekey.zip(tunn.time_since_last_handshake()).is_some_and(|(r, a)| a >= r) {
                     if let TunnResult::WriteToNetwork(p) = tunn.format_handshake_initiation(buf, false) {
                         send_net(sock, *connected, *dest, paused, p);
                     }
@@ -1051,6 +1052,13 @@ impl Tunnel {
     /// Brings the tunnel up to `endpoint` (already resolved by the caller) and starts the SOCKS
     /// server. Returns at once; the handshake completes in the background (see `stats`).
     pub fn up(cfg: &WgConfig, endpoint: SocketAddr) -> Result<Tunnel, TunnelError> {
+        Tunnel::up_with_rekey(cfg, endpoint, REKEY_AGE)
+    }
+
+    /// Like `up`, but re-keys once the handshake is `rekey_age` old instead of `REKEY_AGE`. The
+    /// app keeps it below the lock's stale threshold (tests shorten both), so a healthy tunnel
+    /// never looks stale and a dead one re-handshakes as soon as the server is back.
+    pub fn up_with_rekey(cfg: &WgConfig, endpoint: SocketAddr, rekey_age: Duration) -> Result<Tunnel, TunnelError> {
         let v4 = cfg.addresses.iter().any(|(ip, _)| ip.is_ipv4());
         let v6 = cfg.addresses.iter().any(|(ip, _)| ip.is_ipv6());
         if !v4 && !v6 {
@@ -1059,7 +1067,7 @@ impl Tunnel {
         let sock = UdpSocket::bind(if endpoint.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" })?;
         sock.connect(endpoint)?;
         let tunn = make_tunn(cfg.private_key, cfg.peer_public_key, cfg.preshared_key, cfg.keepalive);
-        let wire = Wire::new(tunn, sock, true, true, Arc::new(AtomicBool::new(false)));
+        let wire = Wire::new(tunn, sock, true, Some(rekey_age), Arc::new(AtomicBool::new(false)));
         let mut dev = VirtDevice::default();
         let iface = make_iface(&mut dev, &cfg.addresses, true);
         let mut sockets = SocketSet::new(vec![]);

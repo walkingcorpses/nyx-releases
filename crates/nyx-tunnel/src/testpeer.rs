@@ -45,7 +45,7 @@ impl TestPeer {
         let sock = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind test peer socket");
         let endpoint = sock.local_addr().unwrap();
         let paused = Arc::new(AtomicBool::new(false));
-        let wire = Wire::new(make_tunn(server_key, client_pub, None, None), sock, false, false, paused.clone());
+        let wire = Wire::new(make_tunn(server_key, client_pub, None, None), sock, false, None, paused.clone());
 
         let mut dev = VirtDevice::default();
         let iface = make_iface(&mut dev, &[(IpAddr::V4(PEER_IP), 24)], false);
