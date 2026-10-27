@@ -252,14 +252,13 @@ impl AppState {
     }
 
     /// Starts, swaps or stops the tunnel when the active profile changed, then points the engine
-    /// at the route in force (encryption, proxy, adapter). A replaced tunnel is dropped only after
+    /// at the route in force (proxy, adapter, then encryption). A replaced tunnel is dropped only after
     /// the engine uses the new one. Settings are read under the net lock, so when writers race the
     /// last saved settings win whatever order their applies run in (a stale copy could otherwise
     /// put the engine on a route the saved settings no longer say, outside the lock).
     fn sync_net(&self) -> Result<(), String> {
         let mut net = self.net.lock().unwrap();
         let s = &self.get_settings();
-        self.engine.set_encryption(encryption_mode(s)).map_err(|e| e.to_string())?;
         let mut old = None;
         if net.profile != s.network.active_profile {
             let (fresh, warning) = start_net(s, self.timing)?;
@@ -269,6 +268,9 @@ impl AppState {
         let (proxy, interface) = net.engine_route(s);
         self.engine.set_proxy(proxy).map_err(|e| e.to_string())?;
         self.engine.set_interface(interface.as_deref()).map_err(|e| e.to_string())?;
+        // Encryption last: an Err from it must never return before the net-state switch and the
+        // route calls above, or the engine would keep the old profile's route.
+        self.engine.set_encryption(encryption_mode(s)).map_err(|e| e.to_string())?;
         drop(net);
         drop(old);
         Ok(())
