@@ -283,6 +283,11 @@ fn handle(mut s: TcpStream, backend: &dyn Backend, creds: &Credentials) -> io::R
                 Target::Addr(a) => a.port(),
                 Target::Domain(_, p) => p,
             };
+            // Leak-lab only: shows what address the client announces (port 0 lets any local
+            // process claim the relay). Loopback addresses only, never key material.
+            if std::env::var_os("NYX_LAB_DEBUG").is_some() {
+                eprintln!("nyx-lab: socks UDP ASSOCIATE announced port {announced}");
+            }
             udp_associate(s, backend, announced)
         }
         _ => reply(&mut s, 0x07), // BIND and anything unknown: command not supported
