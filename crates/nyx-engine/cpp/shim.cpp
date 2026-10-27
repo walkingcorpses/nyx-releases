@@ -234,38 +234,70 @@ rust::String lt_version() {
     return rust::String(lt::version());
 }
 
-// Builds the session with every privacy setting already in place (encryption, proxy, adapter
-// binding), so not even the first packet of a session can go out under the wrong policy.
+// The settings a new session starts with: every privacy setting already in place (encryption,
+// proxy, adapter binding, identity), so not even the first packet can go out under the wrong policy.
+static lt::session_params initial_params(rust::Slice<const std::uint8_t> dht_state, SessionInit const& init) {
+    std::string const iface(init.interface);
+    lt::settings_pack pack;
+    pack.set_str(lt::settings_pack::listen_interfaces,
+                 listen_for(std::string(init.listen), iface, init.proxy_enabled));
+    pack.set_str(lt::settings_pack::outgoing_interfaces, iface);
+    // Identity (lab findings F7, F8): nothing a tracker or peer sees names Nyx or libtorrent.
+    // An empty fingerprint makes all 20 peer_id bytes random (libtorrent's default prefix
+    // "-LT20B0-" names the engine and its version). anonymous_mode leaves the client version `v`
+    // out of the extension handshake, sends trackers libtorrent's generic User-Agent
+    // ("curl/7.81.0") and never adds ip=; it does not touch connectivity (checked in the
+    // 2.0.11 source: those three places are all it changes). The user agent and handshake
+    // version are blanked as well, for the private-torrent case where anonymous_mode still
+    // sends the user agent.
+    pack.set_str(lt::settings_pack::peer_fingerprint, "");
+    pack.set_str(lt::settings_pack::user_agent, "");
+    pack.set_str(lt::settings_pack::handshake_client_version, "");
+    pack.set_bool(lt::settings_pack::anonymous_mode, true);
+    pack.set_bool(lt::settings_pack::allow_multiple_connections_per_ip, true);
+    // Default is 60 s before libtorrent redials a peer it was connected to. Pausing and
+    // resuming (and the parked-magnet flow) should pick peers back up within seconds.
+    // Failing peers still back off: the delay is multiplied by their fail count.
+    pack.set_int(lt::settings_pack::min_reconnect_time, 5);
+    pack.set_int(lt::settings_pack::alert_mask, lt::alert_category::error | lt::alert_category::status);
+    fill_encryption(pack, init.encryption);
+    fill_proxy(pack, init.proxy_enabled, std::string(init.proxy_host), init.proxy_port,
+               std::string(init.proxy_user), std::string(init.proxy_pass), init.discovery);
+    lt::session_params sp(std::move(pack));
+    if (init.discovery && !init.proxy_enabled && !dht_state.empty()) {
+        lt::session_params old = lt::read_session_params(lt::span<char const>(
+            reinterpret_cast<char const*>(dht_state.data()), dht_state.size()));
+        sp.dht_state = std::move(old.dht_state);
+    }
+    return sp;
+}
+
+// Records the address of `s`'s session_impl among every one this process has built; true when it
+// is new. The address is an input of every tracker key (torrent::tracker_key hashes the torrent's,
+// its storage slot's and the session's addresses), and the allocator readily hands a new session
+// the block of one freed earlier: the identity test saw a torrent get its key from two rotations
+// back. respawn() only accepts a session at an address never used before.
+static bool first_use(lt::session const& s) {
+    static std::mutex mu;
+    static std::set<std::uintptr_t> used;
+    std::lock_guard<std::mutex> lk(mu);
+    return used.insert(reinterpret_cast<std::uintptr_t>(s.native_handle().get())).second;
+}
+
+// A session from the engine's start-up config (see initial_params).
 Session::Session(rust::Slice<const std::uint8_t> dht_state, SessionInit const& init)
-    : ses_(
-          [&] {
-              std::string const iface(init.interface);
-              lt::settings_pack pack;
-              pack.set_str(lt::settings_pack::listen_interfaces,
-                           listen_for(std::string(init.listen), iface, init.proxy_enabled));
-              pack.set_str(lt::settings_pack::outgoing_interfaces, iface);
-              pack.set_str(lt::settings_pack::user_agent, "Nyx/0.1");
-              pack.set_bool(lt::settings_pack::allow_multiple_connections_per_ip, true);
-              // Default is 60 s before libtorrent redials a peer it was connected to. Pausing and
-              // resuming (and the parked-magnet flow) should pick peers back up within seconds.
-              // Failing peers still back off: the delay is multiplied by their fail count.
-              pack.set_int(lt::settings_pack::min_reconnect_time, 5);
-              pack.set_int(lt::settings_pack::alert_mask, lt::alert_category::error | lt::alert_category::status);
-              fill_encryption(pack, init.encryption);
-              fill_proxy(pack, init.proxy_enabled, std::string(init.proxy_host), init.proxy_port,
-                         std::string(init.proxy_user), std::string(init.proxy_pass), init.discovery);
-              lt::session_params sp(std::move(pack));
-              if (init.discovery && !init.proxy_enabled && !dht_state.empty()) {
-                  lt::session_params old = lt::read_session_params(lt::span<char const>(
-                      reinterpret_cast<char const*>(dht_state.data()), dht_state.size()));
-                  sp.dht_state = std::move(old.dht_state);
-              }
-              return sp;
-          }()),
-      discovery_(init.discovery),
-      listen_(init.listen),
-      iface_(init.interface),
-      proxied_(init.proxy_enabled) {
+    : Session(initial_params(dht_state, init), init.discovery, std::string(init.listen),
+              std::string(init.interface), init.proxy_enabled) {}
+
+// Builds the session from complete params (start-up config or a respawn's copy of the live
+// settings), then sets up what every session needs: the peer-class filter and the alert pump.
+Session::Session(lt::session_params params, bool discovery, std::string listen, std::string iface, bool proxied)
+    : ses_(std::move(params)),
+      discovery_(discovery),
+      listen_(std::move(listen)),
+      iface_(std::move(iface)),
+      proxied_(proxied),
+      new_address_(first_use(ses_)) {
     // Rate limits must also bind LAN/loopback peers (libtorrent exempts them by default):
     // put every address, v4 and v6, in the global peer class and nothing in the local one.
     lt::ip_filter classes;
@@ -644,6 +676,69 @@ rust::Vec<ResumeBlob> Session::save_resume(std::uint32_t timeout_ms) const {
         out.push_back(std::move(b));
     }
     return out;
+}
+
+// Lab findings F5, F6. libtorrent keeps a torrent's tracker peer_id (made when the torrent object
+// is built) and its tracker key (a hash of the torrent's and the session's addresses) for the torrent's whole life;
+// a new peer_fingerprint only reaches peer connections opened later. So a new identity needs new
+// torrent objects in a new session. Order, so nothing links or leaks:
+//  1. Read the live settings (they already hold the new tunnel's proxy), blocklist and torrent count.
+//  2. Silence this session: proxy to 127.0.0.1:0 (every connect fails on the spot, so the stopped
+//     announces of step 3 and of the later teardown never reach a tracker: the old peer_id and key
+//     must not show up behind the new exit) and loopback listening (frees a configured port for
+//     the new session); then pause it (disconnects every peer). Session pause does not touch the
+//     torrents' own paused flags, so the resume data keeps them.
+//  3. Resume data for every torrent; any missing -> undo step 2 and fail (no torrent may be lost).
+//  4. The new session at an address no earlier session of this process had (see first_use), the
+//     step-1 settings, the blocklist before any torrent, parked magnets, then every torrent from
+//     its resume data (save path, progress, paused flag, limits, file priorities, sequential,
+//     trackers).
+// This session stays alive (inert) until the caller drops it after the swap.
+std::unique_ptr<Session> Session::respawn(std::uint32_t timeout_ms) const {
+    lt::settings_pack const keep = ses_.get_settings();
+    lt::ip_filter const blocklist = ses_.get_ip_filter();
+    std::size_t const count = ses_.get_torrents().size();
+    // The live settings, silenced: nothing can connect, loopback listening only.
+    lt::settings_pack quiet = keep;
+    fill_proxy(quiet, true, "127.0.0.1", 0, "", "", false);
+    quiet.set_str(lt::settings_pack::listen_interfaces, "127.0.0.1:0");
+    ses_.apply_settings(quiet);
+    ses_.pause();
+    try {
+        rust::Vec<ResumeBlob> blobs = save_resume(timeout_ms);
+        if (blobs.size() != count)
+            throw std::runtime_error("identity rotation: resume data for " + std::to_string(blobs.size()) + " of " +
+                                     std::to_string(count) + " torrents");
+        std::set<std::string> parked;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            parked = parked_;
+        }
+        // Candidates start silenced too and get the live settings only once accepted, before any
+        // torrent exists: no socket ever opens under a looser policy. One at a reused address is
+        // kept alive while the next is built, so the allocator must place that one elsewhere.
+        std::vector<std::unique_ptr<Session>> reused;
+        auto fresh = std::make_unique<Session>(lt::session_params(quiet), discovery_, listen_, iface_, proxied_);
+        while (!fresh->new_address_ && reused.size() < 8) {
+            reused.push_back(std::move(fresh));
+            fresh = std::make_unique<Session>(lt::session_params(quiet), discovery_, listen_, iface_, proxied_);
+        }
+        if (!fresh->new_address_) throw std::runtime_error("identity rotation: no session at a fresh address");
+        reused.clear();
+        fresh->ses_.apply_settings(keep);
+        fresh->ses_.set_ip_filter(blocklist);
+        {
+            std::lock_guard<std::mutex> lk(fresh->mu_);
+            fresh->parked_ = std::move(parked);
+        }
+        for (ResumeBlob const& b : blobs)
+            fresh->add_resume(rust::Slice<const std::uint8_t>(b.data.data(), b.data.size()));
+        return fresh;
+    } catch (...) {
+        ses_.apply_settings(keep);
+        ses_.resume();
+        throw;
+    }
 }
 
 TorrentMeta inspect_torrent(rust::Slice<const std::uint8_t> bytes) {
