@@ -219,17 +219,35 @@ fn initiation_alone_does_not_reset_age() {
     assert!(last >= Duration::from_secs(4), "age {last:?}");
 }
 
-/// An authenticated transport packet from the peer is confirmed contact: echo data received long
-/// after the handshake (no re-key due for 120 s) brings the age back to about zero.
+/// Inbound transport data alone is NOT confirmed contact: under a one-way cut the server keeps
+/// sending data on its still-valid keypair (the lab saw TCP retransmits from the seeder reset the
+/// age at 1, 2, 5, 7, 14, 27 s after the cut). Only a completed handshake that we initiated
+/// proves our packets reach the peer, so echo data received long after the handshake (no re-key
+/// due for 120 s) leaves the age growing.
 #[test]
-fn data_or_keepalive_counts_as_contact() {
+fn data_alone_does_not_reset_age() {
     let (_peer, t) = up();
     let (mut s, code, _) = socks(&t, 1, &addr_bytes(ECHO));
     assert_eq!(code, 0);
     thread::sleep(Duration::from_millis(1500));
-    assert!(age(&t) >= Duration::from_millis(1400), "age {:?}", age(&t));
-    assert_echoes(&mut s, b"proof of life");
-    assert!(age(&t) < Duration::from_millis(500), "echo data did not count as contact: age {:?}", age(&t));
+    let before = age(&t);
+    assert!(before >= Duration::from_millis(1400), "age {before:?}");
+    assert_echoes(&mut s, b"data is not proof of life");
+    assert!(age(&t) >= before, "echo data counted as contact: age {before:?} -> {:?}", age(&t));
+}
+
+/// A completed re-key handshake (initiated by us) is confirmed contact: with a 1 s re-key the
+/// age never grows much past it on a healthy idle tunnel.
+#[test]
+fn completed_rekey_counts_as_contact() {
+    let peer = TestPeer::start();
+    let t = Tunnel::up_with_rekey(&peer.client_config(), peer.endpoint(), Duration::from_secs(1)).unwrap();
+    wait_handshake(&t);
+    let end = Instant::now() + Duration::from_secs(4);
+    while Instant::now() < end {
+        assert!(age(&t) < Duration::from_millis(1800), "re-key did not refresh contact: age {:?}", age(&t));
+        thread::sleep(Duration::from_millis(100));
+    }
 }
 
 #[test]

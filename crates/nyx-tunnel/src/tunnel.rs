@@ -162,7 +162,7 @@ pub(crate) fn new_tcp() -> tcp::Socket<'static> {
 /// Last-contact time and byte counters published by the worker for `Tunnel::stats`.
 #[derive(Default)]
 pub(crate) struct WireStats {
-    /// When the peer last gave confirmed contact (see `Wire::contact_at`). Only moves forward.
+    /// When the peer last gave confirmed contact (see `Wire::handshake_at`). Only moves forward.
     contact_at: Mutex<Option<Instant>>,
     rx: AtomicU64,
     tx: AtomicU64,
@@ -194,14 +194,15 @@ pub(crate) struct Wire {
     cut: Arc<AtomicBool>,
     /// When the `cut` hook last forced an initiation.
     forced_at: Option<Instant>,
-    /// When a handshake WE initiated last completed (the peer's response was accepted). Drives the
-    /// client's re-key. A handshake the peer initiated never counts: our response may be lost.
+    /// Confirmed contact, what the network lock calls "alive": when a handshake WE initiated last
+    /// completed (the peer accepted our initiation and its response reached us), the only packet
+    /// that proves both directions work right now. Not contact (lab finding F1):
+    /// - a received initiation or cookie reply: our answer may never arrive, yet boringtun's own
+    ///   `time_since_last_handshake` resets on one;
+    /// - received transport data or keepalives: the peer keeps sending on its old keypair (up to
+    ///   180 s) while our packets are dropped, e.g. TCP retransmits from the far end.
+    /// Also drives the client's re-key.
     handshake_at: Option<Instant>,
-    /// Confirmed contact, what the network lock calls "alive": the latest of `handshake_at` and an
-    /// authenticated transport packet (data or keepalive) accepted on a session. A received
-    /// initiation or cookie reply is NOT contact: it proves nothing about our packets reaching the
-    /// peer, and boringtun's own `time_since_last_handshake` resets on one (lab finding F1).
-    contact_at: Option<Instant>,
     buf: Vec<u8>,
 }
 
@@ -234,7 +235,7 @@ pub(crate) fn make_tunn(private: [u8; 32], peer_public: [u8; 32], psk: Option<[u
 impl Wire {
     /// Wraps a `Tunn` and its socket; see the field docs for `connected` and `rekey`.
     pub(crate) fn new(tunn: Tunn, sock: UdpSocket, connected: bool, rekey: Option<Duration>, paused: Arc<AtomicBool>, cut: Arc<AtomicBool>) -> Wire {
-        Wire { tunn, sock, connected, dest: None, rekey, paused, cut, forced_at: None, handshake_at: None, contact_at: None, buf: vec![0u8; 65536] }
+        Wire { tunn, sock, connected, dest: None, rekey, paused, cut, forced_at: None, handshake_at: None, buf: vec![0u8; 65536] }
     }
 
     /// Sends a handshake initiation now (the client calls this at start so the tunnel is up within
@@ -252,16 +253,12 @@ impl Wire {
         if self.paused.load(Ordering::Relaxed) || self.cut.load(Ordering::Relaxed) {
             return;
         }
-        let Wire { tunn, sock, connected, dest, paused, buf, handshake_at, contact_at, .. } = self;
+        let Wire { tunn, sock, connected, dest, paused, buf, handshake_at, .. } = self;
         let r = tunn.decapsulate(Some(from.ip()), d, buf);
         if matches!(r, TunnResult::Err(_)) {
             return;
         }
-        let (contact, handshake) = contact_kind(d, &r);
-        if contact {
-            *contact_at = Some(Instant::now());
-        }
-        if handshake {
+        if completes_our_handshake(d, &r) {
             *handshake_at = Some(Instant::now());
         }
         if !*connected {
@@ -298,12 +295,13 @@ impl Wire {
     /// The re-key age counts from our own last completed handshake (`handshake_at`), never from
     /// boringtun's session age: an initiation received from the peer resets that age and also
     /// cancels our in-flight initiation (boringtun moves it to its `previous` slot), so under a
-    /// one-way failure we would otherwise stop asking for a handshake. Contact on a healthy idle
-    /// tunnel comes only from this re-key: the client's persistent keepalive gets no reply (a
-    /// WireGuard peer answers data, not keepalives), so the completed re-key handshake every
-    /// `rekey` (120 s in production, 2/3 of the lock's 180 s stale threshold) keeps an idle
-    /// tunnel's contact age under the threshold. Before the first completed handshake a new one
-    /// is due whenever none is in flight.
+    /// one-way failure we would otherwise stop asking for a handshake. Contact on every healthy
+    /// tunnel, idle or busy, comes only from this re-key (data does not count, see `handshake_at`;
+    /// the client's persistent keepalive gets no reply anyway, a WireGuard peer answers data, not
+    /// keepalives): the completed handshake every `rekey` (120 s in production, 2/3 of the lock's
+    /// 180 s stale threshold; boringtun retries a lost one every 5 s) keeps the contact age under
+    /// the threshold. Before the first completed handshake a new one is due whenever none is in
+    /// flight.
     fn tick(&mut self) {
         self.force_initiation_if_cut();
         let Wire { tunn, sock, connected, dest, paused, buf, rekey, handshake_at, .. } = self;
@@ -341,28 +339,21 @@ impl Wire {
     /// Copies the confirmed-contact time and byte counters into the shared stats.
     fn publish(&self, stats: &WireStats) {
         let (_, tx, rx, _, _) = self.tunn.stats();
-        if self.contact_at.is_some() {
-            *stats.contact_at.lock().unwrap() = self.contact_at;
+        if self.handshake_at.is_some() {
+            *stats.contact_at.lock().unwrap() = self.handshake_at;
         }
         stats.tx.store(tx as u64, Ordering::Relaxed);
         stats.rx.store(rx as u64, Ordering::Relaxed);
     }
 }
 
-/// Classifies a datagram boringtun did not reject, by its WireGuard message type (little-endian
-/// u32 at offset 0: 1 initiation, 2 response, 3 cookie reply, 4 transport) and the result.
-/// Returns (confirmed contact, completed handshake we initiated):
-/// - type 2 counts only when boringtun answers with its confirmation keepalive (a type-4
-///   packet); under load it may instead return a cookie reply (type 3) without processing it;
-/// - type 4 counts when it decrypts to an IP packet or to an empty keepalive (`Done`);
-/// - types 1 and 3 never count.
-fn contact_kind(d: &[u8], r: &TunnResult) -> (bool, bool) {
+/// True when datagram `d` was a handshake response (WireGuard message type 2, little-endian u32
+/// at offset 0) to our initiation that boringtun accepted. Accepted means boringtun answers with
+/// its confirmation keepalive (a type-4 packet); under load it may instead return a cookie reply
+/// (type 3) without processing the response at all.
+fn completes_our_handshake(d: &[u8], r: &TunnResult) -> bool {
     let kind = |p: &[u8]| p.get(..4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
-    match (kind(d), r) {
-        (Some(2), TunnResult::WriteToNetwork(p)) if kind(p) == Some(4) => (true, true),
-        (Some(4), TunnResult::WriteToTunnelV4(..) | TunnResult::WriteToTunnelV6(..) | TunnResult::Done) => (true, false),
-        _ => (false, false),
-    }
+    matches!(r, TunnResult::WriteToNetwork(p) if kind(d) == Some(2) && kind(p) == Some(4))
 }
 
 /// Messages to the worker.
@@ -1069,9 +1060,10 @@ impl Backend for BlockedBackend {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TunnelStats {
     /// Time since the last CONFIRMED contact with the peer: a handshake we initiated that the
-    /// peer completed (its response arrived), or an authenticated data/keepalive packet received
-    /// on a session. Received initiations do not count (they prove nothing about our packets
-    /// reaching the peer). `None` before the first completed handshake. The name is historical.
+    /// peer completed (its response arrived). Received initiations and received data do not
+    /// count: neither proves our packets reach the peer (lab finding F1). The client re-keys
+    /// every `rekey_age` (120 s by default), so a healthy tunnel stays under that plus retries.
+    /// `None` before the first completed handshake.
     pub handshake_age: Option<Duration>,
     /// Decrypted payload bytes received / plaintext bytes sent through WireGuard.
     pub rx_bytes: u64,

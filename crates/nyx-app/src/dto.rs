@@ -187,8 +187,8 @@ pub struct NetworkStatusDto {
     pub route: Route,
     /// Profile name.
     pub profile: Option<String>,
-    /// Seconds since the last confirmed contact with the VPN server (a handshake we started that
-    /// it completed, or authenticated data/keepalive from it; see nyx-tunnel `TunnelStats`).
+    /// Seconds since the last confirmed contact with the VPN server: a handshake we started that
+    /// it completed (see nyx-tunnel `TunnelStats`).
     /// `None` before the first handshake. The name is historical.
     pub handshake_age_secs: Option<u64>,
     pub rx_bytes: u64,
