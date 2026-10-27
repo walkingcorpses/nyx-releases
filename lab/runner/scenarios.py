@@ -40,6 +40,11 @@ Scenarios (in run order):
                              (check_swap_gap) and the download must move again after every swap.
   rotation_failure_holds     exit B drops WireGuard: the swap to B fails, the lock must hold (route
                              down, torrents held, nothing direct), then rotating to A recovers.
+  identity_rotation          rotation on, encryption "Prefer" (so the plaintext-only observer can read
+                             the handshake): two rotate_now swaps during a download; what the tracker
+                             and the observer saw in each session goes to check_linkability (peer_id,
+                             tracker key and version must change on every swap and never name Nyx or
+                             libtorrent; no listen port may be announced).
   positive_control (last)    deliberate leaks that the lab must detect, or the run fails "blind"."""
 import base64
 import glob
@@ -86,6 +91,7 @@ TORRENTS = {
     "v6": (8 * MB, 13, IP_TRACKERS),
     "rot": (40 * MB, 16, IP_TRACKERS),
     "rot2": (40 * MB, 17, IP_TRACKERS),
+    "ident": (40 * MB, 18, IP_TRACKERS),
 }
 SLOW = 256 * 1024       # seeder upload cap (B/s) for the mid-transfer scenarios: 20 MB takes ~80 s
 DOWNLOAD_TIMEOUT = 600
@@ -98,11 +104,12 @@ DROP_OUT_RULE = ["OUTPUT", "-p", "udp", "--sport", str(WG_PORT), "-j", "DROP"]  
 LONG_CUT = 130          # tunnel_cut_long: > wireguard-go's 90 s of handshake attempts + the 20 s stale threshold
 CONTROL = "positive_control"
 # Rotation scenarios: their windows allow WireGuard to both exits (the client moves between them).
-ROTATION_SCENARIOS = ("rotation_swap", "rotation_failure_holds")
+ROTATION_SCENARIOS = ("rotation_swap", "rotation_failure_holds", "identity_rotation")
 ROT_SLOW = 128 * 1024   # seeder cap for the rotation scenarios: 40 MB takes ~5 min, longer than every swap
 FLOW_WITHIN = 45        # after a swap the download must make progress again within this
 SWAP_TAIL = 2           # a swap window runs this long past rotate_now's reply (the old tunnel closing)
 LOCK_SAMPLES = 15       # rotation_failure_holds: lock samples (one a second) after the failed swap
+SESSION_SEEN = 90       # identity_rotation: each session must reach the tracker and the observer within this
 
 # Run state shared by the scenarios: windows are (scenario, since, until, kind) with kind
 # "normal" or "kill" (the kill window's egress is checked by check_kill_timing); swaps are
@@ -722,6 +729,69 @@ def rotation_failure_holds(_t0):
             f"done {secs:.0f} s later, SHA-256 verified")
 
 
+def client_entries(server, since):
+    """`server`'s log entries since `since` that came from the client, i.e. through an exit (the
+    seeder announces too, from its own address, and never rotates)."""
+    return [e for e in logs() if e["server"] == server and e["ts"] >= since and e["src"] in EXIT_IPS]
+
+
+def session_seen(since):
+    """Waits until the client's current session (from `since`) has announced to the tracker and
+    sent the observer a readable (plaintext) handshake, so every session has something for
+    check_linkability to compare. Returns (announces, handshakes) so far; raises if either is
+    missing after SESSION_SEEN s (the check would have nothing to compare: not exercised)."""
+    def both():
+        """(announces, plaintext handshakes) once both exist."""
+        a = client_entries("tracker", since)
+        h = [e for e in client_entries("observer", since) if not e.get("encrypted") and e.get("peer_id")]
+        return a and h and (len(a), len(h))
+    try:
+        return wait_for("an announce and a plaintext handshake from the current session", both, SESSION_SEEN, 1)
+    except TimeoutError:
+        a, h = client_entries("tracker", since), client_entries("observer", since)
+        raise RuntimeError(f"session from {since:.3f} not seen: {len(a)} announces, {len(h)} handshakes "
+                           f"({sum(1 for e in h if e.get('encrypted'))} encrypted)")
+
+
+def identity_rotation(t0):
+    """Spec 7.3 check 3. Encryption "Prefer" so the client falls back to plaintext with the
+    observer (which has no MSE; MSE only wraps the same handshake, so what it reads is what an
+    MSE peer learns). Rotation on, two rotate_now swaps (A -> B -> A) during a slowed download;
+    each session (before, between, after the swaps) must reach the tracker and the observer.
+    Then check_linkability over the client's tracker and observer entries with the swap marks
+    (rotate_now's replies). The download must still finish, SHA-256 verified."""
+    enc = ctl(CLIENT, {"cmd": "get_settings"})["encryption"]
+    marks, seen, done = [], [], []
+    try:
+        change_settings(CLIENT, encryption="Prefer")
+        change_settings("seeder", up_limit=ROT_SLOW)
+        seed("ident")
+        add(CLIENT, "ident", "/data/dl")
+        wait_midway("ident")
+        seen.append(session_seen(t0))
+        set_rotation(True)
+        for i in range(2):
+            old, new, err, took = rotate("identity_rotation")
+            if err or new == old:
+                raise RuntimeError(f"rotate_now {i + 1} did not swap ({old} -> {new}): {err}")
+            marks.append(time.time())
+            done.append(f"{old} -> {new} in {took:.1f} s")
+            seen.append(session_seen(marks[-1]))
+    finally:
+        set_rotation(False, active="wg-exit-a")
+        change_settings(CLIENT, encryption=enc)
+    tracker, observer = client_entries("tracker", t0), client_entries("observer", t0)
+    found = analyzer.check_linkability(tracker, observer, marks, "identity_rotation")
+    LAB["findings"].extend(found)
+    ids = sorted({(e.get("peer_id"), e.get("key")) for e in tracker if e.get("info_hash") == setup_state["hash:ident"]})
+    LAB["notes"].append(f"identity_rotation: marks {[round(m, 3) for m in marks]}; (announces, handshakes) per session {seen}; "
+                        f"ident torrent (peer_id, key) at the tracker: {ids}")
+    change_settings("seeder", up_limit=0)
+    secs = wait_done("ident")
+    return (f"{'; '.join(done)}; sessions seen {seen}; {len(found)} linkability findings; "
+            f"download done {secs:.0f} s later, SHA-256 verified")
+
+
 def positive_control(_t0):
     """Deliberately leaks from the client's network namespace (bash /dev/tcp and /dev/udp, so the
     client image needs no extra tools): TCP to the tracker, a DNS query to the lab dns, UDP to
@@ -808,7 +878,8 @@ SCENARIOS = (("steady_download", steady_download, "normal"), ("hostname_trackers
              ("shutdown_and_crash", shutdown_and_crash, "normal"),
              ("ipv6_icmp_broadcast", ipv6_icmp_broadcast, "normal"),
              ("rotation_swap", rotation_swap, "normal"),
-             ("rotation_failure_holds", rotation_failure_holds, "normal"))
+             ("rotation_failure_holds", rotation_failure_holds, "normal"),
+             ("identity_rotation", identity_rotation, "normal"))
 
 
 def main():

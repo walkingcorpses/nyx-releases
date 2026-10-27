@@ -15,10 +15,15 @@ check_kill_timing / check_recovery: the tunnel_killed_midtransfer scenario's che
 WireGuard to the endpoint after the kill, torrents held in time, tunnel back after the drop).
 
 check_swap_gap: the rotation scenarios' check (inside each profile swap only WireGuard to the old or
-the new endpoint may leave)."""
+the new endpoint may leave).
+
+check_linkability: the identity_rotation scenario's check (spec 7.3 check 3: peer_id, tracker key
+and version strings must change on every rotation and must not name the client)."""
+import bisect
 import ipaddress
 import json
 import os
+import re
 import socket
 from typing import NamedTuple
 
@@ -273,6 +278,87 @@ def recovered(at_restore, sample):
     state_ok = sample["route"] == "up" and not sample["killed"] and sample["status"] != "queued"
     grew = sample["rx"] > at_restore["rx"] or sample["progress"] > at_restore["progress"]
     return state_ok and grew
+
+
+# Text that names the client or its engine: Nyx itself, libtorrent (rasterbar), or libtorrent's
+# Azureus-style peer_id prefix "-LT" (e.g. "-LT20B0-" = libtorrent 2.0.11).
+_CLIENT_NAME = re.compile(r"nyx|libtorrent|rasterbar", re.IGNORECASE)
+_LT_PEER_ID = re.compile(r"^-LT[0-9A-Za-z]{4}-", re.IGNORECASE)
+
+
+def _segment(ts, marks):
+    """Index of the session `ts` falls in: 0 before the first rotation mark, 1 after it, ..."""
+    return bisect.bisect_right(marks, ts)
+
+
+def check_linkability(tracker_log, observer_log, rotation_marks, scenario=""):
+    """Spec 7.3 check 3 (Task 15): what a tracker or a peer learns must neither link the client's
+    sessions across a rotation nor name the client. `tracker_log` and `observer_log` are the
+    servers' entries for the window, `rotation_marks` the times each swap was complete (rotate_now
+    returned). Findings ("linkability"):
+    - the same peer_id (tracker announce or peer handshake), tracker `key` or non-empty extension
+      `v` seen in two sessions (either side of a mark) or from two exits: the server can tell the
+      new exit is the old client. The exit rule also catches an old identity slipping out through
+      the new tunnel before the mark;
+    - a peer_id prefix, `v` or tracker User-Agent naming Nyx or libtorrent (any session);
+    - an announced listen port: the extension handshake `p` or the announce `port`, other than
+      libtorrent's placeholder 1 (and 0). A proxied client cannot accept connections, so a real
+      port is either its true listen port or a stable per-session token.
+    Encrypted handshakes (unreadable) and entries without the field are skipped."""
+    marks = sorted(rotation_marks)
+    out = []
+    # value -> [(session, exit)], per kind of identity
+    seen = {"peer_id": {}, "key": {}, "v": {}}
+    named = {}  # (field, what names it) -> [entries, first entry]: one finding each, with a count
+
+    def note(kind, value, e):
+        """Records that `value` (a `kind` identity) was seen in entry `e`."""
+        if value not in (None, ""):
+            seen[kind].setdefault(str(value).lower() if kind == "key" else str(value), []).append((_segment(e.get("ts", 0), marks), e.get("src")))
+
+    def names(field, value, e):
+        """Counts `value` (of `field`, from entry `e`) when it names Nyx or libtorrent; a peer_id by
+        its 8-character client prefix (the rest is random per torrent or connection)."""
+        value = str(value or "")
+        if _CLIENT_NAME.search(value) or (field.endswith("peer_id") and _LT_PEER_ID.match(value)):
+            hit = named.setdefault((field, value[:8] if field.endswith("peer_id") else value), [0, e])
+            hit[0] += 1
+
+    def port(field, value, e):
+        """A finding for an announced listen port other than the placeholders 0 and 1."""
+        try:
+            n = int(value)
+        except (TypeError, ValueError):
+            return
+        if n > 1:
+            out.append(Finding("linkability", scenario, f"{field} announces listen port {n} ({e['server']}, from {e.get('src')} at {e.get('ts', 0):.3f})"))
+
+    for e in tracker_log:
+        if e.get("path") == "/positive-control":
+            continue
+        note("peer_id", e.get("peer_id"), e)
+        note("key", e.get("key"), e)
+        names("tracker peer_id", e.get("peer_id"), e)
+        names("tracker User-Agent", e.get("user_agent"), e)
+        port("tracker announce", e.get("port"), e)
+    for e in observer_log:
+        if e.get("encrypted") or not e.get("peer_id"):
+            continue
+        note("peer_id", e.get("peer_id"), e)
+        note("v", e.get("v"), e)
+        names("handshake peer_id", e.get("peer_id"), e)
+        names("extension v", e.get("v"), e)
+        port("extension handshake p", e.get("p"), e)
+    for (field, what), (n, e) in named.items():
+        out.append(Finding("linkability", scenario, f"{field} names the client: {what!r} in {n} entries, first {e['server']} "
+                                                    f"from {e.get('src')} at {e.get('ts', 0):.3f}"))
+    for kind, values in seen.items():
+        for value, where in values.items():
+            sessions, exits = sorted({s for s, _ in where}), sorted({x for _, x in where if x})
+            if len(sessions) > 1 or len(exits) > 1:
+                out.append(Finding("linkability", scenario, f"same {kind} {value!r} in sessions {sessions} (rotations at "
+                                                            f"{', '.join(f'{m:.3f}' for m in marks) or '-'}) from exits {exits}"))
+    return out
 
 
 def check_recovery(restore_time, recovered_at, within_s, scenario):

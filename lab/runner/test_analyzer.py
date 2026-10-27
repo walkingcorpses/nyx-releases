@@ -9,7 +9,7 @@ import dpkt
 
 import report
 from analyzer import (CONTROL_SIGNATURES, Finding, capture_live, check_egress, check_identity,
-                      check_kill_timing, check_recovery, check_swap_gap, count_udp_to, load_logs, recovered,
+                      check_kill_timing, check_linkability, check_recovery, check_swap_gap, count_udp_to, load_logs, recovered,
                       split_control)
 
 CLIENT_MAC = b"\x02\x42\x0a\x4d\x00\x0a"
@@ -382,6 +382,101 @@ class Analyzer(unittest.TestCase):
         f = check_swap_gap(self.pcap(self.unreach(qsrc="10.88.0.11")), (1000.0, 1000.0), [EXIT_A, EXIT_B])
         self.assertEqual(len(f), 1, f)
         self.assertIn("ICMP", f[0].detail)
+
+
+def announce(ts, src="10.88.0.10", peer_id="AbCdEfGhIjKlMnOpQrSt", key="1a2b3c4d", port=1, ua=None, proto="udp"):
+    """A synthetic tracker log entry (the shape tracker.py writes)."""
+    e = {"server": "tracker", "ts": ts, "src": src, "proto": proto, "path": "/announce" if proto == "http" else None,
+         "peer_id": peer_id, "key": key, "port": port}
+    if ua is not None:
+        e["user_agent"] = ua
+    return e
+
+
+def handshake(ts, src="10.88.0.10", peer_id="ZyXwVuTsRqPoNmLkJiHg", v=None, p=None, encrypted=False):
+    """A synthetic observer log entry (the shape observer.py writes for a plaintext handshake)."""
+    e = {"server": "observer", "ts": ts, "src": src, "encrypted": encrypted}
+    if not encrypted:
+        e.update(peer_id=peer_id, reserved="0000000000100005")
+        if v is not None:
+            e["v"] = v
+        if p is not None:
+            e["p"] = p
+    return e
+
+
+class Linkability(unittest.TestCase):
+    """check_linkability (spec 7.3 check 3): identities must not survive a rotation and must not
+    name the client."""
+    MARKS = [2000.0]  # one rotation (rotate_now's reply) at t=2000; exit A before, exit B after
+
+    def check(self, tracker, observer, marks=MARKS):
+        """Runs the check and returns the findings' details (all must be check "linkability")."""
+        found = check_linkability(tracker, observer, marks, scenario="identity_rotation")
+        self.assertTrue(all(f.check == "linkability" and f.scenario == "identity_rotation" for f in found), found)
+        return [f.detail for f in found]
+
+    def test_same_peer_id_across_rotation_is_a_finding(self):
+        """The tracker sees one peer_id before and after the swap: it can link both sessions."""
+        d = self.check([announce(1000, key="11111111"), announce(3000, src="10.88.0.11", key="22222222")], [])
+        self.assertEqual(len(d), 1, d)
+        self.assertIn("peer_id", d[0])
+
+    def test_same_tracker_key_across_rotation_is_a_finding(self):
+        """A tracker key that survives the swap links the sessions even with a new peer_id."""
+        d = self.check([announce(1000, peer_id="A" * 20), announce(3000, src="10.88.0.11", peer_id="B" * 20)], [])
+        self.assertEqual(len(d), 1, d)
+        self.assertIn("key", d[0])
+
+    def test_different_identity_is_clean(self):
+        """New peer_id and key after the swap, no version string, a generic User-Agent, the proxied
+        placeholder port 1 and no listen port in the extension handshake: nothing links or names."""
+        tracker = [announce(1000, peer_id="A" * 20, key="11111111"), announce(1060, peer_id="A" * 20, key="11111111"),
+                   announce(3000, src="10.88.0.11", peer_id="B" * 20, key="22222222", proto="http", ua="curl/7.81.0")]
+        observer = [handshake(1001, peer_id="C" * 20), handshake(3001, src="10.88.0.11", peer_id="D" * 20),
+                    handshake(3002, src="10.88.0.11", encrypted=True)]
+        self.assertEqual(self.check(tracker, observer), [])
+
+    def test_same_identity_from_two_exits_is_a_finding_without_a_mark(self):
+        """The old identity showing up on the new exit links the exits, even inside one segment
+        (an announce of the old session that slipped out through the new tunnel)."""
+        d = self.check([announce(1000), announce(1500, src="10.88.0.11")], [], marks=[])
+        self.assertEqual(len(d), 2, d)  # peer_id and key
+        self.assertTrue(any("10.88.0.11" in x for x in d), d)
+
+    def test_same_observer_peer_id_across_rotation_is_a_finding(self):
+        """The peer_id a peer sees in the handshake counts too."""
+        d = self.check([], [handshake(1000), handshake(3000, src="10.88.0.11")])
+        self.assertEqual(len(d), 1, d)
+        self.assertIn("peer_id", d[0])
+
+    def test_client_fingerprint_is_a_finding(self):
+        """A libtorrent peer_id prefix, a version string or a User-Agent naming Nyx or libtorrent
+        identifies the client, rotation or not."""
+        cases = [([announce(1000, peer_id="-LT20B0-abcdefghijkl")], []),
+                 ([], [handshake(1000, peer_id="-LT20B0-abcdefghijkl")]),
+                 ([], [handshake(1000, v="libtorrent/2.0.11.0")]),
+                 ([], [handshake(1000, v="Nyx/0.1")]),
+                 ([announce(1000, proto="http", ua="Nyx/0.1")], [])]
+        for tracker, observer in cases:
+            d = self.check(tracker, observer)
+            self.assertEqual(len(d), 1, (tracker, observer, d))
+            self.assertIn("names the client", d[0])
+
+    def test_same_version_string_across_rotation_is_a_finding(self):
+        """Even a neutral `v` links the sessions when it is the same unusual string on both sides."""
+        d = self.check([], [handshake(1000, peer_id="C" * 20, v="Foo 1.2"), handshake(3000, src="10.88.0.11", peer_id="D" * 20, v="Foo 1.2")])
+        self.assertEqual(len(d), 1, d)
+        self.assertIn("v", d[0])
+
+    def test_announced_listen_port_is_a_finding(self):
+        """A proxied client cannot take inbound connections, so any concrete port it announces is
+        its real listen port (or a stable token): a finding in the handshake and at the tracker.
+        Port 1 (libtorrent's placeholder when it cannot accept) and no port are clean."""
+        d = self.check([announce(1000, port=51413)], [handshake(1000, p=6881)])
+        self.assertEqual(len(d), 2, d)
+        self.assertTrue(all("listen port" in x for x in d), d)
+        self.assertEqual(self.check([announce(1000, port=1), announce(1001, port="1", proto="http")], [handshake(1000)]), [])
 
 
 class Report(unittest.TestCase):
