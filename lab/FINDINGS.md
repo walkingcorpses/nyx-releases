@@ -136,6 +136,29 @@ Original finding (Task 11 baseline):
   as an OS behaviour outside the app's control and allowlist ICMP to the endpoint in the lab, with
   a written reason. A crash will always produce some of it.
 
+## Findings for Task 14 (rotation)
+
+### F3. The lock showed off for up to one tick right after a failed rotation swap (rotation_lock)
+
+- [x] **FIXED in Task 14** (commit 60f62ee). The first `LAB_ONLY=rotation_swap,rotation_failure_holds`
+  run sampled `('down', False, 'downloading')` right after `rotate_now` to the cut exit B
+  returned; the next 14 samples were held. The engine was already on the blocked SOCKS port (no
+  route, so nothing could leave), but the kill switch only ran on the next poller tick. A failed
+  swap now applies the kill switch itself; the features test asserts `killed` and `queued`
+  straight after the failed `rotate_now`. Rerun: 15/15 samples held.
+
+### F4. ICMP port-unreachable to exit B after rotating away from it (egress)
+
+- [x] **RESOLVED BY NARROW ALLOWLIST in Task 14** (lab analyzer). Same shape as F2: after the swap
+  back to exit A the client closed B's WireGuard socket and B's datagrams still in flight got the
+  kernel's port unreachable (1 packet, in the positive_control window, which allowed only exit A).
+  `check_egress` now takes `closed` endpoints (exit B): for those only the F2 shape (ICMP 3/3 to
+  B quoting B:51820 -> client) is allowed, never UDP. Test:
+  `test_closed_endpoint_allows_only_its_port_unreachable`.
+
+Full lab run 2026-10-27 20:19 UTC (Task 14, all 14 scenarios incl. rotation_swap and
+rotation_failure_holds): 0 scenarios failed, 0 findings, positive control complete.
+
 ## Analysis
 
 **The lab can see leaks (positive control).** It is unchanged from Task 10, plus an IPv6 leak
