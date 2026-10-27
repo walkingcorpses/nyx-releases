@@ -29,6 +29,7 @@ pub struct TestPeer {
     endpoint: SocketAddr,
     client: WgConfig,
     paused: Arc<AtomicBool>,
+    cut: Arc<AtomicBool>,
     queries: Arc<Mutex<Vec<String>>>,
     link: Arc<Link<Infallible>>,
     worker: Option<JoinHandle<()>>,
@@ -45,7 +46,8 @@ impl TestPeer {
         let sock = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind test peer socket");
         let endpoint = sock.local_addr().unwrap();
         let paused = Arc::new(AtomicBool::new(false));
-        let wire = Wire::new(make_tunn(server_key, client_pub, None, None), sock, false, None, paused.clone());
+        let cut = Arc::new(AtomicBool::new(false));
+        let wire = Wire::new(make_tunn(server_key, client_pub, None, None), sock, false, None, paused.clone(), cut.clone());
 
         let mut dev = VirtDevice::default();
         let iface = make_iface(&mut dev, &[(IpAddr::V4(PEER_IP), 24)], false);
@@ -73,7 +75,7 @@ impl TestPeer {
             endpoint: Endpoint { host: endpoint.ip().to_string(), port: endpoint.port() },
             keepalive: None,
         };
-        TestPeer { endpoint, client, paused, queries, link, worker: Some(worker) }
+        TestPeer { endpoint, client, paused, cut, queries, link, worker: Some(worker) }
     }
 
     /// The peer's UDP address on loopback (pass to `Tunnel::up`).
@@ -89,6 +91,13 @@ impl TestPeer {
     /// While paused the peer drops every packet in both directions (simulates a dead VPN).
     pub fn set_paused(&self, paused: bool) {
         self.paused.store(paused, Ordering::SeqCst);
+    }
+
+    /// One-way path failure: while set the peer drops everything the client sends but keeps
+    /// sending the client a fresh handshake initiation about once a second. The client receives
+    /// initiations whose responses never arrive, so no handshake ever completes.
+    pub fn set_inbound_cut(&self, cut: bool) {
+        self.cut.store(cut, Ordering::SeqCst);
     }
 
     /// Every name the DNS responder was asked for, in order.

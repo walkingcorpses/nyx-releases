@@ -169,6 +169,69 @@ fn stats_report_handshake_age_and_bytes() {
     assert!(st.rx_bytes >= before.rx_bytes + 50_000, "rx {} -> {}", before.rx_bytes, st.rx_bytes);
 }
 
+/// The tunnel's reported age (time since the last confirmed contact); panics before the first.
+fn age(t: &Tunnel) -> Duration {
+    t.stats().handshake_age.expect("tunnel has had a confirmed contact")
+}
+
+/// Samples the age every 100 ms for `d` and fails if it ever goes down: no confirmed contact may
+/// happen in that time. Returns the last sample.
+fn assert_age_only_grows(t: &Tunnel, d: Duration) -> Duration {
+    let end = Instant::now() + d;
+    let mut prev = age(t);
+    while Instant::now() < end {
+        thread::sleep(Duration::from_millis(100));
+        let a = age(t);
+        assert!(a >= prev, "age went back from {prev:?} to {a:?}: something counted as contact");
+        prev = a;
+    }
+    prev
+}
+
+/// F1 (lab): a one-way path failure. The peer drops everything from the client but keeps sending
+/// handshake initiations; the client answers each one, the answers never arrive. That is not a
+/// live tunnel: the age must keep growing past the (shortened) stale threshold, and fall back to
+/// small once the path is whole again and a real handshake completes.
+#[test]
+fn half_handshake_does_not_count_as_contact() {
+    let peer = TestPeer::start();
+    // Re-key at 2 s, so the stale threshold an app would use is 3 s (2/3 rule in netlock.rs).
+    let t = Tunnel::up_with_rekey(&peer.client_config(), peer.endpoint(), Duration::from_secs(2)).unwrap();
+    wait_handshake(&t);
+    peer.set_inbound_cut(true);
+    thread::sleep(Duration::from_millis(500)); // a re-key answered just before the cut may still land
+    let last = assert_age_only_grows(&t, Duration::from_secs(7));
+    assert!(last > Duration::from_secs(6), "age {last:?} should be well past the 3 s stale threshold");
+    peer.set_inbound_cut(false);
+    let end = Instant::now() + Duration::from_secs(10);
+    while age(&t) > Duration::from_secs(1) {
+        assert!(Instant::now() < end, "no fresh handshake within 10 s of the path coming back: age {:?}", age(&t));
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Initiations alone (no re-key of our own due, default 120 s re-key) never reset the age.
+#[test]
+fn initiation_alone_does_not_reset_age() {
+    let (peer, t) = up();
+    peer.set_inbound_cut(true);
+    let last = assert_age_only_grows(&t, Duration::from_secs(4));
+    assert!(last >= Duration::from_secs(4), "age {last:?}");
+}
+
+/// An authenticated transport packet from the peer is confirmed contact: echo data received long
+/// after the handshake (no re-key due for 120 s) brings the age back to about zero.
+#[test]
+fn data_or_keepalive_counts_as_contact() {
+    let (_peer, t) = up();
+    let (mut s, code, _) = socks(&t, 1, &addr_bytes(ECHO));
+    assert_eq!(code, 0);
+    thread::sleep(Duration::from_millis(1500));
+    assert!(age(&t) >= Duration::from_millis(1400), "age {:?}", age(&t));
+    assert_echoes(&mut s, b"proof of life");
+    assert!(age(&t) < Duration::from_millis(500), "echo data did not count as contact: age {:?}", age(&t));
+}
+
 #[test]
 fn blocked_tunnel_refuses_everything() {
     let t = Tunnel::blocked().unwrap();
