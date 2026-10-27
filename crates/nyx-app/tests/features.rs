@@ -10,7 +10,7 @@ use chrono::Local;
 use nyx_core::{Feed, ProxySettings, Settings};
 use nyx_engine::testkit::socks5::Socks5Stub;
 use nyx_engine::testkit::{free_loopback_addr, make_torrent};
-use nyx_lib::state::AppState;
+use nyx_app::state::AppState;
 
 /// An app state on loopback with no discovery, storing everything in `dir`.
 fn app(dir: &Path) -> AppState {

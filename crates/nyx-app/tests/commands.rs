@@ -4,7 +4,7 @@
 use nyx_core::{EncryptionPref, ProxySettings, Settings};
 use nyx_engine::testkit::free_loopback_addr;
 use nyx_engine::EncryptionMode;
-use nyx_lib::state::AppState;
+use nyx_app::state::AppState;
 
 /// An app state on loopback with no discovery, storing everything in `dir`.
 fn app(dir: &std::path::Path) -> AppState {

@@ -1,0 +1,23 @@
+# nyx-app: the app logic (AppState, DTOs, RSS feeds, update check, poller) with no Tauri types,
+# so both the desktop shell (src-tauri) and a future headless daemon can reuse it.
+[package]
+name = "nyx-app"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+nyx-core = { path = "../nyx-core" }
+nyx-engine = { path = "../nyx-engine" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+ureq = { version = "3", default-features = false, features = ["rustls", "socks-proxy", "gzip"] }
+sha2 = "0.10"
+regex = "1"
+quick-xml = "0.38"
+urlencoding = "2"
+
+[dev-dependencies]
+tempfile = "3"
+nyx-engine = { path = "../nyx-engine", features = ["test-support"] }

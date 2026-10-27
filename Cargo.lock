@@ -2386,6 +2386,23 @@ name = "nyx"
 version = "1.0.0"
 dependencies = [
  "chrono",
+ "nyx-app",
+ "nyx-core",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-dialog",
+ "tauri-plugin-notification",
+ "tauri-plugin-single-instance",
+ "tempfile",
+ "windows-sys 0.59.0",
+ "winreg 0.55.0",
+]
+
+[[package]]
+name = "nyx-app"
+version = "1.0.0"
+dependencies = [
+ "chrono",
  "nyx-core",
  "nyx-engine",
  "quick-xml 0.38.4",
@@ -2393,16 +2410,9 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "tauri",
- "tauri-build",
- "tauri-plugin-dialog",
- "tauri-plugin-notification",
- "tauri-plugin-single-instance",
  "tempfile",
  "ureq",
  "urlencoding",
- "windows-sys 0.59.0",
- "winreg 0.55.0",
 ]
 
 [[package]]

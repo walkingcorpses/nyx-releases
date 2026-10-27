@@ -7,8 +7,8 @@ use std::sync::Arc;
 use nyx_core::{Settings, TorrentId};
 use tauri::State;
 
-use crate::dto::{AppUpdateDto, DetailDto, MetaDto, RssReportDto, SearchResultDto, StatusDto, TorrentDto};
-use crate::state::AppState;
+use nyx_app::dto::{AppUpdateDto, DetailDto, MetaDto, RssReportDto, SearchResultDto, StatusDto, TorrentDto};
+use nyx_app::state::AppState;
 use crate::{assoc, instance};
 
 type St<'a> = State<'a, Arc<AppState>>;

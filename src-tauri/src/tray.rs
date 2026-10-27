@@ -8,7 +8,7 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::{AppHandle, Manager};
 
 use crate::instance::show_main;
-use crate::state::AppState;
+use nyx_app::state::AppState;
 
 /// What each tray menu item does, by menu id. The menu's click handler calls this, and so does
 /// the test hook in the poller, so tests exercise the real handler without a popup menu.

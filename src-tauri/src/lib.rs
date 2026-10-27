@@ -3,14 +3,8 @@
 
 pub mod assoc;
 pub mod commands;
-pub mod dto;
-pub mod feeds;
-pub mod http;
 pub mod instance;
-pub mod poller;
-pub mod state;
 pub mod tray;
-pub mod update;
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -23,8 +17,8 @@ use nyx_core::data_dir;
 use tauri::{Emitter, Manager, PhysicalPosition, RunEvent, WindowEvent};
 use tauri_plugin_notification::NotificationExt;
 
-use dto::UpdateDto;
-use state::AppState;
+use nyx_app::dto::UpdateDto;
+use nyx_app::state::AppState;
 
 /// How often the poller saves resume data while running (ticks of one second).
 const SAVE_EVERY_TICKS: u32 = 60;
