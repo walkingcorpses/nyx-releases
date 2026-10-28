@@ -84,7 +84,7 @@ Settings > Network lets you use a VPN without installing anything else and witho
 - **Rotation (off by default).** Pick two or more profiles and Nyx switches between them every 5 to 10 minutes (you choose the range). The new tunnel is brought up first, and only then does Nyx move over. If it cannot connect, the lock holds; Nyx never falls back to the old route or to a direct connection. Every change of route (a rotation, or picking another profile or "No VPN" in Settings) also gives the torrent engine a new peer ID and tracker key, so trackers cannot link sessions across servers. If renewing the identity fails, Nyx shows a warning and carries on with the old one. Switching resets your peer connections, and some private trackers ban for changing IP, so leave rotation off for those.
 - **What this does not do.** Other peers in a swarm still see your VPN exit address, and your VPN provider can still see your traffic. Tor is not included yet. The tunnel carries no inbound connections, so you only connect out.
 
-**Proof, not promises.** The repo has a leak lab (`lab/`): Docker containers with Nyx clients, VPN exits, a tracker, seeders and a packet capture on each client. It checks that the only thing leaving the client is WireGuard to the active server, that no server ever sees the real address, that the lock holds when the tunnel is cut (one way, both ways, for minutes), during rotation and across crashes, and that sessions cannot be linked across rotations (new peer ID and tracker key each time, and the torrent engine sends no client name or version; Nyx's own web requests for feeds, search and the update check still say "Nyx"). Traits shared by every libtorrent client, and timing correlation between the old and new identity, can still single out a libtorrent client. A deliberate-leak control proves the lab can see leaks. Run it with `labun.ps1` (about 15 minutes, needs Docker). It does not cover your VPN provider's logging, timing correlation by peers, or Windows-only behaviour such as adapter binding.
+**Proof, not promises.** The repo has a leak lab (`lab/`): Docker containers with Nyx clients, VPN exits, a tracker, seeders and a packet capture on each client. It checks that the only thing leaving the client is WireGuard to the active server, that no server ever sees the real address, that the lock holds when the tunnel is cut (one way, both ways, for minutes), during rotation and across crashes, and that sessions cannot be linked across rotations (new peer ID and tracker key each time, and the torrent engine sends no client name or version; Nyx's own web requests for feeds, search and the update check still say "Nyx"). Traits shared by every libtorrent client, and timing correlation between the old and new identity, can still single out a libtorrent client. A deliberate-leak control proves the lab can see leaks. Run it with `lab\run.ps1` (about 15 minutes, needs Docker). It does not cover your VPN provider's logging, timing correlation by peers, or Windows-only behaviour such as adapter binding.
 
 ## Automation (all optional)
 
@@ -110,7 +110,7 @@ To make Nyx open `.torrent` files and magnet links: **Settings → System → Ma
 
 **Why does the DHT stop when I use a proxy?** DHT is UDP traffic to arbitrary nodes; letting it run would be a way around the proxy. With a proxy set, Nyx finds peers through trackers (which do go through the proxy).
 
-**Does the kill switch protect me if I use a VPN instead of a proxy?** The kill switch watches the SOCKS5 proxy. For a VPN, use *Network adapter* binding: Nyx connects only through that adapter.
+**Does the kill switch protect me if I use a VPN instead of a proxy?** Yes, if you use the built-in WireGuard (Settings → Network): the network lock pauses everything whenever that tunnel is not really connected. For a VPN app you run yourself, use *Network adapter* binding: Nyx then connects only through that adapter.
 
 **Is it safe to automate downloads?** Nyx never runs anything it downloads and only ever adds torrents. You are responsible for what your feeds and search provider point at.
 
@@ -125,8 +125,12 @@ The source is in this repository (MIT). Design notes: `docs/superpowers/specs/20
 ```
 crates/nyx-core     pure logic: input validation, queue, categories, schedule, settings (no libtorrent)
 crates/nyx-engine   safe Rust API over libtorrent (cpp/shim.cpp is the only C++); testkit behind `test-support`
-src-tauri           the app: commands, 1 Hz poller, tray, single instance, file associations
+crates/nyx-tunnel   userspace WireGuard (boringtun + smoltcp) with a local password-protected SOCKS5 server
+crates/nyx-app     app logic with no UI types: settings, VPN profiles, network lock, rotation, RSS, updates
+crates/nyx-daemon   headless build of the app logic with a loopback control port (used by the leak lab)
+src-tauri           the app shell: commands, 1 Hz poller, tray, single instance, file associations
 ui                  Svelte + TypeScript UI (no torrent logic)
+lab                 Docker leak lab: Nyx clients, VPN exits, tracker, seeders and packet captures
 e2e                 Playwright smoke test that drives the real exe
 scripts             setup-toolchain.ps1, build-release.ps1
 ```
@@ -171,7 +175,8 @@ Settings has a "Make Nyx the default" button for `.torrent` files and magnet lin
 ### Test
 
 ```powershell
-cargo test --workspace            # core, engine (real libtorrent sessions on loopback), app, instance tests
+cargo test --workspace            # core, engine (real libtorrent sessions on loopback), tunnel, app, daemon, instance tests
+lab\run.ps1                       # the leak lab (needs Docker, about 15 minutes; see lab\README.md)
 cargo test -p nyx-engine --test swarm -- --ignored --nocapture   # real public swarm, direct and via proxy (needs internet)
 npm --prefix ui test              # UI unit and component tests (Vitest)
 npm --prefix ui run check         # svelte-check
@@ -196,6 +201,12 @@ Bump `version` in `Cargo.toml` and `src-tauri/tauri.conf.json`, commit and push,
 Nyx is a neutral BitTorrent client, like any other. Only download and share content you have the right to. It ships with no search provider, no feeds and no trackers of its own.
 
 ## What's new
+
+### Unreleased (next version)
+
+- **Built-in WireGuard VPN** with a **network lock**, **timed rotation** between profiles and **identity renewal** (new peer ID and tracker key per route change). See [Built-in VPN](#built-in-vpn-wireguard).
+- **Leak lab** in `lab/`: Docker containers and packet captures that check what leaves a client, with a deliberate-leak control so a blind lab fails.
+- Smaller privacy fixes the lab found: the torrent engine no longer sends a libtorrent fingerprint or a client version, and tracker keys are random per session.
 
 ### 1.0.0
 
