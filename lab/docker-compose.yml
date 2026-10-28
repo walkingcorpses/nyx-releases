@@ -1,0 +1,135 @@
+# Nyx leak lab (spec section 7). Run with lab/run.ps1 or lab/run.sh, which build nyx-lab/daemon
+# from the repo root first and tear the lab down afterwards.
+#
+# real     10.77.0.0/24 + fd77::/64  the client's home LAN (see the note on the network), IPv6 on so
+#                        IPv6 leaks can happen: client-a .10 / fd77::a, gateway .1 / fd77::1.
+#                        The host (Docker's bridge) is reachable on this LAN at 10.77.0.254 / fd77::fe.
+# internet 10.88.0.0/24  internal: gateway .1 (NAT, the client's real "ISP" identity),
+#                        wg-exit-a .10, wg-exit-b .11, tracker .20, seeder .21, observer .22,
+#                        dns .23, canary .24
+# Docker's own bridge address is moved to .254 so .1 is free for the gateway.
+# Volume `conf` carries keys, configs and the torrent from the runner to the exits, the seeder and
+# the client. Volume `labout` holds the live logs and the capture: a named volume, because reads of
+# a Windows bind mount from another container can be stale. The runner copies it to lab/out/ at
+# the end, with the report.
+name: nyx-lab
+
+networks:
+  # Not `internal`: Docker's internal-network filter drops bridged frames whose IP source or
+  # destination is off-subnet, so the client could not route through the gateway container at all
+  # (measured: ARP to 10.77.0.1 works, the TCP SYN to 10.88.0.20 never reaches it). Real-internet
+  # egress is closed instead by: no host masquerade for this bridge, the client's default route
+  # pointing at the lab gateway, and the gateway having no default route (gateway/entry.sh).
+  real:
+    enable_ipv6: true
+    driver_opts: { com.docker.network.bridge.enable_ip_masquerade: "false" }
+    ipam:
+      config: [{ subnet: 10.77.0.0/24, gateway: 10.77.0.254 }, { subnet: "fd77::/64", gateway: "fd77::fe" }]
+  internet:
+    internal: true
+    ipam:
+      config: [{ subnet: 10.88.0.0/24, gateway: 10.88.0.254 }]
+
+volumes:
+  conf: {}
+  labout: {}
+
+x-net-image: &net-image
+  image: nyx-lab/net
+  build: { context: images, dockerfile: wg-exit/Dockerfile }
+
+x-server: &server
+  image: nyx-lab/servers
+  build: { context: images/servers }
+  volumes: ["labout:/out"]
+
+x-exit: &exit
+  <<: *net-image
+  command: wg-exit-entry
+  cap_add: [NET_ADMIN]
+  devices: ["/dev/net/tun:/dev/net/tun"]
+  sysctls: { net.ipv4.ip_forward: 1 }
+  volumes: ["conf:/conf"]
+
+services:
+  gateway:
+    <<: *net-image
+    command: gateway-entry
+    cap_add: [NET_ADMIN]
+    sysctls: { net.ipv4.ip_forward: 1 }
+    networks:
+      real: { ipv4_address: 10.77.0.1, ipv6_address: "fd77::1" }
+      internet: { ipv4_address: 10.88.0.1 }
+
+  wg-exit-a:
+    <<: *exit
+    environment: { EXIT_NAME: wg-exit-a }
+    networks: { internet: { ipv4_address: 10.88.0.10 } }
+
+  wg-exit-b:
+    <<: *exit
+    environment: { EXIT_NAME: wg-exit-b }
+    networks: { internet: { ipv4_address: 10.88.0.11 } }
+
+  tracker:
+    <<: *server
+    command: ["python", "tracker.py"]
+    networks: { internet: { ipv4_address: 10.88.0.20 } }
+
+  observer:
+    <<: *server
+    command: ["python", "observer.py"]
+    networks: { internet: { ipv4_address: 10.88.0.22 } }
+
+  dns:
+    <<: *server
+    command: ["python", "dns.py"]
+    networks: { internet: { ipv4_address: 10.88.0.23 } }
+
+  canary:
+    <<: *server
+    command: ["python", "canary.py"]
+    networks: { internet: { ipv4_address: 10.88.0.24 } }
+
+  # A plain Nyx seeding directly (no profile): the client's download source.
+  seeder:
+    image: nyx-lab/daemon
+    environment: { NYX_DATA_DIR: /data, NYX_NO_DISCOVERY: "1" }
+    volumes: ["conf:/conf"]
+    networks: { internet: { ipv4_address: 10.88.0.21 } }
+
+  # The client under test: real defaults (discovery on, kill switch on), profile A pre-seeded.
+  client-a:
+    image: nyx-lab/client
+    build: { context: images/client }
+    cap_add: [NET_ADMIN]  # only for the default routes set in entry.sh, which then drops it
+    # NYX_LAB_STALE_AFTER_SECS (lab-only override, read by nyx-daemon only): the network lock calls
+    # the tunnel stale after 20 s without a handshake instead of 180 s, for the kill-timing check.
+    # NYX_LAB_ROTATE_SECS (lab-only, nyx-daemon only): a fixed 60 s rotation interval instead of the
+    # settings' minutes, so rotation_swap sees one timer-driven swap; it only matters while rotation is on.
+    environment: { CLIENT_NAME: client-a, NYX_DATA_DIR: /data, NYX_LAB_DEBUG: "1", NYX_LAB_STALE_AFTER_SECS: "20", NYX_LAB_ROTATE_SECS: "60" }
+    volumes: ["conf:/conf:ro"]
+    networks: { real: { ipv4_address: 10.77.0.10, ipv6_address: "fd77::a" } }
+    depends_on: [gateway]
+
+  # Records every packet LEAVING client-a (shares its network namespace).
+  sniff-client-a:
+    <<: *net-image
+    network_mode: "service:client-a"
+    cap_add: [NET_ADMIN, NET_RAW]
+    command: ["tcpdump", "-i", "eth0", "-Q", "out", "--immediate-mode", "-U", "-Z", "root", "-w", "/out/client-a.pcap"]
+    volumes: ["labout:/out"]
+    depends_on: [client-a]
+
+  runner:
+    image: nyx-lab/runner
+    build: { context: ., dockerfile: images/runner/Dockerfile }
+    network_mode: none
+    # LAB_ONLY=<scenario>[,<scenario>]: dev runs of a subset (cold_start and the control always run).
+    environment: { LAB_ONLY: "${LAB_ONLY:-}" }
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock"
+      - "labout:/out"
+      - "./out:/host-out"
+      - "conf:/conf"
+    depends_on: [gateway, wg-exit-a, wg-exit-b, tracker, observer, dns, canary, seeder, client-a, sniff-client-a]

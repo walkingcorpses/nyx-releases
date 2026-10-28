@@ -20,20 +20,13 @@ custom-protocol = ["tauri/custom-protocol"]
 
 [dependencies]
 nyx-core = { path = "../crates/nyx-core" }
-nyx-engine = { path = "../crates/nyx-engine" }
+nyx-app = { path = "../crates/nyx-app" }
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-single-instance = "2"
 tauri-plugin-notification = "2"
 tauri-plugin-dialog = "2"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 winreg = "0.55"
-ureq = { version = "3", default-features = false, features = ["rustls", "socks-proxy", "gzip"] }
-sha2 = "0.10"
-regex = "1"
-quick-xml = "0.38"
-urlencoding = "2"
 windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging", "Win32_System_Threading", "Win32_Foundation"] }
 
 [build-dependencies]
@@ -41,4 +34,3 @@ tauri-build = "2"
 
 [dev-dependencies]
 tempfile = "3"
-nyx-engine = { path = "../crates/nyx-engine", features = ["test-support"] }

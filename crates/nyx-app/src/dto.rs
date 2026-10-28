@@ -6,6 +6,7 @@ use nyx_core::TorrentId;
 use nyx_engine::{FileInfo, PeerInfo, TorrentDetail, TorrentMeta, TorrentState, TorrentStatus, TrackerInfo};
 use serde::Serialize;
 
+use crate::netlock::Route;
 use crate::poller::Update;
 
 /// One row of the torrent table. `status` is a lowercase word; `error` is set only when
@@ -174,6 +175,28 @@ pub struct StatusDto {
     pub update: Option<AppUpdateDto>,
     /// Things that went wrong at startup (for example an unreadable blocklist).
     pub warnings: Vec<String>,
+    /// The VPN route ("starting", "up", "stale", "down"), or "none" without an active profile.
+    pub route: String,
+    /// Name of the active VPN profile.
+    pub profile_name: Option<String>,
+}
+
+/// The Network page's status card (and the result of the profile Test button). No key material.
+#[derive(Debug, Clone, Serialize)]
+pub struct NetworkStatusDto {
+    pub route: Route,
+    /// Profile name.
+    pub profile: Option<String>,
+    /// Seconds since the last confirmed contact with the VPN server: a handshake we started that
+    /// it completed (see nyx-tunnel `TunnelStats`).
+    /// `None` before the first handshake. The name is historical.
+    pub handshake_age_secs: Option<u64>,
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+    /// The public IP seen through the tunnel (Test button only, best effort).
+    pub exit_ip: Option<String>,
+    /// Seconds until the next automatic rotation; `None` while rotation is off.
+    pub next_rotation_secs: Option<u64>,
 }
 
 /// One search result.
@@ -192,4 +215,16 @@ pub struct RssReportDto {
     /// Feeds seen for the first time: their current items were recorded, not downloaded.
     pub baselined: u32,
     pub errors: Vec<String>,
+}
+
+/// One saved VPN profile as the UI sees it. Deliberately carries no config text or key material.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ProfileDto {
+    pub id: String,
+    pub name: String,
+    pub group: String,
+    /// "host:port" for display.
+    pub endpoint: String,
+    /// This is the profile the tunnel connects with.
+    pub active: bool,
 }

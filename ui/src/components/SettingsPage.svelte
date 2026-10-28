@@ -1,11 +1,13 @@
-<!-- SettingsPage.svelte - full settings editor in a modal. Tabs: Connection (encryption, proxy),
+<!-- SettingsPage.svelte - full settings editor in a modal. Tabs: Connection (encryption, proxy), Network (VPN profiles, lock, rotation),
      Limits (caps, schedule), Queue, Categories, System. Edits a private copy of the settings and
      only hands it back on Save, so Cancel discards everything. -->
 <script lang="ts">
   import CategoryEditor from './CategoryEditor.svelte';
+  import NetworkPage from './NetworkPage.svelte';
   import RssEditor from './RssEditor.svelte';
   import ScheduleEditor from './ScheduleEditor.svelte';
   import { api } from '../lib/api';
+  import { rotationError } from '../lib/network';
   import { blockError } from '../lib/schedule';
   import { appStatus } from '../lib/store';
   import type { Settings } from '../lib/types';
@@ -16,9 +18,10 @@
     onclose: () => void;
   } = $props();
 
-  type Tab = 'connection' | 'limits' | 'queue' | 'categories' | 'automation' | 'system';
+  type Tab = 'connection' | 'network' | 'limits' | 'queue' | 'categories' | 'automation' | 'system';
   const tabs: { id: Tab; label: string }[] = [
     { id: 'connection', label: 'Connection' },
+    { id: 'network', label: 'Network' },
     { id: 'limits', label: 'Limits' },
     { id: 'queue', label: 'Queue' },
     { id: 'categories', label: 'Categories' },
@@ -30,6 +33,9 @@
   // Private working copy (structuredClone keeps nested arrays independent of the store).
   // svelte-ignore state_referenced_locally
   let draft = $state<Settings>(structuredClone($state.snapshot(settings)));
+  // The active profile when the dialog opened, to tell whether the user changed it.
+  // svelte-ignore state_referenced_locally
+  const openedActive = settings.network.active_profile;
   // svelte-ignore state_referenced_locally
   let proxyOn = $state(settings.proxy !== null);
   let proxy = $state({
@@ -61,7 +67,7 @@
       : '',
   );
   const scheduleBad = $derived(draft.schedule.blocks.some((b) => blockError(b) !== null));
-  const canSave = $derived(!saving && !proxyError && !scheduleBad && draft.max_active_downloads >= 1 && draft.max_active_seeds >= 1);
+  const canSave = $derived(!saving && !proxyError && !scheduleBad && !rotationError(draft.network.rotation) && draft.max_active_downloads >= 1 && draft.max_active_seeds >= 1);
 
   /** KB/s <-> bytes/s for the two global caps. */
   const kb = (bytes: number) => Math.round(bytes / 1024);
@@ -69,6 +75,16 @@
   async function save(): Promise<void> {
     saving = true;
     error = '';
+    // A rotation can switch the profile while this dialog is open. When the user did not pick a
+    // profile here, keep what the backend runs now instead of sending back the one from when the
+    // dialog opened (that would undo the rotation).
+    if (draft.network.active_profile === openedActive) {
+      try {
+        draft.network.active_profile = (await api.getSettings()).network.active_profile;
+      } catch {
+        /* keep the draft value; the backend still validates it */
+      }
+    }
     const out: Settings = {
       ...$state.snapshot(draft),
       bind_interface: iface.trim() || null,
@@ -145,7 +161,9 @@
     </aside>
 
     <div class="content">
-      {#if tab === 'connection'}
+      {#if tab === 'network'}
+        <NetworkPage bind:draft />
+      {:else if tab === 'connection'}
         <h3>Peer encryption</h3>
         <label class="radio"><input type="radio" name="enc" value="Forced" bind:group={draft.encryption} /> <span><b>Forced</b> <span class="muted">(recommended): refuse peers that do not encrypt</span></span></label>
         <label class="radio"><input type="radio" name="enc" value="Prefer" bind:group={draft.encryption} /> <span><b>Prefer encrypted</b> <span class="muted">: connect to plaintext peers too, for hard-to-seed torrents</span></span></label>

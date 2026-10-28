@@ -57,6 +57,10 @@ public:
     // `dht_state` is the blob from save_session_state() (may be empty). `init` carries the listen
     // address and the privacy policy the session must start with (see SessionInit in ffi.rs).
     Session(rust::Slice<const std::uint8_t> dht_state, SessionInit const& init);
+    // The one place a session is built (both constructors and respawn() end here): `params` already
+    // carries every setting, so the policy is in force before the first socket opens. The rest is
+    // the little state this wrapper keeps beside libtorrent.
+    Session(lt::session_params params, bool discovery, std::string listen, std::string iface, bool proxied);
     ~Session();
     Session(Session const&) = delete;
     Session& operator=(Session const&) = delete;
@@ -109,6 +113,13 @@ public:
     // Persistence. Session state is the DHT blob; resume data is one blob per torrent.
     rust::Vec<std::uint8_t> save_session_state() const;
     rust::Vec<ResumeBlob> save_resume(std::uint32_t timeout_ms) const;
+
+    // Identity rotation (Task 15): returns a NEW session with the same settings (proxy, adapter,
+    // encryption, limits), blocklist, parked magnets and every torrent (from resume data), whose
+    // torrents get a fresh tracker peer_id and key. This session is silenced and paused first and
+    // stays that way; the caller swaps the new one in and destroys this one. On any error this
+    // session is put back exactly as it was and the error is thrown (-> Rust Err).
+    std::unique_ptr<Session> respawn(std::uint32_t timeout_ms) const;
 
 private:
     mutable lt::session ses_;

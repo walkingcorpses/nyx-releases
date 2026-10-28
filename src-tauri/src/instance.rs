@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use tauri::{AppHandle, Emitter, Manager};
 
-use crate::state::AppState;
+use nyx_app::state::AppState;
 
 /// Arguments forwarded by a second launch before AppState exists (the first instance is still
 /// starting). `queue_own_args` moves them into the state once it is ready, so none are lost.

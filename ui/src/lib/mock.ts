@@ -3,7 +3,7 @@
 // the progress bars and speed graph move. `?rows=1000` in the URL loads 1,000 rows for a
 // scroll-performance check.
 
-import type { AppUpdate, Detail, FileItem, Meta, SearchResult, Settings, AppStatus, Status, Torrent, UpdatePayload } from './types';
+import type { AppUpdate, Detail, FileItem, Meta, NetworkStatus, Profile, SearchResult, Settings, AppStatus, Status, Torrent, UpdatePayload } from './types';
 
 const NAMES = [
   'ubuntu-26.04-desktop-amd64.iso', 'Big Buck Bunny (2008) 1080p', 'Sintel.2010.4k.HDR',
@@ -46,7 +46,13 @@ let settings: Settings = {
   kill_switch: true, bind_interface: null, blocklist: null, check_updates: false,
   rss: { feeds: [{ name: 'Linux ISOs', url: 'https://example.org/feed.xml', filter: 'ubuntu|debian', category: 'software', enabled: true }], interval_minutes: 30 },
   search_url: '',
+  network: { active_profile: 'p1', rotation: { enabled: false, pool: [], min_minutes: 5, max_minutes: 10 } },
 };
+// Two fake VPN profiles for the browser preview; the real backend never sends keys.
+let profiles: Profile[] = [
+  { id: 'p1', name: 'Mullvad Amsterdam', group: 'Mullvad', endpoint: '193.32.126.66:51820', active: true },
+  { id: 'p2', name: 'Mullvad Zurich', group: 'Mullvad', endpoint: '185.65.134.80:51820', active: false },
+];
 let order: string[] = list.map((t) => t.id);
 
 const subs = new Set<(u: UpdatePayload) => void>();
@@ -131,6 +137,8 @@ export const mockApi = {
     killed: new URLSearchParams(globalThis.location?.search ?? '').has('proxydown'),
     update: new URLSearchParams(globalThis.location?.search ?? '').has('update') ? { version: '1.1.0', notes: 'Faster everything.' } : null,
     warnings: [],
+    route: 'up',
+    profile_name: 'Mullvad Amsterdam',
   }),
   checkUpdate: async (): Promise<AppUpdate | null> => null,
   installUpdate: async () => '1.1.0',
@@ -141,6 +149,25 @@ export const mockApi = {
     { title: `${query} Server 26.04`, link: 'https://example.org/x.torrent', size: 2_100_000_000, seeders: 87 },
   ],
   fetchTorrentUrl: async () => 'D:\\Downloads\\fetched.torrent',
+  listProfiles: async () => profiles.map((p) => ({ ...p, active: p.id === settings.network.active_profile })),
+  importProfile: async (_path: string, name: string, group: string): Promise<Profile> => {
+    const p = { id: 'p' + (profiles.length + 1), name, group, endpoint: '203.0.113.9:51820', active: false };
+    profiles = [...profiles, p];
+    return p;
+  },
+  renameProfile: async (id: string, name: string, group: string) => {
+    profiles = profiles.map((p) => (p.id === id ? { ...p, name, group } : p));
+  },
+  deleteProfile: async (id: string) => { profiles = profiles.filter((p) => p.id !== id); },
+  testProfile: async (): Promise<NetworkStatus> => ({
+    route: 'up', profile: 'Mullvad Amsterdam', handshake_age_secs: 1, rx_bytes: 4096, tx_bytes: 2048,
+    exit_ip: '193.32.126.66', next_rotation_secs: null,
+  }),
+  getNetworkStatus: async (): Promise<NetworkStatus> => ({
+    route: 'up', profile: 'Mullvad Amsterdam', handshake_age_secs: 12, rx_bytes: 52_428_800, tx_bytes: 3_145_728,
+    exit_ip: null, next_rotation_secs: settings.network.rotation.enabled ? 421 : null,
+  }),
+  rotateNow: async () => 'p2',
   getSettings: async () => settings,
   setSettings: async (s: Settings) => { settings = s; },
   registerAssociations: async () => {},

@@ -195,6 +195,12 @@
           "markdownDescription": "Enables the check_update command without any pre-configured scope."
         },
         {
+          "description": "Enables the delete_profile command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-delete-profile",
+          "markdownDescription": "Enables the delete_profile command without any pre-configured scope."
+        },
+        {
           "description": "Enables the fetch_torrent_url command without any pre-configured scope.",
           "type": "string",
           "const": "allow-fetch-torrent-url",
@@ -211,6 +217,12 @@
           "type": "string",
           "const": "allow-get-magnet",
           "markdownDescription": "Enables the get_magnet command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_network_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-network-status",
+          "markdownDescription": "Enables the get_network_status command without any pre-configured scope."
         },
         {
           "description": "Enables the get_queue_order command without any pre-configured scope.",
@@ -231,6 +243,12 @@
           "markdownDescription": "Enables the get_status command without any pre-configured scope."
         },
         {
+          "description": "Enables the import_profile command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-import-profile",
+          "markdownDescription": "Enables the import_profile command without any pre-configured scope."
+        },
+        {
           "description": "Enables the inspect_torrent command without any pre-configured scope.",
           "type": "string",
           "const": "allow-inspect-torrent",
@@ -241,6 +259,12 @@
           "type": "string",
           "const": "allow-install-update",
           "markdownDescription": "Enables the install_update command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the list_profiles command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-list-profiles",
+          "markdownDescription": "Enables the list_profiles command without any pre-configured scope."
         },
         {
           "description": "Enables the list_torrents command without any pre-configured scope.",
@@ -261,10 +285,22 @@
           "markdownDescription": "Enables the register_associations command without any pre-configured scope."
         },
         {
+          "description": "Enables the rename_profile command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-rename-profile",
+          "markdownDescription": "Enables the rename_profile command without any pre-configured scope."
+        },
+        {
           "description": "Enables the restart_app command without any pre-configured scope.",
           "type": "string",
           "const": "allow-restart-app",
           "markdownDescription": "Enables the restart_app command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the rotate_now command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-rotate-now",
+          "markdownDescription": "Enables the rotate_now command without any pre-configured scope."
         },
         {
           "description": "Enables the rss_run_now command without any pre-configured scope.",
@@ -309,6 +345,12 @@
           "markdownDescription": "Enables the take_pending_args command without any pre-configured scope."
         },
         {
+          "description": "Enables the test_profile command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-test-profile",
+          "markdownDescription": "Enables the test_profile command without any pre-configured scope."
+        },
+        {
           "description": "Enables the torrent_action command without any pre-configured scope.",
           "type": "string",
           "const": "allow-torrent-action",
@@ -339,6 +381,12 @@
           "markdownDescription": "Denies the check_update command without any pre-configured scope."
         },
         {
+          "description": "Denies the delete_profile command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-delete-profile",
+          "markdownDescription": "Denies the delete_profile command without any pre-configured scope."
+        },
+        {
           "description": "Denies the fetch_torrent_url command without any pre-configured scope.",
           "type": "string",
           "const": "deny-fetch-torrent-url",
@@ -355,6 +403,12 @@
           "type": "string",
           "const": "deny-get-magnet",
           "markdownDescription": "Denies the get_magnet command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_network_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-network-status",
+          "markdownDescription": "Denies the get_network_status command without any pre-configured scope."
         },
         {
           "description": "Denies the get_queue_order command without any pre-configured scope.",
@@ -375,6 +429,12 @@
           "markdownDescription": "Denies the get_status command without any pre-configured scope."
         },
         {
+          "description": "Denies the import_profile command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-import-profile",
+          "markdownDescription": "Denies the import_profile command without any pre-configured scope."
+        },
+        {
           "description": "Denies the inspect_torrent command without any pre-configured scope.",
           "type": "string",
           "const": "deny-inspect-torrent",
@@ -385,6 +445,12 @@
           "type": "string",
           "const": "deny-install-update",
           "markdownDescription": "Denies the install_update command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the list_profiles command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-list-profiles",
+          "markdownDescription": "Denies the list_profiles command without any pre-configured scope."
         },
         {
           "description": "Denies the list_torrents command without any pre-configured scope.",
@@ -405,10 +471,22 @@
           "markdownDescription": "Denies the register_associations command without any pre-configured scope."
         },
         {
+          "description": "Denies the rename_profile command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-rename-profile",
+          "markdownDescription": "Denies the rename_profile command without any pre-configured scope."
+        },
+        {
           "description": "Denies the restart_app command without any pre-configured scope.",
           "type": "string",
           "const": "deny-restart-app",
           "markdownDescription": "Denies the restart_app command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the rotate_now command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-rotate-now",
+          "markdownDescription": "Denies the rotate_now command without any pre-configured scope."
         },
         {
           "description": "Denies the rss_run_now command without any pre-configured scope.",
@@ -451,6 +529,12 @@
           "type": "string",
           "const": "deny-take-pending-args",
           "markdownDescription": "Denies the take_pending_args command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the test_profile command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-test-profile",
+          "markdownDescription": "Denies the test_profile command without any pre-configured scope."
         },
         {
           "description": "Denies the torrent_action command without any pre-configured scope.",

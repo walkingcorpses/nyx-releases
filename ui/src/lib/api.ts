@@ -9,7 +9,7 @@ import { getCurrentWindow } from '@tauri-apps/api/window';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import { mockApi } from './mock';
-import type { AppUpdate, Detail, Meta, RssReport, SearchResult, Settings, AppStatus, Torrent, UpdatePayload } from './types';
+import type { AppUpdate, Detail, Meta, NetworkStatus, Profile, RssReport, SearchResult, Settings, AppStatus, Torrent, UpdatePayload } from './types';
 
 /** True when running inside the Tauri webview. */
 export const inTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
@@ -43,6 +43,13 @@ const real = {
   rssRunNow: () => invoke<RssReport>('rss_run_now'),
   search: (query: string) => invoke<SearchResult[]>('search', { query }),
   fetchTorrentUrl: (url: string) => invoke<string>('fetch_torrent_url', { url }),
+  listProfiles: () => invoke<Profile[]>('list_profiles'),
+  importProfile: (path: string, name: string, group: string) => invoke<Profile>('import_profile', { path, name, group }),
+  renameProfile: (id: string, name: string, group: string) => invoke<void>('rename_profile', { id, name, group }),
+  deleteProfile: (id: string) => invoke<void>('delete_profile', { id }),
+  testProfile: (id: string) => invoke<NetworkStatus>('test_profile', { id }),
+  getNetworkStatus: () => invoke<NetworkStatus>('get_network_status'),
+  rotateNow: () => invoke<string>('rotate_now'),
 
   /** Subscribes to backend update events; returns an unsubscribe function. */
   async onUpdate(cb: (u: UpdatePayload) => void): Promise<() => void> {

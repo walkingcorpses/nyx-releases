@@ -7,6 +7,7 @@
 #include <libtorrent/alert_types.hpp>
 #include <libtorrent/announce_entry.hpp>
 #include <libtorrent/create_torrent.hpp>
+#include <libtorrent/disk_interface.hpp>
 #include <libtorrent/error_code.hpp>
 #include <libtorrent/file_storage.hpp>
 #include <libtorrent/ip_filter.hpp>
@@ -14,18 +15,21 @@
 #include <libtorrent/magnet_uri.hpp>
 #include <libtorrent/peer_info.hpp>
 #include <libtorrent/read_resume_data.hpp>
+#include <libtorrent/session.hpp>
 #include <libtorrent/session_params.hpp>
 #include <libtorrent/settings_pack.hpp>
 #include <libtorrent/torrent_flags.hpp>
 #include <libtorrent/torrent_handle.hpp>
 #include <libtorrent/torrent_info.hpp>
 #include <libtorrent/torrent_status.hpp>
+#include <libtorrent/storage_defs.hpp>
 #include <libtorrent/version.hpp>
 #include <libtorrent/write_resume_data.hpp>
 
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
+#include <random>
 #include <thread>
 #include <exception>
 #include <filesystem>
@@ -206,6 +210,113 @@ std::string listen_for(std::string const& listen, std::string const& iface, bool
     return iface + (colon == std::string::npos ? ":6881" : listen.substr(colon));
 }
 
+// libtorrent's own disk I/O behind a random per-session shift of every storage index it hands out
+// (lab finding F6). torrent::tracker_key hashes the torrent's address, its storage index and the
+// session's address; the allocator hands a new session and its torrents the blocks of freed ones,
+// so the identity test saw a torrent's key come back two rotations later. The shift puts 32
+// random bits into every key. The index means nothing outside the disk subsystem (2.0.11: only
+// tracker_key reads it), so every call shifts it back and forwards to the real disk I/O.
+class SaltedDisk final : public lt::disk_interface {
+public:
+    SaltedDisk(std::unique_ptr<lt::disk_interface> inner, std::uint32_t salt)
+        : inner_(std::move(inner)), salt_(salt) {}
+
+    // The real storage's holder stays here (it removes the real storage when dropped); the
+    // torrent gets one for the shifted index, which comes back through remove_torrent.
+    lt::storage_holder new_torrent(lt::storage_params const& p, std::shared_ptr<void> const& t) override {
+        lt::storage_holder h = inner_->new_torrent(p, t);
+        lt::storage_index_t const out{static_cast<std::uint32_t>(static_cast<lt::storage_index_t>(h)) + salt_};
+        std::lock_guard<std::mutex> lk(mu_);
+        held_[static_cast<std::uint32_t>(out)] = std::move(h);
+        return lt::storage_holder(out, *this);
+    }
+    // Drops the real storage's holder (outside the lock: it calls into the real disk I/O).
+    void remove_torrent(lt::storage_index_t s) override {
+        lt::storage_holder h;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            auto it = held_.find(static_cast<std::uint32_t>(s));
+            if (it == held_.end()) return;
+            h = std::move(it->second);
+            held_.erase(it);
+        }
+    }
+    // Everything else: the real index, same arguments.
+    void async_read(lt::storage_index_t s, lt::peer_request const& r,
+                    std::function<void(lt::disk_buffer_holder, lt::storage_error const&)> h,
+                    lt::disk_job_flags_t f) override {
+        inner_->async_read(in(s), r, std::move(h), f);
+    }
+    bool async_write(lt::storage_index_t s, lt::peer_request const& r, char const* buf,
+                     std::shared_ptr<lt::disk_observer> o, std::function<void(lt::storage_error const&)> h,
+                     lt::disk_job_flags_t f) override {
+        return inner_->async_write(in(s), r, buf, std::move(o), std::move(h), f);
+    }
+    void async_hash(lt::storage_index_t s, lt::piece_index_t p, lt::span<lt::sha256_hash> v2, lt::disk_job_flags_t f,
+                    std::function<void(lt::piece_index_t, lt::sha1_hash const&, lt::storage_error const&)> h) override {
+        inner_->async_hash(in(s), p, v2, f, std::move(h));
+    }
+    void async_hash2(lt::storage_index_t s, lt::piece_index_t p, int offset, lt::disk_job_flags_t f,
+                     std::function<void(lt::piece_index_t, lt::sha256_hash const&, lt::storage_error const&)> h) override {
+        inner_->async_hash2(in(s), p, offset, f, std::move(h));
+    }
+    void async_move_storage(lt::storage_index_t s, std::string p, lt::move_flags_t f,
+                            std::function<void(lt::status_t, std::string const&, lt::storage_error const&)> h) override {
+        inner_->async_move_storage(in(s), std::move(p), f, std::move(h));
+    }
+    void async_release_files(lt::storage_index_t s, std::function<void()> h) override {
+        inner_->async_release_files(in(s), std::move(h));
+    }
+    void async_check_files(lt::storage_index_t s, lt::add_torrent_params const* rd,
+                           lt::aux::vector<std::string, lt::file_index_t> links,
+                           std::function<void(lt::status_t, lt::storage_error const&)> h) override {
+        inner_->async_check_files(in(s), rd, std::move(links), std::move(h));
+    }
+    void async_stop_torrent(lt::storage_index_t s, std::function<void()> h) override {
+        inner_->async_stop_torrent(in(s), std::move(h));
+    }
+    void async_rename_file(lt::storage_index_t s, lt::file_index_t i, std::string name,
+                           std::function<void(std::string const&, lt::file_index_t, lt::storage_error const&)> h) override {
+        inner_->async_rename_file(in(s), i, std::move(name), std::move(h));
+    }
+    void async_delete_files(lt::storage_index_t s, lt::remove_flags_t o,
+                            std::function<void(lt::storage_error const&)> h) override {
+        inner_->async_delete_files(in(s), o, std::move(h));
+    }
+    void async_set_file_priority(lt::storage_index_t s, lt::aux::vector<lt::download_priority_t, lt::file_index_t> prio,
+                                 std::function<void(lt::storage_error const&,
+                                                    lt::aux::vector<lt::download_priority_t, lt::file_index_t>)> h) override {
+        inner_->async_set_file_priority(in(s), std::move(prio), std::move(h));
+    }
+    void async_clear_piece(lt::storage_index_t s, lt::piece_index_t p, std::function<void(lt::piece_index_t)> h) override {
+        inner_->async_clear_piece(in(s), p, std::move(h));
+    }
+    void update_stats_counters(lt::counters& c) const override { inner_->update_stats_counters(c); }
+    std::vector<lt::open_file_state> get_status(lt::storage_index_t s) const override { return inner_->get_status(in(s)); }
+    void abort(bool wait) override { inner_->abort(wait); }
+    void submit_jobs() override { inner_->submit_jobs(); }
+    void settings_updated() override { inner_->settings_updated(); }
+
+private:
+    // The real disk I/O's index for a shifted one.
+    lt::storage_index_t in(lt::storage_index_t s) const {
+        return lt::storage_index_t{static_cast<std::uint32_t>(s) - salt_};
+    }
+    std::unique_ptr<lt::disk_interface> inner_;  // declared first: outlives held_
+    std::uint32_t const salt_;
+    std::mutex mu_;                               // guards held_
+    std::map<std::uint32_t, lt::storage_holder> held_;
+};
+
+// `params` with its disk I/O wrapped in a SaltedDisk with a fresh random salt (every session).
+lt::session_params salted(lt::session_params params) {
+    std::uint32_t const salt = std::random_device{}();
+    params.disk_io_constructor = [salt](lt::io_context& ios, lt::settings_interface const& sett, lt::counters& cnt) {
+        return std::unique_ptr<lt::disk_interface>(new SaltedDisk(lt::default_disk_io_constructor(ios, sett, cnt), salt));
+    };
+    return params;
+}
+
 } // namespace
 
 // Real session start/stop: links the session, networking and crypto code paths,
@@ -234,38 +345,57 @@ rust::String lt_version() {
     return rust::String(lt::version());
 }
 
-// Builds the session with every privacy setting already in place (encryption, proxy, adapter
-// binding), so not even the first packet of a session can go out under the wrong policy.
+// The settings a new session starts with: every privacy setting already in place (encryption,
+// proxy, adapter binding, identity), so not even the first packet can go out under the wrong policy.
+static lt::session_params initial_params(rust::Slice<const std::uint8_t> dht_state, SessionInit const& init) {
+    std::string const iface(init.interface);
+    lt::settings_pack pack;
+    pack.set_str(lt::settings_pack::listen_interfaces,
+                 listen_for(std::string(init.listen), iface, init.proxy_enabled));
+    pack.set_str(lt::settings_pack::outgoing_interfaces, iface);
+    // Identity (lab findings F7, F8): nothing a tracker or peer sees names Nyx or libtorrent.
+    // An empty fingerprint makes all 20 peer_id bytes random (libtorrent's default prefix
+    // "-LT20B0-" names the engine and its version). anonymous_mode leaves the client version `v`
+    // out of the extension handshake, sends trackers libtorrent's generic User-Agent
+    // ("curl/7.81.0") and never adds ip=; it does not touch connectivity (checked in the
+    // 2.0.11 source: those three places are all it changes). The user agent and handshake
+    // version are blanked as well, for the private-torrent case where anonymous_mode still
+    // sends the user agent.
+    pack.set_str(lt::settings_pack::peer_fingerprint, "");
+    pack.set_str(lt::settings_pack::user_agent, "");
+    pack.set_str(lt::settings_pack::handshake_client_version, "");
+    pack.set_bool(lt::settings_pack::anonymous_mode, true);
+    pack.set_bool(lt::settings_pack::allow_multiple_connections_per_ip, true);
+    // Default is 60 s before libtorrent redials a peer it was connected to. Pausing and
+    // resuming (and the parked-magnet flow) should pick peers back up within seconds.
+    // Failing peers still back off: the delay is multiplied by their fail count.
+    pack.set_int(lt::settings_pack::min_reconnect_time, 5);
+    pack.set_int(lt::settings_pack::alert_mask, lt::alert_category::error | lt::alert_category::status);
+    fill_encryption(pack, init.encryption);
+    fill_proxy(pack, init.proxy_enabled, std::string(init.proxy_host), init.proxy_port,
+               std::string(init.proxy_user), std::string(init.proxy_pass), init.discovery);
+    lt::session_params sp(std::move(pack));
+    if (init.discovery && !init.proxy_enabled && !dht_state.empty()) {
+        lt::session_params old = lt::read_session_params(lt::span<char const>(
+            reinterpret_cast<char const*>(dht_state.data()), dht_state.size()));
+        sp.dht_state = std::move(old.dht_state);
+    }
+    return sp;
+}
+
+// A session from the engine's start-up config (see initial_params).
 Session::Session(rust::Slice<const std::uint8_t> dht_state, SessionInit const& init)
-    : ses_(
-          [&] {
-              std::string const iface(init.interface);
-              lt::settings_pack pack;
-              pack.set_str(lt::settings_pack::listen_interfaces,
-                           listen_for(std::string(init.listen), iface, init.proxy_enabled));
-              pack.set_str(lt::settings_pack::outgoing_interfaces, iface);
-              pack.set_str(lt::settings_pack::user_agent, "Nyx/0.1");
-              pack.set_bool(lt::settings_pack::allow_multiple_connections_per_ip, true);
-              // Default is 60 s before libtorrent redials a peer it was connected to. Pausing and
-              // resuming (and the parked-magnet flow) should pick peers back up within seconds.
-              // Failing peers still back off: the delay is multiplied by their fail count.
-              pack.set_int(lt::settings_pack::min_reconnect_time, 5);
-              pack.set_int(lt::settings_pack::alert_mask, lt::alert_category::error | lt::alert_category::status);
-              fill_encryption(pack, init.encryption);
-              fill_proxy(pack, init.proxy_enabled, std::string(init.proxy_host), init.proxy_port,
-                         std::string(init.proxy_user), std::string(init.proxy_pass), init.discovery);
-              lt::session_params sp(std::move(pack));
-              if (init.discovery && !init.proxy_enabled && !dht_state.empty()) {
-                  lt::session_params old = lt::read_session_params(lt::span<char const>(
-                      reinterpret_cast<char const*>(dht_state.data()), dht_state.size()));
-                  sp.dht_state = std::move(old.dht_state);
-              }
-              return sp;
-          }()),
-      discovery_(init.discovery),
-      listen_(init.listen),
-      iface_(init.interface),
-      proxied_(init.proxy_enabled) {
+    : Session(initial_params(dht_state, init), init.discovery, std::string(init.listen),
+              std::string(init.interface), init.proxy_enabled) {}
+
+// Builds the session from complete params (start-up config or a respawn's copy of the live
+// settings), then sets up what every session needs: the peer-class filter and the alert pump.
+Session::Session(lt::session_params params, bool discovery, std::string listen, std::string iface, bool proxied)
+    : ses_(salted(std::move(params))),
+      discovery_(discovery),
+      listen_(std::move(listen)),
+      iface_(std::move(iface)),
+      proxied_(proxied) {
     // Rate limits must also bind LAN/loopback peers (libtorrent exempts them by default):
     // put every address, v4 and v6, in the global peer class and nothing in the local one.
     lt::ip_filter classes;
@@ -644,6 +774,58 @@ rust::Vec<ResumeBlob> Session::save_resume(std::uint32_t timeout_ms) const {
         out.push_back(std::move(b));
     }
     return out;
+}
+
+// Lab findings F5, F6. libtorrent keeps a torrent's tracker peer_id (made when the torrent object
+// is built) and its tracker key (a hash of the torrent's and the session's addresses) for the torrent's whole life;
+// a new peer_fingerprint only reaches peer connections opened later. So a new identity needs new
+// torrent objects in a new session. Order, so nothing links or leaks:
+//  1. Read the live settings (they already hold the new tunnel's proxy), blocklist and torrent count.
+//  2. Silence this session: proxy to 127.0.0.1:0 (every connect fails on the spot, so the stopped
+//     announces of step 3 and of the later teardown never reach a tracker: the old peer_id and key
+//     must not show up behind the new exit) and loopback listening (frees a configured port for
+//     the new session); then pause it (disconnects every peer). Session pause does not touch the
+//     torrents' own paused flags, so the resume data keeps them.
+//  3. Resume data for every torrent; any missing -> undo step 2 and fail (no torrent may be lost).
+//  4. The new session from the step-1 settings (its first socket is under the same policy, and
+//     its disk I/O has a new random salt, see SaltedDisk), the blocklist before any torrent,
+//     parked magnets, then every torrent from its resume data (save path, progress, paused flag,
+//     limits, file priorities, sequential, trackers).
+// This session stays alive (inert) until the caller drops it after the swap.
+std::unique_ptr<Session> Session::respawn(std::uint32_t timeout_ms) const {
+    lt::settings_pack const keep = ses_.get_settings();
+    lt::ip_filter const blocklist = ses_.get_ip_filter();
+    std::size_t const count = ses_.get_torrents().size();
+    // The live settings, silenced: nothing can connect, loopback listening only.
+    lt::settings_pack quiet;
+    fill_proxy(quiet, true, "127.0.0.1", 0, "", "", false);
+    quiet.set_str(lt::settings_pack::listen_interfaces, "127.0.0.1:0");
+    ses_.apply_settings(quiet);
+    ses_.pause();
+    try {
+        rust::Vec<ResumeBlob> blobs = save_resume(timeout_ms);
+        if (blobs.size() != count)
+            throw std::runtime_error("identity rotation: resume data for " + std::to_string(blobs.size()) + " of " +
+                                     std::to_string(count) + " torrents");
+        std::set<std::string> parked;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            parked = parked_;
+        }
+        auto fresh = std::make_unique<Session>(lt::session_params(keep), discovery_, listen_, iface_, proxied_);
+        fresh->ses_.set_ip_filter(blocklist);
+        {
+            std::lock_guard<std::mutex> lk(fresh->mu_);
+            fresh->parked_ = std::move(parked);
+        }
+        for (ResumeBlob const& b : blobs)
+            fresh->add_resume(rust::Slice<const std::uint8_t>(b.data.data(), b.data.size()));
+        return fresh;
+    } catch (...) {
+        ses_.apply_settings(keep);
+        ses_.resume();
+        throw;
+    }
 }
 
 TorrentMeta inspect_torrent(rust::Slice<const std::uint8_t> bytes) {

@@ -18,6 +18,12 @@ pub fn make_torrent(dir: &Path, size_bytes: u64) -> Vec<u8> {
     make_torrent_files(dir, &[size_bytes])
 }
 
+/// Like `make_torrent` with one tracker URL in the .torrent (identity tests use a local tracker stub).
+pub fn make_torrent_tracked(dir: &Path, size_bytes: u64, tracker: &str) -> Vec<u8> {
+    std::fs::create_dir_all(dir).unwrap();
+    ffi::make_torrent(&dir.to_string_lossy(), &[size_bytes], PIECE_LEN, tracker).unwrap()
+}
+
 /// Like `make_torrent` but with several files (a multi-file torrent rooted at `payload/`).
 pub fn make_torrent_files(dir: &Path, sizes: &[u64]) -> Vec<u8> {
     std::fs::create_dir_all(dir).unwrap();
@@ -58,16 +64,16 @@ pub fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
 impl Engine {
     /// Tells the torrent to connect to a specific peer (a local seeder in tests).
     pub fn add_peer(&self, id: &TorrentId, addr: SocketAddr) -> Result<(), EngineError> {
-        Ok(self.inner.add_peer(id, &addr.ip().to_string(), addr.port())?)
+        Ok(self.ses().add_peer(id, &addr.ip().to_string(), addr.port())?)
     }
 
     /// Makes this engine refuse encrypted connections and speak plaintext only.
     pub fn set_plaintext_only(&self) -> Result<(), EngineError> {
-        Ok(self.inner.set_encryption(2)?)
+        Ok(self.ses().set_encryption(2)?)
     }
 
     /// One bool per piece: do we have it yet?
     pub fn have_pieces(&self, id: &TorrentId) -> Result<Vec<bool>, EngineError> {
-        Ok(self.inner.have_pieces(id)?.into_iter().map(|b| b != 0).collect())
+        Ok(self.ses().have_pieces(id)?.into_iter().map(|b| b != 0).collect())
     }
 }

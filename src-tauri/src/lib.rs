@@ -3,14 +3,8 @@
 
 pub mod assoc;
 pub mod commands;
-pub mod dto;
-pub mod feeds;
-pub mod http;
 pub mod instance;
-pub mod poller;
-pub mod state;
 pub mod tray;
-pub mod update;
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -23,8 +17,8 @@ use nyx_core::data_dir;
 use tauri::{Emitter, Manager, PhysicalPosition, RunEvent, WindowEvent};
 use tauri_plugin_notification::NotificationExt;
 
-use dto::UpdateDto;
-use state::AppState;
+use nyx_app::dto::UpdateDto;
+use nyx_app::state::AppState;
 
 /// How often the poller saves resume data while running (ticks of one second).
 const SAVE_EVERY_TICKS: u32 = 60;
@@ -132,6 +126,13 @@ pub fn run() {
             commands::rss_run_now,
             commands::search,
             commands::fetch_torrent_url,
+            commands::list_profiles,
+            commands::import_profile,
+            commands::rename_profile,
+            commands::delete_profile,
+            commands::test_profile,
+            commands::get_network_status,
+            commands::rotate_now,
         ])
         .on_window_event(|window, event| {
             // Close button: hide to the tray when that setting is on, otherwise let the app exit.

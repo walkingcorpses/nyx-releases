@@ -30,7 +30,7 @@ vi.mock('../lib/api', () => {
 
 /** A status with sensible defaults; `over` changes fields. */
 function status(over: Partial<AppStatus> = {}): AppStatus {
-  return { version: '1.0.0', proxy_down: false, killed: false, update: null, warnings: [], ...over };
+  return { version: '1.0.0', proxy_down: false, killed: false, update: null, warnings: [], route: 'none', profile_name: null, ...over };
 }
 
 describe('banners', () => {

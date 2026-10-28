@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::categories::CategoryDef;
+use crate::network::NetworkSettings;
 use crate::scheduler::Schedule;
 
 /// File name inside the data folder.
@@ -81,6 +82,8 @@ pub struct Settings {
     pub rss: RssSettings,
     /// Search provider: an http(s) URL containing `{query}` that returns an RSS/Torznab feed.
     pub search_url: String,
+    /// WireGuard profiles, network lock and rotation.
+    pub network: NetworkSettings,
 }
 
 impl Default for Settings {
@@ -106,6 +109,7 @@ impl Default for Settings {
             check_updates: false,
             rss: RssSettings::default(),
             search_url: String::new(),
+            network: NetworkSettings::default(),
         }
     }
 }
@@ -185,6 +189,33 @@ mod tests {
         let s = Settings::load(tmp.path());
         assert_eq!(s.max_active_seeds, 9);
         assert_eq!(s.max_active_downloads, 3);
+    }
+
+    #[test]
+    fn old_settings_file_without_network_section_loads_with_defaults() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("settings.json"), r#"{"max_active_seeds": 9}"#).unwrap();
+        let s = Settings::load(tmp.path());
+        assert_eq!(s.network.rotation.min_minutes, 5);
+        assert_eq!(s.network.active_profile, None);
+    }
+
+    #[test]
+    fn network_settings_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = Settings::default();
+        s.network.profiles.push(crate::network::Profile {
+            id: "p1".into(),
+            name: "Home".into(),
+            group: "EU".into(),
+            sealed_conf: "sealed".into(),
+            endpoint: "vpn.example.com:51820".into(),
+            endpoint_ip: "203.0.113.5:51820".into(),
+        });
+        s.network.active_profile = Some("p1".into());
+        s.network.rotation = crate::network::RotationSettings { enabled: true, pool: vec!["p1".into()], min_minutes: 2, max_minutes: 8 };
+        s.save(tmp.path()).unwrap();
+        assert_eq!(Settings::load(tmp.path()), s);
     }
 
     #[test]

@@ -27,6 +27,13 @@ const COMMANDS: &[&str] = &[
     "rss_run_now",
     "search",
     "fetch_torrent_url",
+    "list_profiles",
+    "import_profile",
+    "rename_profile",
+    "delete_profile",
+    "test_profile",
+    "get_network_status",
+    "rotate_now",
 ];
 
 fn main() {

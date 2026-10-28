@@ -12,7 +12,7 @@ use std::fs;
 use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock, RwLockReadGuard};
 
 use cxx::UniquePtr;
 use nyx_core::{check_torrent_bytes, parse_magnet, safe_join};
@@ -60,10 +60,21 @@ struct Meta {
 
 /// The torrent engine: one libtorrent session plus Nyx's per-torrent metadata.
 pub struct Engine {
-    pub(crate) inner: UniquePtr<ffi::Session>,
+    /// The session. Every call takes the read side; `rotate_identity` takes the write side to swap
+    /// in a new session, so no call ever sees one half-built or already destroyed.
+    inner: RwLock<UniquePtr<ffi::Session>>,
     meta: Mutex<Meta>,
     state_dir: PathBuf,
+    /// How many times `rotate_identity` has succeeded (diagnostics and tests).
+    identity_generation: std::sync::atomic::AtomicU64,
 }
+
+/// A session swapped out by `rotate_identity`, on its way to the thread that destroys it.
+struct Retired(UniquePtr<ffi::Session>);
+
+// SAFETY: nothing else references a retired session (it left the RwLock), and its destructor only
+// stops its own alert thread and lt::session, which may be destroyed from any thread.
+unsafe impl Send for Retired {}
 
 // SAFETY: lt::session is documented thread-safe, every Session method is const and goes
 // through its API, and our own state sits behind a Mutex.
@@ -89,11 +100,47 @@ impl Engine {
             interface: cfg.interface.clone().unwrap_or_default(),
         };
         let inner = ffi::new_session(&dht, &init)?;
-        let engine = Engine { inner, meta: Mutex::new(Meta::default()), state_dir: cfg.state_dir };
+        let engine = Engine { inner: RwLock::new(inner), meta: Mutex::new(Meta::default()), state_dir: cfg.state_dir, identity_generation: std::sync::atomic::AtomicU64::new(0) };
         // Blocklist before any torrent exists, so a restored torrent never talks to a blocked address.
         engine.set_ip_filter(&cfg.blocklist)?;
         engine.restore();
         Ok(engine)
+    }
+
+    /// The current session, for one call (read lock held while the guard lives).
+    pub(crate) fn ses(&self) -> RwLockReadGuard<'_, UniquePtr<ffi::Session>> {
+        self.inner.read().unwrap()
+    }
+
+    /// A new identity for trackers and peers (spec 7.3 check 3): every torrent gets a fresh
+    /// tracker peer_id and key, as if a different client had started. Called after each VPN
+    /// rotation, once the engine already points at the new tunnel. libtorrent fixes both for a
+    /// torrent's lifetime, so this builds a new session from the live one's settings (same proxy,
+    /// adapter, encryption and limits from its first socket) and its torrents' resume data
+    /// (progress, paused flags, limits, priorities); categories and queue holds live here and stay.
+    /// The old session is silenced before anything is saved (its stopped announces cannot reach
+    /// a tracker) and torn down after the swap on a short-lived thread: libtorrent's teardown
+    /// takes 0.1 to 1 s and the rotation timer runs on the poller's tick. Blocks other engine
+    /// calls for the save and the rebuild (about 0.1 s in tests, at most the 5 s resume wait). On
+    /// error nothing changes: the old session is restored as it was, still on its proxy.
+    pub fn rotate_identity(&self) -> Result<(), EngineError> {
+        let old = {
+            let mut ses = self.inner.write().unwrap();
+            let fresh = ses.respawn(5000)?;
+            Retired(std::mem::replace(&mut *ses, fresh))
+        };
+        self.identity_generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        std::thread::spawn(move || {
+            let r = old;
+            drop(r.0);
+        });
+        Ok(())
+    }
+
+    /// How many times the identity has been renewed since the engine started. Lets callers and
+    /// tests tell that a route change really renewed it.
+    pub fn identity_generation(&self) -> u64 {
+        self.identity_generation.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Adds a magnet link. The torrent fetches metadata but downloads nothing until the caller
@@ -104,7 +151,7 @@ impl Engine {
         let existing = self.ids();
         let save_err = prepare_save_dir(&opts.save_path);
         let paused = opts.paused || save_err.is_some();
-        let id = self.inner.add_magnet(uri, &path_str(&opts.save_path), paused, opts.sequential)?;
+        let id = self.ses().add_magnet(uri, &path_str(&opts.save_path), paused, opts.sequential)?;
         self.after_add(&id, &opts, save_err, &existing);
         Ok(id)
     }
@@ -115,7 +162,7 @@ impl Engine {
         let existing = self.ids();
         let save_err = prepare_save_dir(&opts.save_path);
         let paused = opts.paused || save_err.is_some();
-        let id = self.inner.add_torrent(bytes, &path_str(&opts.save_path), paused, opts.sequential)?;
+        let id = self.ses().add_torrent(bytes, &path_str(&opts.save_path), paused, opts.sequential)?;
         self.after_add(&id, &opts, save_err, &existing);
         Ok(id)
     }
@@ -137,13 +184,13 @@ impl Engine {
 
     /// All torrent ids currently in the session.
     fn ids(&self) -> HashSet<TorrentId> {
-        self.inner.snapshot().map(|v| v.into_iter().map(|r| r.id).collect()).unwrap_or_default()
+        self.ses().snapshot().map(|v| v.into_iter().map(|r| r.id).collect()).unwrap_or_default()
     }
 
     /// State of every torrent, for the list view. Never panics on libtorrent errors:
     /// a torrent with a problem shows `Error(message)`.
     pub fn snapshot(&self) -> Vec<TorrentState> {
-        let rows = self.inner.snapshot().unwrap_or_default();
+        let rows = self.ses().snapshot().unwrap_or_default();
         let m = self.meta.lock().unwrap();
         rows.into_iter()
             .map(|r| {
@@ -180,7 +227,7 @@ impl Engine {
     /// User pause. Clears any queue hold so the torrent reads as `Paused`, not `Queued`.
     pub fn pause(&self, id: &TorrentId) -> Result<(), EngineError> {
         self.meta.lock().unwrap().held.remove(id);
-        Ok(self.inner.pause(id)?)
+        Ok(self.ses().pause(id)?)
     }
 
     /// User resume. If the save folder was the problem, retries creating it first.
@@ -198,8 +245,8 @@ impl Engine {
             }
         }
         self.meta.lock().unwrap().held.remove(id);
-        self.inner.unpark(id)?;
-        Ok(self.inner.resume(id)?)
+        self.ses().unpark(id)?;
+        Ok(self.ses().resume(id)?)
     }
 
     /// Queue hold: pauses (`on`) or releases (`!on`) a torrent without it counting as a user pause.
@@ -208,12 +255,12 @@ impl Engine {
             let mut m = self.meta.lock().unwrap();
             if on { m.held.insert(id.clone()); } else { m.held.remove(id); }
         }
-        if on { Ok(self.inner.pause(id)?) } else { Ok(self.inner.resume(id)?) }
+        if on { Ok(self.ses().pause(id)?) } else { Ok(self.ses().resume(id)?) }
     }
 
     /// Removes a torrent, optionally deleting its downloaded files, and forgets its saved state.
     pub fn remove(&self, id: &TorrentId, delete_files: bool) -> Result<(), EngineError> {
-        self.inner.remove(id, delete_files)?;
+        self.ses().remove(id, delete_files)?;
         let mut m = self.meta.lock().unwrap();
         m.categories.remove(id);
         m.held.remove(id);
@@ -224,17 +271,17 @@ impl Engine {
 
     /// Re-hashes the torrent's files from scratch.
     pub fn recheck(&self, id: &TorrentId) -> Result<(), EngineError> {
-        Ok(self.inner.recheck(id)?)
+        Ok(self.ses().recheck(id)?)
     }
 
     /// Per-file priorities, in file order: 0 skips the file, 1 to 7 downloads it (higher first).
     pub fn set_file_priorities(&self, id: &TorrentId, priorities: &[u8]) -> Result<(), EngineError> {
-        Ok(self.inner.set_priorities(id, priorities)?)
+        Ok(self.ses().set_priorities(id, priorities)?)
     }
 
     /// Sequential download on or off (pieces in order, for streaming).
     pub fn set_sequential(&self, id: &TorrentId, on: bool) -> Result<(), EngineError> {
-        Ok(self.inner.set_sequential(id, on)?)
+        Ok(self.ses().set_sequential(id, on)?)
     }
 
     /// Replaces the peer blocklist: connections to and from these ranges are refused. An empty
@@ -242,12 +289,12 @@ impl Engine {
     pub fn set_ip_filter(&self, ranges: &[nyx_core::IpRange]) -> Result<(), EngineError> {
         let spans: Vec<ffi::IpSpan> =
             ranges.iter().map(|r| ffi::IpSpan { first: r.first.to_string(), last: r.last.to_string() }).collect();
-        Ok(self.inner.set_ip_filter(&spans)?)
+        Ok(self.ses().set_ip_filter(&spans)?)
     }
 
     /// Binds to one network adapter (name or IP), or unbinds with `None`.
     pub fn set_interface(&self, name: Option<&str>) -> Result<(), EngineError> {
-        Ok(self.inner.set_interface(name.unwrap_or(""))?)
+        Ok(self.ses().set_interface(name.unwrap_or(""))?)
     }
 
     /// Changes the save folder of a torrent (created first). For a magnet still fetching metadata
@@ -257,7 +304,7 @@ impl Engine {
             return Err(EngineError::Backend(msg));
         }
         self.meta.lock().unwrap().save_errors.remove(id);
-        Ok(self.inner.move_storage(id, &path_str(path))?)
+        Ok(self.ses().move_storage(id, &path_str(path))?)
     }
 
     /// Sets or clears the torrent's category label (the folder is chosen separately).
@@ -272,16 +319,16 @@ impl Engine {
     /// Rate caps in bytes per second, 0 = unlimited. `None` sets the global caps.
     pub fn set_limits(&self, id: Option<&TorrentId>, down: u64, up: u64) -> Result<(), EngineError> {
         match id {
-            Some(id) => Ok(self.inner.set_torrent_limits(id, down, up)?),
-            None => Ok(self.inner.set_global_limits(down, up)?),
+            Some(id) => Ok(self.ses().set_torrent_limits(id, down, up)?),
+            None => Ok(self.ses().set_global_limits(down, up)?),
         }
     }
 
     /// Files, peers and trackers of one torrent, for the detail drawer.
     pub fn torrent_detail(&self, id: &TorrentId) -> Result<TorrentDetail, EngineError> {
-        let files = self.inner.files(id)?.into_iter().map(file_info).collect();
+        let files = self.ses().files(id)?.into_iter().map(file_info).collect();
         let peers = self
-            .inner
+            .ses()
             .peers(id)?
             .into_iter()
             .filter_map(|p| {
@@ -296,45 +343,45 @@ impl Engine {
             })
             .collect();
         let trackers = self
-            .inner
+            .ses()
             .trackers(id)?
             .into_iter()
             .map(|t| TrackerInfo { url: t.url, status: t.status })
             .collect();
-        let lim = self.inner.torrent_limits(id)?;
+        let lim = self.ses().torrent_limits(id)?;
         Ok(TorrentDetail { files, peers, trackers, down_limit: lim.down, up_limit: lim.up })
     }
 
     /// Sets peer encryption: `Forced` refuses plaintext peers, `Prefer` accepts them.
     pub fn set_encryption(&self, mode: EncryptionMode) -> Result<(), EngineError> {
         let m = match mode { EncryptionMode::Forced => 0, EncryptionMode::Prefer => 1 };
-        Ok(self.inner.set_encryption(m)?)
+        Ok(self.ses().set_encryption(m)?)
     }
 
     /// Routes peers, trackers and hostname lookups through a SOCKS5 proxy and turns off
     /// LSD, UPnP and NAT-PMP. `None` goes back to direct connections.
     pub fn set_proxy(&self, cfg: Option<ProxyConfig>) -> Result<(), EngineError> {
         match cfg {
-            Some(c) => Ok(self.inner.set_proxy(
+            Some(c) => Ok(self.ses().set_proxy(
                 true,
                 &c.host,
                 c.port,
                 c.username.as_deref().unwrap_or(""),
                 c.password.as_deref().unwrap_or(""),
             )?),
-            None => Ok(self.inner.set_proxy(false, "", 0, "", "")?),
+            None => Ok(self.ses().set_proxy(false, "", 0, "", "")?),
         }
     }
 
     /// The encryption policy libtorrent currently has (read back, not remembered).
     /// Anything other than the two user modes (test-only plaintext) reads as `Prefer`.
     pub fn encryption_mode(&self) -> EncryptionMode {
-        if self.inner.encryption_mode() == 0 { EncryptionMode::Forced } else { EncryptionMode::Prefer }
+        if self.ses().encryption_mode() == 0 { EncryptionMode::Forced } else { EncryptionMode::Prefer }
     }
 
     /// DHT, LSD, UPnP and NAT-PMP as libtorrent currently has them.
     pub fn discovery_flags(&self) -> DiscoveryFlags {
-        let f = self.inner.discovery_flags();
+        let f = self.ses().discovery_flags();
         DiscoveryFlags { dht: f.dht, lsd: f.lsd, upnp: f.upnp, natpmp: f.natpmp }
     }
 
@@ -344,10 +391,10 @@ impl Engine {
         let io_err = |e: io::Error| EngineError::Backend(e.to_string());
         let dir = self.state_dir.join("resume");
         fs::create_dir_all(&dir).map_err(io_err)?;
-        for blob in self.inner.save_resume(5000)? {
+        for blob in self.ses().save_resume(5000)? {
             write_atomic(&self.resume_path(&blob.id), &blob.data).map_err(io_err)?;
         }
-        write_atomic(&self.state_dir.join("session.dat"), &self.inner.save_session_state()).map_err(io_err)?;
+        write_atomic(&self.state_dir.join("session.dat"), &self.ses().save_session_state()).map_err(io_err)?;
         let m = self.meta.lock().unwrap();
         let mut ids: Vec<&TorrentId> = m.categories.keys().chain(m.held.iter()).collect();
         ids.sort();
@@ -382,7 +429,7 @@ impl Engine {
         let Ok(entries) = fs::read_dir(self.state_dir.join("resume")) else { return };
         for e in entries.flatten() {
             if let Ok(bytes) = fs::read(e.path()) {
-                let _ = self.inner.add_resume(&bytes);
+                let _ = self.ses().add_resume(&bytes);
             }
         }
     }

@@ -18,6 +18,9 @@ vi.mock('../lib/api', () => ({
       trackers: [],
     })),
     pickFolder: vi.fn(async () => null),
+    getSettings: vi.fn(),
+    listProfiles: vi.fn(async () => []),
+    getNetworkStatus: vi.fn(async () => null),
     registerAssociations: vi.fn(async () => {}),
     unregisterAssociations: vi.fn(async () => {}),
   },
@@ -32,10 +35,26 @@ function base(): Settings {
     default_save_dir: 'D:\\Downloads', start_minimized: false, minimize_to_tray: true,
     kill_switch: true, bind_interface: null, blocklist: null, check_updates: false,
     rss: { feeds: [], interval_minutes: 30 }, search_url: '',
+    network: { active_profile: null, rotation: { enabled: false, pool: [], min_minutes: 5, max_minutes: 10 } },
   };
 }
 
 describe('settings page', () => {
+  it('save keeps a rotation that happened while the dialog was open', async () => {
+    const opened = base();
+    opened.network.active_profile = 'p1';
+    const running = base();
+    running.network.active_profile = 'p2'; // the timer rotated p1 -> p2 after the dialog opened
+    const { api } = await import('../lib/api');
+    vi.mocked(api.getSettings).mockResolvedValue(running);
+    const onsave = vi.fn(async () => {});
+    render(SettingsPage, { settings: opened, onsave, onclose: () => {} });
+    await fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() =>
+      expect(onsave).toHaveBeenCalledWith(expect.objectContaining({ network: expect.objectContaining({ active_profile: 'p2' }) })),
+    );
+  });
+
   it('encryption selector defaults to Forced', () => {
     render(SettingsPage, { settings: base(), onsave: async () => {}, onclose: () => {} });
     expect(screen.getByRole('radio', { name: /Forced/ })).toBeChecked();

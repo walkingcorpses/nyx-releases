@@ -118,6 +118,41 @@ export interface Settings {
   check_updates: boolean;
   rss: { feeds: Feed[]; interval_minutes: number };
   search_url: string;
+  network: NetworkSettings;
+}
+
+/** Timed switching between VPN profiles (off by default). `pool` holds profile ids. */
+export interface Rotation {
+  enabled: boolean;
+  pool: string[];
+  min_minutes: number;
+  max_minutes: number;
+}
+
+/** The part of the settings the Network page edits. Saved profiles come from `listProfiles`, never from here. */
+export interface NetworkSettings {
+  active_profile: string | null;
+  rotation: Rotation;
+}
+
+/** One saved VPN profile. The backend never sends config text or keys. */
+export interface Profile {
+  id: string;
+  name: string;
+  group: string;
+  endpoint: string;
+  active: boolean;
+}
+
+/** Live state of the VPN route for the status card. */
+export interface NetworkStatus {
+  route: 'starting' | 'up' | 'stale' | 'down';
+  profile: string | null;
+  handshake_age_secs: number | null;
+  rx_bytes: number;
+  tx_bytes: number;
+  exit_ip: string | null;
+  next_rotation_secs: number | null;
 }
 
 /** A newer Nyx that can be installed. */
@@ -133,6 +168,9 @@ export interface AppStatus {
   killed: boolean;
   update: AppUpdate | null;
   warnings: string[];
+  /** VPN route: starting, up, stale, down, or none without an active profile. */
+  route: 'none' | 'starting' | 'up' | 'stale' | 'down';
+  profile_name: string | null;
 }
 
 /** One search result. */

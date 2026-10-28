@@ -144,6 +144,10 @@ mod bridge {
 
         fn save_session_state(self: &Session) -> Vec<u8>;
         fn save_resume(self: &Session, timeout_ms: u32) -> Result<Vec<ResumeBlob>>;
+
+        /// Identity rotation: a new session holding the same settings and torrents, with fresh
+        /// tracker peer_ids and keys. This one is left silenced and paused (restored on error).
+        fn respawn(self: &Session, timeout_ms: u32) -> Result<UniquePtr<Session>>;
     }
 }
 

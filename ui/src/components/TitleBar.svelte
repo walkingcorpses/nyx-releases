@@ -3,7 +3,8 @@
 <script lang="ts">
   import { api } from '../lib/api';
   import { formatRate } from '../lib/format';
-  import { totals } from '../lib/store';
+  import { routeText } from '../lib/network';
+  import { appStatus, totals } from '../lib/store';
 </script>
 
 <header class="bar" data-tauri-drag-region>
@@ -18,6 +19,11 @@
     </svg>
     <span data-tauri-drag-region>Nyx</span>
   </div>
+  {#if $appStatus && $appStatus.route !== 'none'}
+    <div class="route" class:bad={$appStatus.killed || $appStatus.route !== 'up'} data-tauri-drag-region role="status" aria-label="VPN route">
+      <span class="dot" data-tauri-drag-region></span>{$appStatus.killed ? 'Locked: ' : 'VPN: '}{routeText($appStatus.route)}
+    </div>
+  {/if}
   <div class="speed num" data-tauri-drag-region aria-label="Total speed">
     <span class="d" data-tauri-drag-region>↓ {formatRate($totals.down)}</span>
     <span class="u" data-tauri-drag-region>↑ {formatRate($totals.up)}</span>
@@ -44,6 +50,9 @@
   }
   .brand { display: flex; align-items: center; gap: 8px; font-weight: 600; letter-spacing: 0.04em; }
   .speed { margin-left: auto; margin-right: 16px; display: flex; gap: 14px; font-size: 12px; }
+  .route { display: flex; align-items: center; gap: 6px; margin-left: 18px; font-size: 12px; color: var(--cyan); }
+  .route.bad { color: var(--bad); }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
   .d { color: var(--cyan); }
   .u { color: #b79bff; }
   .buttons { display: flex; height: 100%; }

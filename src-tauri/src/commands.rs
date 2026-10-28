@@ -7,8 +7,10 @@ use std::sync::Arc;
 use nyx_core::{Settings, TorrentId};
 use tauri::State;
 
-use crate::dto::{AppUpdateDto, DetailDto, MetaDto, RssReportDto, SearchResultDto, StatusDto, TorrentDto};
-use crate::state::AppState;
+use nyx_app::dto::{
+    AppUpdateDto, DetailDto, MetaDto, NetworkStatusDto, ProfileDto, RssReportDto, SearchResultDto, StatusDto, TorrentDto,
+};
+use nyx_app::state::AppState;
 use crate::{assoc, instance};
 
 type St<'a> = State<'a, Arc<AppState>>;
@@ -83,7 +85,7 @@ pub fn move_in_queue(state: St, id: String, position: u32) -> Result<(), String>
 /// Current settings.
 #[tauri::command]
 pub fn get_settings(state: St) -> Result<Settings, String> {
-    Ok(state.get_settings())
+    Ok(state.settings_for_ui())
 }
 
 /// Validates, saves and applies settings.
@@ -164,4 +166,56 @@ pub fn search(state: St, query: String) -> Result<Vec<SearchResultDto>, String> 
 #[tauri::command]
 pub fn fetch_torrent_url(state: St, url: String) -> Result<String, String> {
     state.fetch_torrent_url(&url)
+}
+
+/// Runs slow AppState work (DNS at import, a tunnel bring-up that waits for a handshake) on a
+/// blocking thread so the window never freezes while it runs.
+async fn blocking<T: Send + 'static>(
+    state: &St<'_>,
+    work: impl FnOnce(Arc<AppState>) -> T + Send + 'static,
+) -> Result<T, String> {
+    let s = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || work(s)).await.map_err(|e| e.to_string())
+}
+
+/// The saved VPN profiles (names, endpoints; never any key material).
+#[tauri::command]
+pub fn list_profiles(state: St) -> Result<Vec<ProfileDto>, String> {
+    Ok(state.list_profiles())
+}
+
+/// Imports a WireGuard `.conf` file chosen in the file picker as a new profile.
+#[tauri::command]
+pub async fn import_profile(state: St<'_>, path: String, name: String, group: String) -> Result<ProfileDto, String> {
+    blocking(&state, move |s| s.import_profile(&path, &name, &group)).await?
+}
+
+/// Renames a profile and changes its group label.
+#[tauri::command]
+pub fn rename_profile(state: St, id: String, name: String, group: String) -> Result<(), String> {
+    state.rename_profile(&id, &name, &group)
+}
+
+/// Deletes a profile (refused while it is active or in the rotation pool).
+#[tauri::command]
+pub fn delete_profile(state: St, id: String) -> Result<(), String> {
+    state.delete_profile(&id)
+}
+
+/// Brings a profile's tunnel up once to check the handshake and the exit IP. Can take ~35 s.
+#[tauri::command]
+pub async fn test_profile(state: St<'_>, id: String) -> Result<NetworkStatusDto, String> {
+    blocking(&state, move |s| s.test_profile(&id)).await?
+}
+
+/// Live VPN route, handshake age, traffic and next rotation for the status card.
+#[tauri::command]
+pub fn get_network_status(state: St) -> Result<NetworkStatusDto, String> {
+    Ok(state.network_status())
+}
+
+/// Switches to another pool profile now (same as the timer does). Waits up to ~15 s.
+#[tauri::command]
+pub async fn rotate_now(state: St<'_>) -> Result<String, String> {
+    blocking(&state, |s| s.rotate_now()).await?
 }
