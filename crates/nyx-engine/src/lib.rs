@@ -65,6 +65,8 @@ pub struct Engine {
     inner: RwLock<UniquePtr<ffi::Session>>,
     meta: Mutex<Meta>,
     state_dir: PathBuf,
+    /// How many times `rotate_identity` has succeeded (diagnostics and tests).
+    identity_generation: std::sync::atomic::AtomicU64,
 }
 
 /// A session swapped out by `rotate_identity`, on its way to the thread that destroys it.
@@ -98,7 +100,7 @@ impl Engine {
             interface: cfg.interface.clone().unwrap_or_default(),
         };
         let inner = ffi::new_session(&dht, &init)?;
-        let engine = Engine { inner: RwLock::new(inner), meta: Mutex::new(Meta::default()), state_dir: cfg.state_dir };
+        let engine = Engine { inner: RwLock::new(inner), meta: Mutex::new(Meta::default()), state_dir: cfg.state_dir, identity_generation: std::sync::atomic::AtomicU64::new(0) };
         // Blocklist before any torrent exists, so a restored torrent never talks to a blocked address.
         engine.set_ip_filter(&cfg.blocklist)?;
         engine.restore();
@@ -127,11 +129,18 @@ impl Engine {
             let fresh = ses.respawn(5000)?;
             Retired(std::mem::replace(&mut *ses, fresh))
         };
+        self.identity_generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         std::thread::spawn(move || {
             let r = old;
             drop(r.0);
         });
         Ok(())
+    }
+
+    /// How many times the identity has been renewed since the engine started. Lets callers and
+    /// tests tell that a route change really renewed it.
+    pub fn identity_generation(&self) -> u64 {
+        self.identity_generation.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Adds a magnet link. The torrent fetches metadata but downloads nothing until the caller

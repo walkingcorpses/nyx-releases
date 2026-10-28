@@ -343,6 +343,16 @@ impl AppState {
         // route calls above, or the engine would keep the old profile's route.
         self.engine.set_encryption(encryption_mode(s)).map_err(|e| e.to_string())?;
         drop(net);
+        // A route change made through settings (another profile, to or from "No VPN") must also
+        // renew the torrent identity, exactly as a rotation swap does, or trackers can link the
+        // old exit (or the real address) to the new route by peer_id and key. No app lock is held
+        // here (same reasoning as `commit_swap`); the old tunnel closes only after the rebuild.
+        // A failure keeps the route change and the old session, which is already on the new route: warn only.
+        if old.is_some() {
+            if let Err(e) = self.engine.rotate_identity() {
+                self.warn(format!("The route changed, but the torrent identity could not be renewed: {e}"));
+            }
+        }
         drop(old);
         Ok(())
     }

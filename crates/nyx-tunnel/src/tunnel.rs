@@ -58,8 +58,8 @@ const PUMP_ROUNDS: usize = 32;
 // stalls, fall back to buffers <= 64 KiB (no window scaling) and re-check the 10 MB/s throughput.
 const TCP_BUF: usize = 128 * 1024;
 /// Concurrent tunnel TCP connections; further CONNECTs are refused (ConnectionRefused, SOCKS
-/// reply 5). Bounds memory at about 512 x (2 x TCP_BUF + 2 x APP_BUF).
-const MAX_TCP_CONNS: usize = 512;
+/// reply 5). Bounds memory at about 256 x (2 x TCP_BUF + 2 x APP_BUF).
+const MAX_TCP_CONNS: usize = 256;
 /// Random picks `alloc_port` tries before giving up.
 const PORT_TRIES: usize = 64;
 /// Buffer between a SOCKS thread and the worker, per direction per connection.

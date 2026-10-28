@@ -33,6 +33,9 @@
   // Private working copy (structuredClone keeps nested arrays independent of the store).
   // svelte-ignore state_referenced_locally
   let draft = $state<Settings>(structuredClone($state.snapshot(settings)));
+  // The active profile when the dialog opened, to tell whether the user changed it.
+  // svelte-ignore state_referenced_locally
+  const openedActive = settings.network.active_profile;
   // svelte-ignore state_referenced_locally
   let proxyOn = $state(settings.proxy !== null);
   let proxy = $state({
@@ -72,6 +75,16 @@
   async function save(): Promise<void> {
     saving = true;
     error = '';
+    // A rotation can switch the profile while this dialog is open. When the user did not pick a
+    // profile here, keep what the backend runs now instead of sending back the one from when the
+    // dialog opened (that would undo the rotation).
+    if (draft.network.active_profile === openedActive) {
+      try {
+        draft.network.active_profile = (await api.getSettings()).network.active_profile;
+      } catch {
+        /* keep the draft value; the backend still validates it */
+      }
+    }
     const out: Settings = {
       ...$state.snapshot(draft),
       bind_interface: iface.trim() || null,

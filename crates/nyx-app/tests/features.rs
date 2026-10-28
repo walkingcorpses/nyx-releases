@@ -757,3 +757,34 @@ fn all_profiles_failing_does_not_panic_and_keeps_lock_on() {
         assert_eq!(a.check_update().unwrap_err(), LOCK_ERR);
     }
 }
+
+/// Final-review finding: a route change made through settings (not a rotation swap) must renew
+/// the torrent identity too, or trackers can link the old exit (or the real address) to the new
+/// route. Switching profile and switching to "No VPN" renew it; an unrelated save does not.
+#[test]
+fn route_change_through_settings_renews_the_identity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (pa, pb) = (TestPeer::start(), TestPeer::start());
+    let a = rotation_app(tmp.path(), &pa, &pb);
+    assert_eq!(a.engine.identity_generation(), 0);
+
+    // An unrelated save keeps the route and the identity.
+    let mut s = a.settings_for_ui();
+    s.max_active_downloads = 4;
+    a.set_settings(s).unwrap();
+    assert_eq!(a.engine.identity_generation(), 0, "an unrelated save must not renew the identity");
+
+    // Another profile through settings: new identity.
+    let mut s = a.settings_for_ui();
+    s.network.active_profile = Some("p2".into());
+    a.set_settings(s).unwrap();
+    assert_eq!(a.engine.identity_generation(), 1, "profile switch through settings kept the old identity");
+    assert_eq!(a.network_status().profile.as_deref(), Some("Test VPN 2"));
+
+    // To "No VPN" (rotation must be off first: it needs an active profile): new identity again.
+    let mut s = a.settings_for_ui();
+    s.network.rotation.enabled = false;
+    s.network.active_profile = None;
+    a.set_settings(s).unwrap();
+    assert_eq!(a.engine.identity_generation(), 2, "leaving the VPN kept the old identity");
+}

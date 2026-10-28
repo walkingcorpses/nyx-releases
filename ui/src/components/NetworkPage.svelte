@@ -91,7 +91,9 @@
   /** Switches to another pool profile now. */
   function rotate(): Promise<void> {
     return run(async () => {
-      await api.rotateNow();
+      // The draft must follow the switch, or the next Save would send the old profile back and undo it.
+      draft.network.active_profile = await api.rotateNow();
+      await refresh();
       note = 'Switched.';
     });
   }
@@ -149,7 +151,7 @@
       <input class="field" type="text" aria-label={'Provider of ' + p.name} bind:value={edits[p.id].group} />
     {/if}
     <button class="btn" disabled={busy} onclick={() => saveEdit(p)}>Rename</button>
-    <button class="btn" disabled={busy} onclick={() => test(p)}>Test</button>
+    <button class="btn" disabled={busy || p.active} title={p.active ? "The active profile is already connected" : ""} onclick={() => test(p)}>Test</button>
     <button class="btn danger" disabled={busy} onclick={() => remove(p)}>Delete</button>
     {#if tested[p.id]}<span class="small muted">{tested[p.id]}</span>{/if}
   </div>

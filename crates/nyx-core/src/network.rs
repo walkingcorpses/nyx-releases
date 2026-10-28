@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 /// One saved WireGuard profile. The config itself is stored encrypted so keys never sit
 /// in settings.json in plain text.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Profile {
     /// Stable identifier, referenced by `active_profile` and the rotation pool.
@@ -20,6 +20,21 @@ pub struct Profile {
     pub endpoint: String,
     /// Resolved endpoint as IP:port, used at runtime so no DNS lookup happens outside the tunnel.
     pub endpoint_ip: String,
+}
+
+/// Debug output hides `sealed_conf`: on non-Windows builds (the lab) it is the plain key in base64,
+/// and a failing `assert_eq!` or a stray `{:?}` must never print it.
+impl std::fmt::Debug for Profile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Profile")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("group", &self.group)
+            .field("sealed_conf", &"<hidden>")
+            .field("endpoint", &self.endpoint)
+            .field("endpoint_ip", &self.endpoint_ip)
+            .finish()
+    }
 }
 
 /// Automatic switching between profiles at random intervals.
@@ -50,4 +65,16 @@ pub struct NetworkSettings {
     /// Id of the profile to connect with, if any.
     pub active_profile: Option<String>,
     pub rotation: RotationSettings,
+}
+
+#[cfg(test)]
+mod tests {
+    /// `{:?}` of a profile must never print the sealed config (the plain key on non-Windows).
+    #[test]
+    fn profile_debug_hides_the_sealed_config() {
+        let p = super::Profile { id: "p1".into(), sealed_conf: "plain:SECRETKEY".into(), ..Default::default() };
+        let shown = format!("{p:?}");
+        assert!(!shown.contains("SECRETKEY"), "{shown}");
+        assert!(shown.contains("p1"));
+    }
 }
