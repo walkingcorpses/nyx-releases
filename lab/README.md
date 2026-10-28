@@ -18,7 +18,7 @@ takes a long time; later builds are cached), removes any leftover lab (`docker c
 project `nyx-lab`), clears `lab/out/`, starts the lab detached and follows the runner's output,
 then tears the lab down. The exit code is the runner's: non-zero if any check found a leak, a
 scenario could not run, or the positive control was not fully detected. A full run takes about
-12 minutes.
+13 minutes.
 
 Dev runs of a subset: set `LAB_ONLY=<scenario>[,<scenario>]` before the script (cold_start and
 the positive control always run), e.g. `$env:LAB_ONLY='tunnel_killed_midtransfer'; lab\run.ps1`.
@@ -87,6 +87,16 @@ checked once. The capture sidecar is stopped before the analysis, so the pcap is
   leave, plus the housekeeping above. In the rotation scenarios' windows the egress check allows
   both exits; the port-unreachable allowance stays pinned to each exit's own WireGuard flow.
 
+- **linkability** (spec 7.3 check 3, `identity_rotation`): a finding when the same peer_id
+  (tracker announce or peer handshake), tracker `key` or non-empty extension `v` is seen in two
+  sessions (either side of a rotation mark) or from two exits (which also catches an old identity
+  slipping out through the new tunnel before the mark); when a peer_id prefix, `v` or tracker
+  User-Agent names Nyx or libtorrent (`-LT....-`, "libtorrent", "nyx"); and when a listen port is
+  announced: the extension handshake `p` or the announce `port`, other than libtorrent's
+  placeholder 1 (or 0). A proxied client cannot accept connections, so a real port there is its
+  true listen port or a stable per-session token. libtorrent sends `port=1` and no `p` while
+  proxied; libtorrent's anonymous-mode User-Agent `curl/7.81.0` is not counted (see FINDINGS).
+
 The report separates scenarios that could not run (infrastructure failures) from findings (leaks).
 
 ## Scenarios
@@ -129,6 +139,17 @@ The report separates scenarios that could not run (infrastructure failures) from
   fail (no contact in 15 s). For 15 s after it the lock must hold (route down, torrents `queued`;
   a `rotation_lock` finding otherwise) with nothing direct; then the drop is lifted and
   `rotate_now` back to A must get the download moving within 60 s.
+- `identity_rotation`: rotation on (A and B in the pool), encryption set to "Prefer" for the
+  scenario, a 40 MB download (seeder capped at 128 KiB/s); `rotate_now` twice (A, B, A). Each
+  session (before, between and after the swaps) must reach the tracker and send the observer a
+  plaintext handshake within 90 s, or the scenario fails (not exercised). Then the linkability
+  check runs over the client's tracker and observer entries (from the exits only; the seeder
+  announces too and never rotates), with each `rotate_now` reply as a mark. The download must
+  still finish, SHA-256 verified. Why "Prefer": the observer has no MSE/PE, and under "Forced"
+  every connection to it is encrypted and unreadable. MSE only wraps the BitTorrent handshake and
+  the extension handshake; their content (peer_id, reserved bits, `v`, `p`, `yourip`, `reqq`,
+  `m`) is the same under Forced, so what the observer reads is what any MSE peer learns. libtorrent
+  tries MSE first and falls back to plaintext on the next connect.
 - `positive_control` (last): deliberate leaks from client-a's namespace: TCP to the tracker
   (`/positive-control`), a DNS query for `control.lab` to the lab dns, UDP to exit A on port 9999,
   UDP over IPv6 to fd77::1. All four egress findings and the tracker/dns identity findings

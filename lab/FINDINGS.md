@@ -159,6 +159,122 @@ Original finding (Task 11 baseline):
 Full lab run 2026-10-27 20:19 UTC (Task 14, all 14 scenarios incl. rotation_swap and
 rotation_failure_holds): 0 scenarios failed, 0 findings, positive control complete.
 
+## Findings for Task 15 (identity and linkability, spec 7.3 check 3)
+
+First run of `identity_rotation` (`LAB_ONLY=identity_rotation`, 2026-10-27 ~20:45 UTC, daemon
+built before any engine change): 60 linkability findings, all of the four kinds below. Two
+`rotate_now` swaps (A -> B -> A); every session reached the tracker and sent the observer a
+plaintext handshake (28 MSE attempts first, then libtorrent's plaintext fallback, as intended
+with encryption "Prefer").
+
+Evidence from that run (tracker log, client entries only; observer, one plaintext handshake):
+
+```
+10.88.0.10 udp  peer_id=-LT20B0-syvUVUu8GKj0 key=7e568221 port=1 ip=0.0.0.0 event=started
+10.88.0.11 udp  peer_id=-LT20B0-syvUVUu8GKj0 key=7e568221 port=1 ip=0.0.0.0        (after swap 1)
+10.88.0.10 udp  peer_id=-LT20B0-syvUVUu8GKj0 key=7e568221 port=1 ip=0.0.0.0        (after swap 2)
+10.88.0.10 http peer_id=-LT20B0-syvUVUu8GKj0 key=7E568221 port=1 event=completed UA=Nyx/0.1
+observer: peer_id=-LT20B0-fGO-*tynoFPG reserved=0000000000100005 v=Nyx/0.1 p=(absent)
+          yourip=10.88.0.22 reqq=2000 complete_ago=-1 metadata_size=3273
+          m={lt_donthave, share_mode, upload_only, ut_holepunch, ut_metadata, ut_pex}
+```
+
+### F5. The tracker peer_id survives a rotation (linkability)
+
+- [x] **FIXED in Task 15.**
+- Line: `same peer_id '-LT20B0-syvUVUu8GKj0' in sessions [0, 1, 2] ... from exits ['10.88.0.10', '10.88.0.11']`.
+- Why it links: the tracker sees one peer_id for the torrent from exit A, then from exit B, then
+  from A again. Any tracker (or anyone with its logs) can tell the "new" client behind exit B is
+  the old one. Rotation hides nothing from it.
+- Cause (libtorrent 2.0.11 source): the announce peer_id is `torrent::m_peer_id`, set once in the
+  torrent's constructor (`torrent.cpp:208`, `generate_peer_id(settings())`). Nothing regenerates
+  it for a live torrent. The BitTorrent handshake already uses a new random peer_id per connection
+  (`torrent.cpp:7582`), only its 8-byte prefix is fixed.
+
+### F6. The tracker key survives a rotation (linkability)
+
+- [x] **FIXED in Task 15.**
+- Line: `same key '7e568221' in sessions [0, 1, 2] ...` (UDP and HTTP, 7E568221 in the HTTP query).
+- Why it links: BEP 7/15 define `key` exactly so a tracker can recognise a client whose IP
+  changed. A key that survives the swap is a client identifier handed to every tracker.
+- Cause: `torrent::tracker_key()` (`torrent.cpp:5079`) is a SHA-1 of the torrent object's address,
+  its storage index and the session's address. It is fixed for the torrent's life, and even a new
+  session does not reliably change it: the engine test saw a torrent get its old key back two
+  rotations later, because the allocator hands a new session and its torrents the memory blocks
+  of freed ones.
+
+### F7. Every peer_id names the engine and its version (fingerprint)
+
+- [x] **FIXED in Task 15.**
+- Lines: `tracker peer_id names the client: '-LT20B0-'` and `handshake peer_id names the client:
+  '-LT20B0-' in 27 entries` (every handshake, both exits).
+- Why it matters: `-LT20B0-` is libtorrent's Azureus-style prefix for 2.0.11. With the other
+  details below it narrows the client down to a small set; it is the same on every exit.
+
+### F8. The client version "Nyx/0.1" in every extension handshake and HTTP announce (fingerprint, linkability)
+
+- [x] **FIXED in Task 15.**
+- Lines: `extension v names the client: 'Nyx/0.1' in 27 entries`, `same v 'Nyx/0.1' in sessions
+  [0, 1, 2]`, and the HTTP announce's `User-Agent: Nyx/0.1`.
+- Why it matters: it names the app outright to every peer and every HTTP tracker, and is the same
+  across rotations. Nyx is a small user base: in a swarm this alone links sessions.
+
+### Clean in the first run (checked, no finding)
+
+- No listen port leaks: the extension handshake has no `p` (libtorrent only sends `p` for a listen
+  socket that accepts connections; the proxied session's only listen socket is its proxy socket,
+  `session_impl.cpp` `listen_port()`), and announces carry `port=1`, libtorrent's placeholder
+  when it cannot accept (`make_announce_port(0)`). No `ip=` (UDP ip field 0.0.0.0).
+- `yourip` is the observer's own address (what the client sees through SOCKS): no client address.
+
+### The fix (commits 13a3595, 1512c73, 0ebf2a9)
+
+- Fingerprint (F7, F8): every session starts with `peer_fingerprint` empty (all 20 peer_id bytes
+  random), `anonymous_mode` on (no `v`, generic tracker User-Agent, no `ip=`), and a blank
+  `user_agent` and `handshake_client_version` (anonymous mode still sends the user agent to
+  private trackers). anonymous_mode changes exactly those three things in 2.0.11 (all its uses
+  in the source), so connectivity is unchanged: steady_download and every download scenario
+  below completed.
+- Identity (F5, F6): `Engine::rotate_identity` rebuilds the libtorrent session from the live
+  settings and every torrent's resume data (progress, paused/held flags, limits, priorities,
+  categories kept) and swaps it in. The old session is first pointed at a dead proxy
+  (127.0.0.1:0) and paused, so none of its announces, not even "stopped", reaches a tracker
+  through the new exit; it is destroyed after the swap. Every session's disk I/O is wrapped so
+  that each storage index carries a random 32-bit salt, which makes every tracker key random
+  whatever the memory layout (F6's address reuse). The app calls it in the rotation commit
+  (rotate_now and the timer) after the engine points at the new tunnel and before the old tunnel
+  closes.
+- Tests: engine `rotate_identity_keeps_torrents_and_changes_peer_id` (six rotations against a
+  local HTTP tracker: a peer_id and key never seen before each time, the old identity never
+  announces again, nothing names the client, a paused torrent with a category and limits and a
+  queue-held torrent keep their state); analyzer `Linkability` tests (positive and negative case
+  for each rule).
+
+### Full lab run 2026-10-28 02:36 UTC (Task 15, all 15 scenarios)
+
+0 scenarios failed, 0 findings, positive control complete (exit 0). `identity_rotation`: A -> B -> A
+in 0.3 s each; every session reached the tracker and the observer ((announces, handshakes) per
+session (3, 40), (7, 10), (5, 10)); the test torrent showed a different peer_id and key in each
+session (`AL-h!s.5l)Anjmg)N(T4`/`1a46d693`, `PZn)y(0lXUpqIB8SS61L`/`30e7fea8`,
+`TZS4KZoNw).kZh)vb*K9`/`fe4fce6d`), no `v`, no `p`, `port=1`, User-Agent `curl/7.81.0`; the
+download finished, SHA-256 verified. steady_download and every other download completed with
+anonymous_mode on. (An earlier full run the same night lost `tunnel_cut_long` to the host going
+to sleep mid-scenario, Kernel-Power event 42 at 21:32, capture stalled; it had 0 findings too.)
+
+### Residual fingerprint (not findings; same for every libtorrent client)
+
+- Reserved bits `0000000000100005` (extension protocol, fast extension, DHT bit), the extension
+  message names (`lt_donthave`, `ut_holepunch`, `share_mode`, `upload_only`, `ut_metadata`,
+  `ut_pex`), `reqq=2000`, `complete_ago`: these mark the libtorrent family (qBittorrent, Deluge
+  and others share them) but not Nyx, and do not change across a rotation for anyone.
+- Tracker User-Agent `curl/7.81.0`: libtorrent's fixed anonymous-mode string, shared by every
+  libtorrent client in anonymous mode. `port=1` likewise marks "libtorrent behind a proxy".
+- Timing: a tracker sees one identity stop announcing and a new one start on another exit at the
+  same moment. With many users per exit that is weak; with few it is a correlation no client-side
+  identity change can remove.
+- A profile change from the settings (not a rotation) keeps the identity (only rotation swaps
+  call rotate_identity).
+
 ## Analysis
 
 **The lab can see leaks (positive control).** It is unchanged from Task 10, plus an IPv6 leak
@@ -206,10 +322,10 @@ complete. Every window of 30 s or more had WireGuard to exit A and a packet in i
   and adds the torrent again.
 
 **Observations for later tasks (not findings of these checks):**
-- *HTTP User-Agent*: HTTP tracker announces send `User-Agent: Nyx/0.1`, which names the app.
-- *Fingerprint*: peer_id prefix `-LT20B0-` (libtorrent 2.0.11); `key` is stable within a torrent's
-  session; UDP announces carry `port=1 ip=0.0.0.0`.
+- *HTTP User-Agent*, *Fingerprint*: became findings F7, F8 (and F5, F6 for the stable peer_id and
+  key) in Task 15, fixed there.
 - *Lost torrent on crash*: a torrent added less than 60 s before a crash is not restored.
-- *Observer blind to MSE*: every connection to the observer was encrypted (Task 15).
+- *Observer blind to MSE*: handled in Task 15: `identity_rotation` runs with encryption "Prefer",
+  so libtorrent falls back to plaintext with the observer (MSE only wraps the same handshake).
 - *UDP ASSOCIATE port 0* (carry-over): libtorrent announces port 0, so the relay adopts the first
   local sender.
